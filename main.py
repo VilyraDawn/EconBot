@@ -1,5 +1,4 @@
 import os
-import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -8,9 +7,12 @@ from discord import app_commands
 import asyncpg
 
 # =========================
-# Vilyra Economy Bot (V1)
-# Single-file version
+# Vilyra Economy Bot (V1) — Single-file version (EconBot_v2)
 # =========================
+#
+# Fixes vs v1:
+# - Supports testing in a different guild while pulling characters from the "main" guild
+#   via LEGACY_SOURCE_GUILD_ID (optional).
 #
 # Commands:
 # - /income      (once/day per character; +10 Val = 1 Arce)
@@ -34,11 +36,15 @@ import asyncpg
 # - GUILD_ID
 # - BANK_CHANNEL_ID
 # - ECON_LOG_CHANNEL_ID
-# - STAFF_ROLE_IDS           (comma-separated role IDs)
+# - STAFF_ROLE_IDS            (comma-separated role IDs)
+#
 # Optional ENV vars:
-# - LEGACY_CHAR_SCHEMA       (default: public)
-# - LEGACY_CHAR_TABLE        (default: characters)
-# - ENV                      (default: test)
+# - LEGACY_CHAR_SCHEMA        (default: public)
+# - LEGACY_CHAR_TABLE         (default: characters)
+# - LEGACY_SOURCE_GUILD_ID    (default: unset/0 => use current guild)
+# - ENV                       (default: test)
+
+TZ = ZoneInfo("America/Chicago")
 
 # ---------- Config ----------
 def _req(name: str) -> str:
@@ -56,7 +62,10 @@ ECON_LOG_CHANNEL_ID = int(_req("ECON_LOG_CHANNEL_ID"))
 
 LEGACY_CHAR_SCHEMA = os.getenv("LEGACY_CHAR_SCHEMA", "public")
 LEGACY_CHAR_TABLE = os.getenv("LEGACY_CHAR_TABLE", "characters")
-ENV = os.getenv("ENV", "test")
+
+# If set, bot will read legacy characters from this guild id (e.g., your main server),
+# while still operating and writing economy data in the current/test guild.
+LEGACY_SOURCE_GUILD_ID = int(os.getenv("LEGACY_SOURCE_GUILD_ID", "0"))
 
 STAFF_ROLE_IDS = {
     int(x.strip())
@@ -64,7 +73,7 @@ STAFF_ROLE_IDS = {
     if x.strip().isdigit()
 }
 
-TZ = ZoneInfo("America/Chicago")
+ENV = os.getenv("ENV", "test")
 
 # ---------- Currency helpers ----------
 DENOMS = [
@@ -216,6 +225,9 @@ async def autocomplete_character_names(
         rows = await con.fetch(base, *params)
     return [str(r["name"]) for r in rows]
 
+def legacy_guild_id(current_guild_id: int) -> int:
+    return LEGACY_SOURCE_GUILD_ID or current_guild_id
+
 # ---------- Permissions / logging ----------
 def is_staff_member(interaction: discord.Interaction) -> bool:
     if interaction.guild is None or interaction.user is None:
@@ -309,7 +321,8 @@ async def render_bank_embed() -> discord.Embed:
     embed.add_field(name="Balances", value=text, inline=False)
     return embed
 
-async def update_bank_dashboard(bot: discord.Client) -> None:
+async def update_bank_dashboard(bot: discord.Client, current_guild_id: int) -> None:
+    # NOTE: Dashboard posts to the configured bank channel (test server).
     channel = bot.get_channel(BANK_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         return
@@ -344,7 +357,7 @@ class EconBot(discord.Client):
         await self.tree.sync(guild=self.guild_obj)
 
     async def on_ready(self):
-        print(f"[{ENV}] Logged in as {self.user} (guild locked: {GUILD_ID})")
+        print(f"[{ENV}] Logged in as {self.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID or 'current'})")
 
 bot = EconBot()
 
@@ -352,8 +365,9 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
     if interaction.guild is None:
         return []
     staff = is_staff_member(interaction)
+    legacy_gid = legacy_guild_id(interaction.guild.id)
     names = await autocomplete_character_names(
-        interaction.guild.id,
+        legacy_gid,
         current,
         requester_user_id=interaction.user.id,
         is_staff=staff,
@@ -372,7 +386,9 @@ async def income(interaction: discord.Interaction, character: str):
         return await interaction.response.send_message("Use this in the server.", ephemeral=True)
 
     staff = is_staff_member(interaction)
-    legacy_char = await fetch_character_by_name(interaction.guild.id, character)
+    legacy_gid = legacy_guild_id(interaction.guild.id)
+
+    legacy_char = await fetch_character_by_name(legacy_gid, character)
     if not legacy_char:
         return await interaction.response.send_message("Character not found.", ephemeral=True)
 
@@ -389,14 +405,17 @@ async def income(interaction: discord.Interaction, character: str):
 
     pool = await get_pool()
     async with pool.acquire() as con:
-        # Once/day enforcement via PK
+        # IMPORTANT: Claims + transactions are stored under the CURRENT guild (test server),
+        # even if characters are sourced from a different guild. This prevents polluting real data.
+        current_gid = interaction.guild.id
+
         try:
             await con.execute(
                 """
                 INSERT INTO economy.income_claims (guild_id, character_name, claim_date)
                 VALUES ($1, $2, $3)
                 """,
-                interaction.guild.id,
+                current_gid,
                 legacy_char.name,
                 today,
             )
@@ -413,7 +432,7 @@ async def income(interaction: discord.Interaction, character: str):
             VALUES
               ($1, $2, $3, $4, $5, $6, $7)
             """,
-            interaction.guild.id,
+            current_gid,
             legacy_char.name,
             legacy_char.user_id,
             10,
@@ -428,18 +447,18 @@ async def income(interaction: discord.Interaction, character: str):
             FROM economy.transactions
             WHERE guild_id=$1 AND character_name=$2
             """,
-            interaction.guild.id,
+            current_gid,
             legacy_char.name,
         )
 
     await interaction.response.send_message(
         f"✅ Income claimed for **{legacy_char.name}**: +1 Arce (10 Cinth).\n"
-        f"New balance: **{format_currency(int(bal))}**",
+        f"New balance (test server): **{format_currency(int(bal))}**",
         ephemeral=True,
     )
 
     await log_to_econ(bot, f"💰 `/income` by {interaction.user.mention} → **{legacy_char.name}** (+1 Arce)")
-    await update_bank_dashboard(bot)
+    await update_bank_dashboard(bot, interaction.guild.id)
 
 @bot.tree.command(
     name="balance",
@@ -453,7 +472,9 @@ async def balance(interaction: discord.Interaction, character: str):
         return await interaction.response.send_message("Use this in the server.", ephemeral=True)
 
     staff = is_staff_member(interaction)
-    legacy_char = await fetch_character_by_name(interaction.guild.id, character)
+    legacy_gid = legacy_guild_id(interaction.guild.id)
+
+    legacy_char = await fetch_character_by_name(legacy_gid, character)
     if not legacy_char:
         return await interaction.response.send_message("Character not found.", ephemeral=True)
 
@@ -463,6 +484,8 @@ async def balance(interaction: discord.Interaction, character: str):
     if legacy_char.user_id != interaction.user.id and not staff:
         return await interaction.response.send_message("You can only view your own characters.", ephemeral=True)
 
+    current_gid = interaction.guild.id
+
     pool = await get_pool()
     async with pool.acquire() as con:
         bal = await con.fetchval(
@@ -471,7 +494,7 @@ async def balance(interaction: discord.Interaction, character: str):
             FROM economy.transactions
             WHERE guild_id=$1 AND character_name=$2
             """,
-            interaction.guild.id,
+            current_gid,
             legacy_char.name,
         )
         assets = await con.fetch(
@@ -482,14 +505,14 @@ async def balance(interaction: discord.Interaction, character: str):
             ORDER BY created_at ASC
             LIMIT 10
             """,
-            interaction.guild.id,
+            current_gid,
             legacy_char.name,
         )
 
     e = discord.Embed(title="💳 Balance Card")
     e.add_field(name="Character", value=f"**{legacy_char.name}**", inline=True)
     e.add_field(name="Owner", value=f"<@{legacy_char.user_id}>", inline=True)
-    e.add_field(name="Balance", value=f"**{format_currency(int(bal))}**", inline=False)
+    e.add_field(name="Balance (test server)", value=f"**{format_currency(int(bal))}**", inline=False)
 
     if assets:
         lines = [f"• **{a['asset_type']}** — {a['label']}" for a in assets]
@@ -540,7 +563,8 @@ async def econ_adjust(
     if not is_staff_member(interaction):
         return await interaction.response.send_message("You don’t have permission to use this.", ephemeral=True)
 
-    legacy_char = await fetch_character_by_name(interaction.guild.id, character)
+    legacy_gid = legacy_guild_id(interaction.guild.id)
+    legacy_char = await fetch_character_by_name(legacy_gid, character)
     if not legacy_char:
         return await interaction.response.send_message("Character not found.", ephemeral=True)
 
@@ -551,6 +575,8 @@ async def econ_adjust(
     if operation.value == "sub":
         delta = -delta
 
+    current_gid = interaction.guild.id
+
     pool = await get_pool()
     async with pool.acquire() as con:
         await con.execute(
@@ -560,7 +586,7 @@ async def econ_adjust(
             VALUES
               ($1, $2, $3, $4, $5, $6, $7, $8)
             """,
-            interaction.guild.id,
+            current_gid,
             legacy_char.name,
             legacy_char.user_id,
             delta,
@@ -576,7 +602,7 @@ async def econ_adjust(
             FROM economy.transactions
             WHERE guild_id=$1 AND character_name=$2
             """,
-            interaction.guild.id,
+            current_gid,
             legacy_char.name,
         )
 
@@ -584,7 +610,7 @@ async def econ_adjust(
     await interaction.response.send_message(
         f"✅ Updated **{legacy_char.name}**: {sign}{format_currency(delta)}\n"
         f"Reason: {reason}\n"
-        f"New balance: **{format_currency(int(bal))}**",
+        f"New balance (test server): **{format_currency(int(bal))}**",
         ephemeral=True,
     )
 
@@ -592,12 +618,11 @@ async def econ_adjust(
         bot,
         f"🛠️ `/econ_adjust` by {interaction.user.mention} → **{legacy_char.name}** ({sign}{format_currency(delta)}): {reason}",
     )
-    await update_bank_dashboard(bot)
+    await update_bank_dashboard(bot, interaction.guild.id)
 
 def main():
-    print(f"[{ENV}] Starting EconBot_v1…")
+    print(f"[{ENV}] Starting EconBot_v2…")
     bot.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     main()
-
