@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -7,7 +8,7 @@ from discord import app_commands
 import asyncpg
 
 # =========================
-# Vilyra Economy Bot (V1) — Single-file version (EconBot_v4)
+# Vilyra Economy Bot (V1) — Single-file version (EconBot_v5)
 # =========================
 #
 # V4 change:
@@ -171,6 +172,8 @@ class LegacyCharacter:
         self.archived = archived
 
 async def fetch_character_by_name(guild_id: int, name: str) -> LegacyCharacter | None:
+    await interaction.response.defer(ephemeral=True)
+
     pool = await get_pool()
     q = f"""
     SELECT guild_id, user_id, name, archived
@@ -271,356 +274,381 @@ async def log_to_econ(bot_client: discord.Client, text: str) -> None:
 async def _get_bank_message_id() -> int | None:
     pool = await get_pool()
     async with pool.acquire() as con:
-        v = await con.fetchval("SELECT v FROM economy.meta WHERE k=$1", META_BANK_MESSAGE_ID_KEY)
-    return int(v) if v else None
-
-async def _set_bank_message_id(mid: int) -> None:
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            INSERT INTO economy.meta (k, v) VALUES ($1, $2)
-            ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v
-            """,
-            META_BANK_MESSAGE_ID_KEY, str(mid)
-        )
-
-async def render_bank_embed() -> discord.Embed:
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
-            SELECT character_user_id, character_name, COALESCE(SUM(amount_val),0) AS bal
-            FROM economy.transactions
-            WHERE guild_id=$1
-            GROUP BY character_user_id, character_name
-            ORDER BY character_user_id ASC, character_name ASC
-            """,
-            GUILD_ID
-        )
-
-    embed = discord.Embed(
-        title="🏦 Bank of Vilyra",
-        description="Character balances (Novir/Orin/Elsh/Arce/Cinth)."
-    )
-
-    if not rows:
-        embed.add_field(name="Balances", value="_No economy data yet._", inline=False)
-        return embed
-
-    blocks: list[str] = []
-    current_user: int | None = None
-    current_lines: list[str] = []
-
-    def flush():
-        nonlocal current_user, current_lines
-        if current_user is None:
-            return
-        header = user_label_from_cache(current_user)
-        body = "\n".join(current_lines) if current_lines else "_No balances yet._"
-        blocks.append(f"**{header}**\n{body}")
-        current_user = None
-        current_lines = []
-
-    for r in rows:
-        uid = int(r["character_user_id"])
-        name = str(r["character_name"])
-        bal = int(r["bal"])
-
-        if current_user is None:
-            current_user = uid
-        if uid != current_user:
-            flush()
-            current_user = uid
-
-        current_lines.append(f"• **{name}** — {format_currency(bal)}")
-
-    flush()
-
-    text = "\n\n".join(blocks)
-    if len(text) > 3900:
-        text = "Too many entries to show in one embed right now. (Paging comes next.)"
-
-    embed.add_field(name="Balances", value=text, inline=False)
-    return embed
-
-async def update_bank_dashboard(bot_client: discord.Client) -> None:
-    channel = bot_client.get_channel(BANK_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        return
-    embed = await render_bank_embed()
-    mid = await _get_bank_message_id()
-    if mid:
         try:
-            msg = await channel.fetch_message(mid)
-            await msg.edit(embed=embed, content=None)
-            return
-        except Exception:
-            pass
-    msg = await channel.send(embed=embed)
-    await _set_bank_message_id(msg.id)
+                    v = await con.fetchval("SELECT v FROM economy.meta WHERE k=$1", META_BANK_MESSAGE_ID_KEY)
+                return int(v) if v else None
 
-# ---------- Discord bot ----------
-INTENTS = discord.Intents.default()
+            async def _set_bank_message_id(mid: int) -> None:
+                pool = await get_pool()
+                async with pool.acquire() as con:
+                    await con.execute(
+                        """
+                        INSERT INTO economy.meta (k, v) VALUES ($1, $2)
+                        ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v
+                        """,
+                        META_BANK_MESSAGE_ID_KEY, str(mid)
+                    )
 
-class EconBot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=INTENTS)
-        self.tree = app_commands.CommandTree(self)
-        self.guild_obj = discord.Object(id=GUILD_ID)
+            async def render_bank_embed() -> discord.Embed:
+                pool = await get_pool()
+                async with pool.acquire() as con:
+                    rows = await con.fetch(
+                        """
+                        SELECT character_user_id, character_name, COALESCE(SUM(amount_val),0) AS bal
+                        FROM economy.transactions
+                        WHERE guild_id=$1
+                        GROUP BY character_user_id, character_name
+                        ORDER BY character_user_id ASC, character_name ASC
+                        """,
+                        GUILD_ID
+                    )
 
-    async def setup_hook(self):
-        pool = await get_pool()
-        async with pool.acquire() as con:
-            await con.execute(SCHEMA_SQL)
-        await self.tree.sync(guild=self.guild_obj)
+                embed = discord.Embed(
+                    title="🏦 Bank of Vilyra",
+                    description="Character balances (Novir/Orin/Elsh/Arce/Cinth)."
+                )
 
-    async def on_ready(self):
-        print(f"[{ENV}] Logged in as {self.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID or 'current'})")
+                if not rows:
+                    embed.add_field(name="Balances", value="_No economy data yet._", inline=False)
+                    return embed
+
+                blocks: list[str] = []
+                current_user: int | None = None
+                current_lines: list[str] = []
+
+                def flush():
+                    nonlocal current_user, current_lines
+                    if current_user is None:
+                        return
+                    header = user_label_from_cache(current_user)
+                    body = "\n".join(current_lines) if current_lines else "_No balances yet._"
+                    blocks.append(f"**{header}**\n{body}")
+                    current_user = None
+                    current_lines = []
+
+                for r in rows:
+                    uid = int(r["character_user_id"])
+                    name = str(r["character_name"])
+                    bal = int(r["bal"])
+
+                    if current_user is None:
+                        current_user = uid
+                    if uid != current_user:
+                        flush()
+                        current_user = uid
+
+                    current_lines.append(f"• **{name}** — {format_currency(bal)}")
+
+                flush()
+
+                text = "\n\n".join(blocks)
+                if len(text) > 3900:
+                    text = "Too many entries to show in one embed right now. (Paging comes next.)"
+
+                embed.add_field(name="Balances", value=text, inline=False)
+                return embed
+
+            async def update_bank_dashboard(bot_client: discord.Client) -> None:
+                channel = bot_client.get_channel(BANK_CHANNEL_ID)
+                if not isinstance(channel, discord.TextChannel):
+                    return
+                embed = await render_bank_embed()
+                mid = await _get_bank_message_id()
+                if mid:
+                    try:
+                        msg = await channel.fetch_message(mid)
+                        await msg.edit(embed=embed, content=None)
+                        return
+                    except Exception:
+                        pass
+                msg = await channel.send(embed=embed)
+                await _set_bank_message_id(msg.id)
+
+            # ---------- Discord bot ----------
+            INTENTS = discord.Intents.default()
+
+            class EconBot(discord.Client):
+                def __init__(self):
+                    super().__init__(intents=INTENTS)
+                    self.tree = app_commands.CommandTree(self)
+                    self.guild_obj = discord.Object(id=GUILD_ID)
+
+                async def setup_hook(self):
+                    pool = await get_pool()
+                    async with pool.acquire() as con:
+                        await con.execute(SCHEMA_SQL)
+                    await self.tree.sync(guild=self.guild_obj)
+
+                async def on_ready(self):
+                    print(f"[{ENV}] Logged in as {self.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID or 'current'})")
+
+            
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Try to notify the user without timing out.
+    try:
+        msg = f"❌ Command error: {type(error).__name__}: {error}"
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+
+    # Log to econ channel (no pings) if available.
+    try:
+        await log_to_econ(bot, f"⚠️ Command error by {actor_label(interaction)}: {type(error).__name__}: {error}")
+    except Exception:
+        pass
 
 bot = EconBot()
 
-async def character_autocomplete(interaction: discord.Interaction, current: str):
-    if interaction.guild is None:
-        return []
-    staff = is_staff_member(interaction)
-    legacy_gid = legacy_guild_id(interaction.guild.id)
-    names = await autocomplete_character_names(
-        legacy_gid,
-        current,
-        requester_user_id=interaction.user.id,
-        is_staff=staff,
-    )
-    return [app_commands.Choice(name=n, value=n) for n in names[:25]]
+            async def character_autocomplete(interaction: discord.Interaction, current: str):
+                if interaction.guild is None:
+                    return []
+                staff = is_staff_member(interaction)
+                legacy_gid = legacy_guild_id(interaction.guild.id)
+                names = await autocomplete_character_names(
+                    legacy_gid,
+                    current,
+                    requester_user_id=interaction.user.id,
+                    is_staff=staff,
+                )
+                return [app_commands.Choice(name=n, value=n) for n in names[:25]]
 
-@bot.tree.command(
-    name="income",
-    description="Claim daily income (+10 Val / 1 Arce).",
-    guild=discord.Object(id=GUILD_ID),
-)
-@app_commands.describe(character="Pick a character")
-@app_commands.autocomplete(character=character_autocomplete)
-async def income(interaction: discord.Interaction, character: str):
-    if interaction.guild is None:
-        return await interaction.response.send_message("Use this in the server.", ephemeral=True)
-
-    staff = is_staff_member(interaction)
-    legacy_gid = legacy_guild_id(interaction.guild.id)
-
-    legacy_char = await fetch_character_by_name(legacy_gid, character)
-    if not legacy_char:
-        return await interaction.response.send_message("Character not found.", ephemeral=True)
-
-    if legacy_char.archived and not staff:
-        return await interaction.response.send_message("That character is archived.", ephemeral=True)
-
-    if legacy_char.user_id != interaction.user.id and not staff:
-        return await interaction.response.send_message(
-            "You can only claim income for your own characters.",
-            ephemeral=True,
-        )
-
-    today = datetime.now(TZ).date()
-    current_gid = interaction.guild.id
-
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        try:
-            await con.execute(
-                """
-                INSERT INTO economy.income_claims (guild_id, character_name, claim_date)
-                VALUES ($1, $2, $3)
-                """,
-                current_gid,
-                legacy_char.name,
-                today,
+            @bot.tree.command(
+                name="income",
+                description="Claim daily income (+10 Val / 1 Arce).",
+                guild=discord.Object(id=GUILD_ID),
             )
-        except Exception:
-            return await interaction.response.send_message(
-                "Income already claimed for this character today.",
-                ephemeral=True,
+            @app_commands.describe(character="Pick a character")
+            @app_commands.autocomplete(character=character_autocomplete)
+            async def income(interaction: discord.Interaction, character: str):
+                if interaction.guild is None:
+                    return await interaction.response.send_message("Use this in the server.", ephemeral=True)
+
+                staff = is_staff_member(interaction)
+                legacy_gid = legacy_guild_id(interaction.guild.id)
+
+                legacy_char = await fetch_character_by_name(legacy_gid, character)
+                if not legacy_char:
+                    return await interaction.response.send_message("Character not found.", ephemeral=True)
+
+                if legacy_char.archived and not staff:
+                    return await interaction.response.send_message("That character is archived.", ephemeral=True)
+
+                if legacy_char.user_id != interaction.user.id and not staff:
+                    return await interaction.response.send_message(
+                        "You can only claim income for your own characters.",
+                        ephemeral=True,
+                    )
+
+                today = datetime.now(TZ).date()
+                current_gid = interaction.guild.id
+
+                pool = await get_pool()
+                async with pool.acquire() as con:
+                    try:
+                        await con.execute(
+                            """
+                            INSERT INTO economy.income_claims (guild_id, character_name, claim_date)
+                            VALUES ($1, $2, $3)
+                            """,
+                            current_gid,
+                            legacy_char.name,
+                            today,
+                        )
+                    except Exception:
+                        return await interaction.response.send_message(
+                            "Income already claimed for this character today.",
+                            ephemeral=True,
+                        )
+
+                    await con.execute(
+                        """
+                        INSERT INTO economy.transactions
+                          (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind)
+                        VALUES
+                          ($1, $2, $3, $4, $5, $6, $7)
+                        """,
+                        current_gid,
+                        legacy_char.name,
+                        legacy_char.user_id,
+                        10,
+                        "Daily income (+10 Cinth / 1 Arce)",
+                        interaction.user.id,
+                        "income",
+                    )
+
+                    bal = await con.fetchval(
+                        """
+                        SELECT COALESCE(SUM(amount_val),0)
+                        FROM economy.transactions
+                        WHERE guild_id=$1 AND character_name=$2
+                        """,
+                        current_gid,
+                        legacy_char.name,
+                    )
+
+                await interaction.followup.send(
+                    f"✅ Income claimed for **{legacy_char.name}**: +1 Arce (10 Cinth).\n"
+                    f"New balance: **{format_currency(int(bal))}**",
+                    ephemeral=True,
+                )
+
+                await log_to_econ(bot, f"💰 /income by {actor_label(interaction)} → **{legacy_char.name}** (+1 Arce)")
+                await update_bank_dashboard(bot)
+
+            @bot.tree.command(
+                name="balance",
+                description="Show a character balance card.",
+                guild=discord.Object(id=GUILD_ID),
             )
+            @app_commands.describe(character="Pick a character")
+            @app_commands.autocomplete(character=character_autocomplete)
+            async def balance(interaction: discord.Interaction, character: str):
+                if interaction.guild is None:
+                    return await interaction.response.send_message("Use this in the server.", ephemeral=True)
 
-        await con.execute(
-            """
-            INSERT INTO economy.transactions
-              (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind)
-            VALUES
-              ($1, $2, $3, $4, $5, $6, $7)
-            """,
-            current_gid,
-            legacy_char.name,
-            legacy_char.user_id,
-            10,
-            "Daily income (+10 Cinth / 1 Arce)",
-            interaction.user.id,
-            "income",
-        )
+                staff = is_staff_member(interaction)
+                legacy_gid = legacy_guild_id(interaction.guild.id)
 
-        bal = await con.fetchval(
-            """
-            SELECT COALESCE(SUM(amount_val),0)
-            FROM economy.transactions
-            WHERE guild_id=$1 AND character_name=$2
-            """,
-            current_gid,
-            legacy_char.name,
-        )
+                legacy_char = await fetch_character_by_name(legacy_gid, character)
+                if not legacy_char:
+                    return await interaction.response.send_message("Character not found.", ephemeral=True)
 
-    await interaction.response.send_message(
-        f"✅ Income claimed for **{legacy_char.name}**: +1 Arce (10 Cinth).\n"
-        f"New balance: **{format_currency(int(bal))}**",
-        ephemeral=True,
-    )
+                if legacy_char.archived and not staff:
+                    return await interaction.response.send_message("That character is archived.", ephemeral=True)
 
-    await log_to_econ(bot, f"💰 /income by {actor_label(interaction)} → **{legacy_char.name}** (+1 Arce)")
-    await update_bank_dashboard(bot)
+                if legacy_char.user_id != interaction.user.id and not staff:
+                    return await interaction.response.send_message("You can only view your own characters.", ephemeral=True)
 
-@bot.tree.command(
-    name="balance",
-    description="Show a character balance card.",
-    guild=discord.Object(id=GUILD_ID),
-)
-@app_commands.describe(character="Pick a character")
-@app_commands.autocomplete(character=character_autocomplete)
-async def balance(interaction: discord.Interaction, character: str):
-    if interaction.guild is None:
-        return await interaction.response.send_message("Use this in the server.", ephemeral=True)
+                current_gid = interaction.guild.id
 
-    staff = is_staff_member(interaction)
-    legacy_gid = legacy_guild_id(interaction.guild.id)
+                pool = await get_pool()
+                async with pool.acquire() as con:
+                    bal = await con.fetchval(
+                        """
+                        SELECT COALESCE(SUM(amount_val),0)
+                        FROM economy.transactions
+                        WHERE guild_id=$1 AND character_name=$2
+                        """,
+                        current_gid,
+                        legacy_char.name,
+                    )
+                    assets = await con.fetch(
+                        """
+                        SELECT asset_type, label
+                        FROM economy.assets
+                        WHERE guild_id=$1 AND character_name=$2
+                        ORDER BY created_at ASC
+                        LIMIT 10
+                        """,
+                        current_gid,
+                        legacy_char.name,
+                    )
 
-    legacy_char = await fetch_character_by_name(legacy_gid, character)
-    if not legacy_char:
-        return await interaction.response.send_message("Character not found.", ephemeral=True)
+                e = discord.Embed(title="💳 Balance Card")
+                e.add_field(name="Character", value=f"**{legacy_char.name}**", inline=True)
+                e.add_field(name="Owner", value=user_label_from_cache(legacy_char.user_id), inline=True)
+                e.add_field(name="Balance", value=f"**{format_currency(int(bal))}**", inline=False)
 
-    if legacy_char.archived and not staff:
-        return await interaction.response.send_message("That character is archived.", ephemeral=True)
+                if assets:
+                    lines = [f"• **{a['asset_type']}** — {a['label']}" for a in assets]
+                    e.add_field(name="Assets", value="\n".join(lines), inline=False)
+                else:
+                    e.add_field(name="Assets", value="_None_", inline=False)
 
-    if legacy_char.user_id != interaction.user.id and not staff:
-        return await interaction.response.send_message("You can only view your own characters.", ephemeral=True)
+                await interaction.response.send_message(embed=e, ephemeral=True)
 
-    current_gid = interaction.guild.id
+            @bot.tree.command(
+                name="econ_adjust",
+                description="Admin: add/subtract currency from a character.",
+                guild=discord.Object(id=GUILD_ID),
+            )
+            @app_commands.describe(
+                character="Pick a character",
+                operation="Add or subtract",
+                amount="Whole number amount",
+                unit="Currency unit",
+                reason="Required reason for audit log",
+            )
+            @app_commands.autocomplete(character=character_autocomplete)
+            @app_commands.choices(
+                operation=[
+                    app_commands.Choice(name="Add", value="add"),
+                    app_commands.Choice(name="Subtract", value="sub"),
+                ],
+                unit=[
+                    app_commands.Choice(name="Cinth (1 Val)", value="CINTH"),
+                    app_commands.Choice(name="Arce (10 Val)", value="ARCE"),
+                    app_commands.Choice(name="Elsh (100 Val)", value="ELSH"),
+                    app_commands.Choice(name="Orin (1,000 Val)", value="ORIN"),
+                    app_commands.Choice(name="Novir (10,000 Val)", value="NOVIR"),
+                    app_commands.Choice(name="Val (base)", value="VAL"),
+                ],
+            )
+            async def econ_adjust(
+                interaction: discord.Interaction,
+                character: str,
+                operation: app_commands.Choice[str],
+                amount: int,
+                unit: app_commands.Choice[str],
+                reason: str,
+            ):
+                if interaction.guild is None:
+                    return await interaction.response.send_message("Use this in the server.", ephemeral=True)
 
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        bal = await con.fetchval(
-            """
-            SELECT COALESCE(SUM(amount_val),0)
-            FROM economy.transactions
-            WHERE guild_id=$1 AND character_name=$2
-            """,
-            current_gid,
-            legacy_char.name,
-        )
-        assets = await con.fetch(
-            """
-            SELECT asset_type, label
-            FROM economy.assets
-            WHERE guild_id=$1 AND character_name=$2
-            ORDER BY created_at ASC
-            LIMIT 10
-            """,
-            current_gid,
-            legacy_char.name,
-        )
+                if not is_staff_member(interaction):
+                    return await interaction.response.send_message("You don’t have permission to use this.", ephemeral=True)
 
-    e = discord.Embed(title="💳 Balance Card")
-    e.add_field(name="Character", value=f"**{legacy_char.name}**", inline=True)
-    e.add_field(name="Owner", value=user_label_from_cache(legacy_char.user_id), inline=True)
-    e.add_field(name="Balance", value=f"**{format_currency(int(bal))}**", inline=False)
+                legacy_gid = legacy_guild_id(interaction.guild.id)
+                legacy_char = await fetch_character_by_name(legacy_gid, character)
+                if not legacy_char:
+                    return await interaction.response.send_message("Character not found.", ephemeral=True)
 
-    if assets:
-        lines = [f"• **{a['asset_type']}** — {a['label']}" for a in assets]
-        e.add_field(name="Assets", value="\n".join(lines), inline=False)
-    else:
-        e.add_field(name="Assets", value="_None_", inline=False)
+                if amount <= 0:
+                    return await interaction.response.send_message("Amount must be positive.", ephemeral=True)
 
-    await interaction.response.send_message(embed=e, ephemeral=True)
+                delta = to_val(amount, unit.value)
+                if operation.value == "sub":
+                    delta = -delta
 
-@bot.tree.command(
-    name="econ_adjust",
-    description="Admin: add/subtract currency from a character.",
-    guild=discord.Object(id=GUILD_ID),
-)
-@app_commands.describe(
-    character="Pick a character",
-    operation="Add or subtract",
-    amount="Whole number amount",
-    unit="Currency unit",
-    reason="Required reason for audit log",
-)
-@app_commands.autocomplete(character=character_autocomplete)
-@app_commands.choices(
-    operation=[
-        app_commands.Choice(name="Add", value="add"),
-        app_commands.Choice(name="Subtract", value="sub"),
-    ],
-    unit=[
-        app_commands.Choice(name="Cinth (1 Val)", value="CINTH"),
-        app_commands.Choice(name="Arce (10 Val)", value="ARCE"),
-        app_commands.Choice(name="Elsh (100 Val)", value="ELSH"),
-        app_commands.Choice(name="Orin (1,000 Val)", value="ORIN"),
-        app_commands.Choice(name="Novir (10,000 Val)", value="NOVIR"),
-        app_commands.Choice(name="Val (base)", value="VAL"),
-    ],
-)
-async def econ_adjust(
-    interaction: discord.Interaction,
-    character: str,
-    operation: app_commands.Choice[str],
-    amount: int,
-    unit: app_commands.Choice[str],
-    reason: str,
-):
-    if interaction.guild is None:
-        return await interaction.response.send_message("Use this in the server.", ephemeral=True)
+                current_gid = interaction.guild.id
 
-    if not is_staff_member(interaction):
-        return await interaction.response.send_message("You don’t have permission to use this.", ephemeral=True)
+                pool = await get_pool()
+                async with pool.acquire() as con:
+                    await con.execute(
+                        """
+                        INSERT INTO economy.transactions
+                          (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind, metadata)
+                        VALUES
+                          ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                        """,
+                        current_gid,
+                        legacy_char.name,
+                        legacy_char.user_id,
+                        delta,
+                        reason.strip(),
+                        interaction.user.id,
+                        "adjust",
+                        json.dumps({"unit": unit.value, "amount": amount, "operation": operation.value}),
+                    )
 
-    legacy_gid = legacy_guild_id(interaction.guild.id)
-    legacy_char = await fetch_character_by_name(legacy_gid, character)
-    if not legacy_char:
-        return await interaction.response.send_message("Character not found.", ephemeral=True)
+                    bal = await con.fetchval(
+                        """
+                        SELECT COALESCE(SUM(amount_val),0)
+                        FROM economy.transactions
+                        WHERE guild_id=$1 AND character_name=$2
+                        """,
+                        current_gid,
+                        legacy_char.name,
+                    )
+        except Exception as e:
+            # Avoid "application did not respond" by returning a clear error
+            await interaction.followup.send(f"❌ econ_adjust failed: {type(e).__name__}: {e}", ephemeral=True)
+            return
 
-    if amount <= 0:
-        return await interaction.response.send_message("Amount must be positive.", ephemeral=True)
-
-    delta = to_val(amount, unit.value)
-    if operation.value == "sub":
-        delta = -delta
-
-    current_gid = interaction.guild.id
-
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            INSERT INTO economy.transactions
-              (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind, metadata)
-            VALUES
-              ($1, $2, $3, $4, $5, $6, $7, $8)
-            """,
-            current_gid,
-            legacy_char.name,
-            legacy_char.user_id,
-            delta,
-            reason.strip(),
-            interaction.user.id,
-            "adjust",
-            {"unit": unit.value, "amount": amount, "operation": operation.value},
-        )
-
-        bal = await con.fetchval(
-            """
-            SELECT COALESCE(SUM(amount_val),0)
-            FROM economy.transactions
-            WHERE guild_id=$1 AND character_name=$2
-            """,
-            current_gid,
-            legacy_char.name,
-        )
 
     sign = "+" if delta >= 0 else ""
     await interaction.response.send_message(
@@ -637,7 +665,7 @@ async def econ_adjust(
     await update_bank_dashboard(bot)
 
 def main():
-    print(f"[{ENV}] Starting EconBot_v4…")
+    print(f"[{ENV}] Starting EconBot_v5…")
     bot.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
