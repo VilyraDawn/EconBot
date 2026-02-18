@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 from datetime import datetime
 import datetime as dt
 from zoneinfo import ZoneInfo
@@ -566,6 +567,7 @@ CREATE TABLE IF NOT EXISTS economy.character_assets (
   id BIGSERIAL PRIMARY KEY,
   guild_id BIGINT NOT NULL,
   character_name TEXT NOT NULL,
+  character_user_id BIGINT NOT NULL,
   instance_no INT NOT NULL DEFAULT 1,
   asset_type TEXT NOT NULL,
   secondary_type TEXT NOT NULL,
@@ -916,11 +918,11 @@ async def render_bank_embed(bot_client: discord.Client) -> discord.Embed:
             GUILD_ID,
         )
 
-    assets_by_char: dict[str, list[tuple[str,str,int,int]]] = {}
+    assets_by_char: dict[str, list[tuple[str,str,int]]] = {}
     for r in asset_rows:
         cname = str(r["character_name"])
         assets_by_char.setdefault(cname, []).append(
-            (str(r["secondary_type"]), str(r["custom_name"] or ""), int(r["tier"]), int(r["instance_no"]))
+            (str(r["custom_name"] or ""), str(r["tier_name"] or ""), int(r["instance_no"]))
         )
 
     embed = discord.Embed(
@@ -960,16 +962,23 @@ async def render_bank_embed(bot_client: discord.Client) -> discord.Embed:
         line = f"• **{name}** — {format_currency(bal)}"
         aset = assets_by_char.get(name) or []
         if aset:
-            # show compact list; subtype + custom name only, with tier
-            parts = []
-            for (subtype, nm, tier, inst) in aset[:6]:
+            lines2 = []
+            for (nm, tier_name, inst) in aset[:12]:
                 disp = nm.strip() if nm and nm.strip() else "(unnamed)"
+                tn = tier_name.strip() if tier_name and tier_name.strip() else "Unknown Tier"
                 inst_suffix = f" [#{inst}]" if inst > 1 else ""
-                parts.append(f"{subtype} — {disp}{inst_suffix} (T{tier})")
+                lines2.append(f"  {disp}{inst_suffix} - {tn}")
             more = ""
-            if len(aset) > 6:
-                more = f" +{len(aset)-6} more"
-            line += f"\n  Assets: " + "; ".join(parts) + more
+            if len(aset) > 12:
+                more = f"  +{len(aset)-12} more"
+            assets_text = "
+".join(lines2)
+            if more:
+                assets_text = assets_text + "
+" + more
+            line += "
+  __*Assets*__
+" + assets_text
         current_lines.append(line)
 
     flush()
@@ -1056,6 +1065,10 @@ class EconBot(discord.Client):
         # Lightweight migrations (safe to re-run)
         async with pool.acquire() as con:
             await con.execute("ALTER TABLE IF EXISTS economy.character_assets ADD COLUMN IF NOT EXISTS custom_name TEXT NOT NULL DEFAULT ''")
+            await con.execute("ALTER TABLE IF EXISTS economy.character_assets ADD COLUMN IF NOT EXISTS character_user_id BIGINT")
+            await con.execute("UPDATE economy.character_assets SET character_user_id = COALESCE(character_user_id, 0) WHERE character_user_id IS NULL")
+            await con.execute("ALTER TABLE economy.character_assets ALTER COLUMN character_user_id SET NOT NULL")
+            await con.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_character_assets_name ON economy.character_assets (guild_id, character_name, character_user_id, custom_name)")
             await con.execute("ALTER TABLE IF EXISTS economy.assets ADD COLUMN IF NOT EXISTS instance_no INT NOT NULL DEFAULT 1")
             await upsert_asset_catalog(con)
             await ensure_asset_rules(con)
@@ -1121,6 +1134,43 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
     if interaction.guild is None:
         return []
 
+
+async def owned_asset_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete owned asset names for the selected character (economy.character_assets)."""
+    try:
+        character_name = None
+        for opt in interaction.data.get("options", []):
+            if opt.get("name") == "character":
+                character_name = opt.get("value")
+                break
+        if not character_name:
+            return []
+
+        legacy_gid = legacy_guild_id(interaction.guild.id) if interaction.guild else GUILD_ID
+        legacy_char = await fetch_character_by_name(legacy_gid, str(character_name))
+        if not legacy_char:
+            return []
+
+        pool = await get_pool()
+        async with pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT custom_name
+                FROM economy.character_assets
+                WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3 AND custom_name ILIKE $4
+                ORDER BY custom_name ASC
+                LIMIT 25
+                """,
+                interaction.guild.id,
+                legacy_char.name,
+                legacy_char.user_id,
+                f"%{current}%",
+            )
+        return [app_commands.Choice(name=str(r["custom_name"]), value=str(r["custom_name"])) for r in rows if str(r["custom_name"]).strip()]
+    except Exception:
+        return []
+
+
     staff = is_staff_member(interaction)
     gid = legacy_guild_id(interaction.guild.id)
 
@@ -1141,7 +1191,7 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
     guild=discord.Object(id=GUILD_ID),
 )
 @app_commands.describe(character="Pick a character")
-@app_commands.autocomplete(character=character_autocomplete)
+@app_commands.autocomplete(character=character_autocomplete, upgrade_asset=owned_asset_autocomplete)
 async def income(interaction: discord.Interaction, character: str):
     if interaction.guild is None:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
@@ -1275,13 +1325,13 @@ async def balance(interaction: discord.Interaction, character: str):
         )
         assets = await con.fetch(
             """
-            SELECT asset_type, label
-            FROM economy.assets
+            SELECT secondary_type, custom_name, tier_name, instance_no
+            FROM economy.character_assets
             WHERE guild_id = $1 AND character_name = $2
-            ORDER BY created_at ASC
-            LIMIT 10
+            ORDER BY asset_type ASC, secondary_type ASC, instance_no ASC, created_at ASC
+            LIMIT 50
             """,
-            current_gid,
+            interaction.guild.id,
             legacy_char.name,
         )
 
@@ -1293,14 +1343,13 @@ async def balance(interaction: discord.Interaction, character: str):
     if assets:
         lines = []
         for a in assets:
-            subtype = str(a["secondary_type"])
-            nm = str(a["custom_name"] or "").strip()
-            t = int(a["tier"])
+            nm = str(a["custom_name"] or "").strip() or "(unnamed)"
+            tier_name = str(a["tier_name"] or "").strip() or "Unknown Tier"
             inst = int(a["instance_no"])
             inst_suffix = f" [#{inst}]" if inst > 1 else ""
-            display_name = nm if nm else "(unnamed)"
-            lines.append(f"• **{subtype}** — {display_name}{inst_suffix} (T{t})")
-        text = "\n".join(lines)
+            lines.append(f"• {nm}{inst_suffix} - {tier_name}")
+        text = "
+".join(lines)
         if len(text) > 3900:
             text = text[:3900] + "…"
         e.add_field(name="Assets", value=text, inline=False)
@@ -1372,13 +1421,45 @@ async def econ_adjust(
 
     current_gid = interaction.guild.id
 
+    
     pool = await get_pool()
     async with pool.acquire() as con:
-        # Store metadata safely as JSON string
-        await con.execute(
-            """
-            INSERT INTO economy.transactions
-              (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind, metadata)
+        async with con.transaction():
+            await con.execute("SELECT pg_advisory_xact_lock($1)", _advisory_key(interaction.guild.id, legacy_char.name))
+
+            if delta < 0:
+                ok, cur, shortfall = await ensure_can_debit(
+                    con,
+                    guild_id=interaction.guild.id,
+                    character_name=legacy_char.name,
+                    debit_val=abs(delta),
+                )
+                if not ok:
+                    await interaction.followup.send(
+                        f"❌ Insufficient funds for **{legacy_char.name}**.\n"
+                        f"Balance: **{format_currency(cur)}**\n"
+                        f"Required: **{format_currency(abs(delta))}**\n"
+                        f"Shortfall: **{format_currency(shortfall)}**",
+                        ephemeral=True,
+                    )
+                    return
+
+            await con.execute(
+                """
+                INSERT INTO economy.transactions
+                  (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind, metadata)
+                VALUES
+                  ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                """,
+                interaction.guild.id,
+                legacy_char.name,
+                legacy_char.user_id,
+                delta,
+                reason.strip(),
+                interaction.user.id,
+                "econ_adjust",
+                json.dumps({"operation": op.value, "unit": unit.value, "amount": amount}),
+            )
             VALUES
               ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
             """,
@@ -1674,6 +1755,7 @@ async def asset_autocomplete(interaction: discord.Interaction, current: str):
     tier="Tier to purchase/upgrade to",
     quantity="How many to buy (only if asset is stackable)",
     asset_name="Custom name for the asset (required when creating a new asset)",
+    upgrade_asset="Select an owned asset to upgrade (by name)",
     reason="Reason (required)",
 )
 @app_commands.autocomplete(character=character_autocomplete, asset=asset_autocomplete)
@@ -1693,6 +1775,7 @@ async def econ_purchase(
     tier: app_commands.Choice[int],
     quantity: int = 1,
     asset_name: str = "",
+    upgrade_asset: str = "",
     reason: str = "",
 ):
     if interaction.guild is None:
@@ -1726,13 +1809,176 @@ async def econ_purchase(
 
     await interaction.response.defer(ephemeral=True)
 
+    
     pool = await get_pool()
     async with pool.acquire() as con:
-        stackable, max_instances = await get_asset_rule(con, asset_type, secondary_type)
+        async with con.transaction():
+            await con.execute("SELECT pg_advisory_xact_lock($1)", _advisory_key(interaction.guild.id, legacy_char.name))
 
-        cat = await get_catalog_row(con, asset_type, secondary_type, desired_tier)
-        if not cat:
-            await interaction.followup.send("Asset tier not found in catalog.", ephemeral=True)
+            cat = await con.fetchrow(
+                """
+                SELECT tier_name, cost_val, income_val
+                FROM economy.asset_catalog
+                WHERE asset_type=$1 AND secondary_type=$2 AND tier=$3
+                """,
+                asset_type,
+                secondary_type,
+                desired_tier,
+            )
+            if not cat:
+                await interaction.followup.send(f"✅ Purchase recorded for **{legacy_char.name}** — **{tier_name}**.", ephemeral=True)
+                    return
+
+                await con.execute(
+                    """
+                    INSERT INTO economy.transactions
+                      (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind, metadata)
+                    VALUES
+                      ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+                    """,
+                    interaction.guild.id,
+                    legacy_char.name,
+                    legacy_char.user_id,
+                    -cost_val,
+                    reason.strip(),
+                    interaction.user.id,
+                    "purchase_upgrade",
+                    json.dumps({"secondary_type": secondary_type, "custom_name": upgrade_asset, "tier": desired_tier}),
+                )
+
+                await con.execute(
+                    """
+                    UPDATE economy.character_assets
+                    SET tier=$1, tier_name=$2, income_val=$3, updated_at=NOW()
+                    WHERE guild_id=$4 AND character_name=$5 AND character_user_id=$6 AND custom_name=$7
+                    """,
+                    desired_tier,
+                    tier_name,
+                    income_val,
+                    interaction.guild.id,
+                    legacy_char.name,
+                    legacy_char.user_id,
+                    upgrade_asset,
+                )
+
+            else:
+                asset_name = (asset_name or "").strip()
+                if not asset_name:
+                    await interaction.followup.send("Asset name is required when creating a new asset.", ephemeral=True)
+                    return
+
+                rule = await con.fetchrow(
+                    """
+                    SELECT stackable, max_instances
+                    FROM economy.asset_rules
+                    WHERE asset_type=$1 AND secondary_type=$2
+                    """,
+                    asset_type,
+                    secondary_type,
+                )
+                stackable = bool(rule["stackable"]) if rule else False
+                max_instances = int(rule["max_instances"]) if rule and rule["max_instances"] is not None else 1
+
+                qty = int(quantity) if int(quantity) > 0 else 1
+                if not stackable:
+                    qty = 1
+
+                # name uniqueness per character+user
+                exists = await con.fetchval(
+                    """
+                    SELECT 1 FROM economy.character_assets
+                    WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3 AND custom_name=$4
+                    """,
+                    interaction.guild.id,
+                    legacy_char.name,
+                    legacy_char.user_id,
+                    asset_name,
+                )
+                if exists:
+                    await interaction.followup.send("That asset name already exists for this character. Choose a different name.", ephemeral=True)
+                    return
+
+                if stackable:
+                    have = await con.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM economy.character_assets
+                        WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3 AND asset_type=$4 AND secondary_type=$5
+                        """,
+                        interaction.guild.id,
+                        legacy_char.name,
+                        legacy_char.user_id,
+                        asset_type,
+                        secondary_type,
+                    )
+                    have = int(have or 0)
+                    if have + qty > max_instances:
+                        await interaction.followup.send(f"Cannot purchase {qty}. Max instances is {max_instances}. You currently have {have}.", ephemeral=True)
+                        return
+
+                total_cost = cost_val * qty
+                ok, cur, shortfall = await ensure_can_debit(con, guild_id=interaction.guild.id, character_name=legacy_char.name, debit_val=total_cost)
+                if not ok:
+                    await interaction.followup.send(
+                        f"❌ Insufficient funds for **{legacy_char.name}**.\n"
+                        f"Balance: **{format_currency(cur)}**\n"
+                        f"Required: **{format_currency(total_cost)}**\n"
+                        f"Shortfall: **{format_currency(shortfall)}**",
+                        ephemeral=True,
+                    )
+                    return
+
+                await con.execute(
+                    """
+                    INSERT INTO economy.transactions
+                      (guild_id, character_name, character_user_id, amount_val, reason, actor_user_id, kind, metadata)
+                    VALUES
+                      ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+                    """,
+                    interaction.guild.id,
+                    legacy_char.name,
+                    legacy_char.user_id,
+                    -total_cost,
+                    reason.strip(),
+                    interaction.user.id,
+                    "purchase_new",
+                    json.dumps({"secondary_type": secondary_type, "custom_name": asset_name, "tier": desired_tier, "quantity": qty}),
+                )
+
+                next_inst = await con.fetchval(
+                    """
+                    SELECT COALESCE(MAX(instance_no),0)+1
+                    FROM economy.character_assets
+                    WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3
+                    """,
+                    interaction.guild.id,
+                    legacy_char.name,
+                    legacy_char.user_id,
+                )
+                next_inst = int(next_inst or 1)
+
+                for i in range(qty):
+                    nm = asset_name if qty == 1 else f"{asset_name} #{i+1}"
+                    inst = next_inst + i
+                    await con.execute(
+                        """
+                        INSERT INTO economy.character_assets
+                          (guild_id, character_name, character_user_id, instance_no, asset_type, secondary_type, custom_name, tier, tier_name, income_val)
+                        VALUES
+                          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                        """,
+                        interaction.guild.id,
+                        legacy_char.name,
+                        legacy_char.user_id,
+                        inst,
+                        asset_type,
+                        secondary_type,
+                        nm,
+                        desired_tier,
+                        tier_name,
+                        income_val,
+                    )
+await interaction.followup.send("Asset tier not found in catalog.", ephemeral=True)
             return
 
         new_cost = int(cat["cost_val"])
@@ -1770,7 +2016,7 @@ async def econ_purchase(
                 await con.execute(
                     """
                     INSERT INTO economy.character_assets
-                      (guild_id, character_name, instance_no, asset_type, secondary_type, custom_name, tier, tier_name, income_val)
+                      (guild_id, character_name, character_user_id, instance_no, asset_type, secondary_type, custom_name, tier, tier_name, income_val)
                     VALUES
                       ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                     """,
