@@ -19,7 +19,7 @@ except Exception:
 # -------------------------
 # Version / Config
 # -------------------------
-VERSION = "EconBot_v22"
+VERSION = "EconBot_v23"
 
 TZ_NAME = "America/Chicago"
 TZ = ZoneInfo(TZ_NAME) if ZoneInfo else dt.timezone.utc
@@ -36,27 +36,55 @@ DENOMS = [
 ]
 
 
-def _req(name: str) -> str:
+def _get(name: str, default: str | None = None) -> str | None:
     v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        raise RuntimeError(f"Missing required env var: {name}")
-    return str(v).strip()
+    if v is None:
+        return default
+    v = str(v).strip()
+    return v if v else default
 
 
-DISCORD_TOKEN = _req("DISCORD_TOKEN")
-DATABASE_URL = _req("DATABASE_URL")
+def _req_token() -> str:
+    v = _get("DISCORD_TOKEN")
+    if not v:
+        raise RuntimeError("Missing required env var: DISCORD_TOKEN")
+    return v
 
-GUILD_ID = int(_req("GUILD_ID"))
-LEGACY_SOURCE_GUILD_ID = int(_req("LEGACY_SOURCE_GUILD_ID"))
 
-BANK_CHANNEL_ID = int(_req("BANK_CHANNEL_ID"))
-ECON_LOG_CHANNEL_ID = int(_req("ECON_LOG_CHANNEL_ID"))
+def _parse_int(v: str | None) -> int | None:
+    try:
+        return int(v) if v is not None and str(v).strip() != "" else None
+    except Exception:
+        return None
 
-BANK_MESSAGE_IDS = [int(x.strip()) for x in _req("BANK_MESSAGE_IDS").split(",") if x.strip().isdigit()]
+
+def _parse_int_list(v: str | None) -> list[int]:
+    if not v:
+        return []
+    out: list[int] = []
+    for part in v.split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.append(int(part))
+    return out
+
+
+def _parse_int_set(v: str | None) -> set[int]:
+    return set(_parse_int_list(v))
+DISCORD_TOKEN = _req_token()
+DATABASE_URL = _get("DATABASE_URL")
+
+GUILD_ID = _parse_int(_get("GUILD_ID"))
+LEGACY_SOURCE_GUILD_ID = _parse_int(_get("LEGACY_SOURCE_GUILD_ID")) or GUILD_ID
+
+BANK_CHANNEL_ID = _parse_int(_get("BANK_CHANNEL_ID"))
+ECON_LOG_CHANNEL_ID = _parse_int(_get("ECON_LOG_CHANNEL_ID"))
+
+BANK_MESSAGE_IDS = _parse_int_list(_get("BANK_MESSAGE_IDS"))
 if not BANK_MESSAGE_IDS:
     raise RuntimeError("BANK_MESSAGE_IDS must contain at least one message id")
 
-ECON_ADMIN_ROLE_IDS = {int(x.strip()) for x in _req("ECON_ADMIN_ROLE_IDS").split(",") if x.strip().isdigit()}
+ECON_ADMIN_ROLE_IDS = _parse_int_set(_get("ECON_ADMIN_ROLE_IDS"))
 if not ECON_ADMIN_ROLE_IDS:
     raise RuntimeError("ECON_ADMIN_ROLE_IDS must contain at least one role id")
 
@@ -440,588 +468,39 @@ def is_admin_member(interaction: discord.Interaction) -> bool:
 
 
 def require_admin():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        return is_admin_member(interaction)
-    return app_commands.check(predicate)
-
-
-async def send_log(message: str):
-    try:
-        ch = client.get_channel(ECON_LOG_CHANNEL_ID)
-        if isinstance(ch, discord.TextChannel):
-            await ch.send(message, allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
-        pass
-
-
-# -------------------------
-# Autocomplete
-# -------------------------
-async def character_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as con:
-            chars = await search_legacy_characters(con, current, limit=25)
-        return [app_commands.Choice(name=c.name, value=c.name) for c in chars]
-    except Exception:
-        return []
-
-
-async def owned_asset_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    try:
-        # Need character selection to filter owned assets
-        selected_character = None
-        for opt in interaction.data.get("options", []):
-            if opt.get("name") == "character":
-                selected_character = opt.get("value")
-                break
-        if not selected_character:
-            return []
-        pool = await get_pool()
-        async with pool.acquire() as con:
-            legacy = await fetch_legacy_character_by_name(con, str(selected_character))
-            if not legacy:
-                return []
-            rows = await con.fetch(
-                """
-                SELECT asset_name
-                FROM economy.character_assets
-                WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3
-                  AND asset_name ILIKE $4
-                ORDER BY asset_name ASC
-                LIMIT 25
-                """,
-                interaction.guild.id if interaction.guild else GUILD_ID,
-                legacy.name,
-                legacy.user_id,
-                f"%{current}%",
-            )
-        return [app_commands.Choice(name=str(r["asset_name"]), value=str(r["asset_name"])) for r in rows]
-    except Exception:
-        return []
-
-
-async def asset_type_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as con:
-            rows = await con.fetch(
-                """
-                SELECT DISTINCT secondary_type
-                FROM economy.asset_catalog
-                WHERE secondary_type ILIKE $1
-                ORDER BY secondary_type ASC
-                LIMIT 25
-                """,
-                f"%{current}%",
-            )
-        return [app_commands.Choice(name=str(r["secondary_type"]), value=str(r["secondary_type"])) for r in rows]
-    except Exception:
-        return []
-
-
-async def tier_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    try:
-        selected_type = None
-        for opt in interaction.data.get("options", []):
-            if opt.get("name") == "asset_type":
-                selected_type = opt.get("value")
-                break
-        if not selected_type:
-            return []
-        pool = await get_pool()
-        async with pool.acquire() as con:
-            rows = await con.fetch(
-                """
-                SELECT tier_name
-                FROM economy.asset_catalog
-                WHERE secondary_type=$1 AND tier_name ILIKE $2
-                ORDER BY tier ASC
-                LIMIT 25
-                """,
-                str(selected_type),
-                f"%{current}%",
-            )
-        return [app_commands.Choice(name=str(r["tier_name"]), value=str(r["tier_name"])) for r in rows]
-    except Exception:
-        return []
-
-
-# -------------------------
-# Embeds / Dashboard
-# -------------------------
-def build_balance_embed(character_name: str, balance_val: int, assets: List[Tuple[str, str]]):
-    em = discord.Embed(title=character_name)
-    em.add_field(name="Balance", value=format_denoms(balance_val), inline=False)
-
-    if assets:
-        lines = [f"{n} - {tier}" for (n, tier) in assets]
-        assets_text = "\n".join(lines)
-        em.add_field(name="__*Assets*__", value=assets_text, inline=False)
-    else:
-        em.add_field(name="__*Assets*__", value="None", inline=False)
-    em.set_footer(text=VERSION)
-    return em
-
-
-async def rebuild_dashboard():
-    """
-    Updates the Bank of Vilyra messages with public balances & assets.
-    """
-    pool = await get_pool()
-    guild = client.get_guild(GUILD_ID)
-    if guild is None:
-        return
-
-    bank_channel = client.get_channel(BANK_CHANNEL_ID)
-    if not isinstance(bank_channel, discord.TextChannel):
-        return
-
-    async with pool.acquire() as con:
-        # We only show characters that have a balance row OR at least one asset.
-        rows = await con.fetch(
-            """
-            WITH chars AS (
-              SELECT b.guild_id, b.character_name, b.character_user_id, b.balance_val
-              FROM economy.balances b
-              WHERE b.guild_id=$1
-              UNION
-              SELECT a.guild_id, a.character_name, a.character_user_id, 0::bigint AS balance_val
-              FROM economy.character_assets a
-              WHERE a.guild_id=$1
-            )
-            SELECT DISTINCT guild_id, character_name, character_user_id,
-                (SELECT balance_val FROM economy.balances b2
-                 WHERE b2.guild_id=chars.guild_id AND b2.character_name=chars.character_name AND b2.character_user_id=chars.character_user_id
-                ) AS balance_val
-            FROM chars
-            ORDER BY character_name ASC
-            """,
-            GUILD_ID,
-        )
-
-        # Build embeds in pages
-        embeds: List[discord.Embed] = []
-        for r in rows:
-            cname = str(r["character_name"])
-            cuid = int(r["character_user_id"])
-            bal = int(r["balance_val"] or 0)
-
-            asset_rows = await con.fetch(
-                """
-                SELECT asset_name, tier_name
-                FROM economy.character_assets
-                WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3
-                ORDER BY asset_name ASC
-                """,
-                GUILD_ID, cname, cuid
-            )
-            assets = [(str(a["asset_name"]), str(a["tier_name"])) for a in asset_rows]
-            embeds.append(build_balance_embed(cname, bal, assets))
-
-        # Split into chunks per message (Discord embed limit per message: up to 10)
-        chunks = [embeds[i:i+10] for i in range(0, len(embeds), 10)]
-        # Ensure we have at least as many message slots as chunks; we will only fill up to len(BANK_MESSAGE_IDS)
-        for idx, msg_id in enumerate(BANK_MESSAGE_IDS):
-            try:
-                msg = await bank_channel.fetch_message(msg_id)
-            except Exception:
-                continue
-
-            if idx < len(chunks):
-                await msg.edit(content="**Bank of Vilyra**", embeds=chunks[idx], allowed_mentions=discord.AllowedMentions.none())
-            else:
-                # clear extra messages if any
-                await msg.edit(content="**Bank of Vilyra**", embeds=[], allowed_mentions=discord.AllowedMentions.none())
-
-
-# -------------------------
-# Commands
-# -------------------------
-@tree.command(name="balance", description="Show a character's balance and assets.")
-@app_commands.describe(character="Character name")
-@app_commands.autocomplete(character=character_autocomplete)
-async def balance_cmd(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        legacy = await fetch_legacy_character_by_name(con, character)
-        if not legacy:
-            await interaction.followup.send("Character not found in Legacy records.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            return
-
-        bal = await get_balance_val(con, GUILD_ID, legacy.name, legacy.user_id)
-        asset_rows = await con.fetch(
-            """
-            SELECT asset_name, tier_name
-            FROM economy.character_assets
-            WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3
-            ORDER BY asset_name ASC
-            """,
-            GUILD_ID, legacy.name, legacy.user_id
-        )
-        assets = [(str(a["asset_name"]), str(a["tier_name"])) for a in asset_rows]
-        em = build_balance_embed(legacy.name, bal, assets)
-
-    await interaction.followup.send(embed=em, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-    # also update dashboard opportunistically
-    asyncio.create_task(rebuild_dashboard())
-
-
-@tree.command(name="income", description="Claim daily income for one of your characters (once per day).")
-@app_commands.describe(character="Character name")
-@app_commands.autocomplete(character=character_autocomplete)
-async def income_cmd(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    today = now_chicago_date()
-
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        legacy = await fetch_legacy_character_by_name(con, character)
-        if not legacy:
-            await interaction.followup.send("Character not found in Legacy records.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            return
-
-        # Owner-only
-        if legacy.user_id != interaction.user.id:
-            await interaction.followup.send("You can only claim income for your own characters.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            return
-
-        async with con.transaction():
-            # Prevent race conditions
-            await con.execute("SELECT pg_advisory_xact_lock($1)", int(hash(f"{GUILD_ID}:{legacy.name}:{legacy.user_id}") & 0x7FFFFFFF))
-
-            last = await con.fetchval(
-                """
-                SELECT last_claim_date
-                FROM economy.income_claims
-                WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3
-                """,
-                GUILD_ID, legacy.name, legacy.user_id
-            )
-            if last is not None and isinstance(last, dt.date) and last >= today:
-                await interaction.followup.send("Income already claimed today for this character.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                return
-
-            asset_income = await sum_asset_income(con, GUILD_ID, legacy.name, legacy.user_id)
-            total = int(BASE_DAILY_INCOME_VAL + asset_income)
-
-            ok, new_bal = await adjust_balance_val_guarded(con, GUILD_ID, legacy.name, legacy.user_id, total)
-            if not ok:
-                # This should never happen for positive income, but keep the guard.
-                await interaction.followup.send("Could not apply income (balance guard).", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                return
-
-            await con.execute(
-                """
-                INSERT INTO economy.income_claims (guild_id, character_name, character_user_id, last_claim_date)
-                VALUES ($1,$2,$3,$4)
-                ON CONFLICT (guild_id, character_name, character_user_id)
-                DO UPDATE SET last_claim_date=EXCLUDED.last_claim_date
-                """,
-                GUILD_ID, legacy.name, legacy.user_id, today
-            )
-
-            await log_tx(
-                con,
-                GUILD_ID,
-                legacy.name,
-                legacy.user_id,
-                interaction.user.id,
-                "INCOME",
-                total,
-                "Daily income claim",
-                details={"base_val": BASE_DAILY_INCOME_VAL, "asset_income_val": asset_income, "date": str(today)},
-            )
-
-    await interaction.followup.send(
-        f"✅ Income claimed for **{legacy.name}**.\nAdded: **{format_denoms(total)}**\nNew balance: **{format_denoms(new_bal)}**",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-    asyncio.create_task(send_log(f"[INCOME] {interaction.user.id} claimed {total} Val for {legacy.name}"))
-    asyncio.create_task(rebuild_dashboard())
-
-
-@tree.command(name="econ_adjust", description="Staff: add/subtract currency from a character (cannot go negative).")
-@require_admin()
-@app_commands.describe(character="Character name", operation="ADD or SUBTRACT", amount_val="Amount in Val", reason="Reason")
-@app_commands.autocomplete(character=character_autocomplete)
-async def econ_adjust_cmd(interaction: discord.Interaction, character: str, operation: str, amount_val: int, reason: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    op = (operation or "").strip().upper()
-    if op not in {"ADD", "SUBTRACT"}:
-        await interaction.followup.send("Operation must be ADD or SUBTRACT.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-    if amount_val <= 0:
-        await interaction.followup.send("Amount must be a positive integer Val amount.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-    if not reason.strip():
-        await interaction.followup.send("Reason is required.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-
-    delta = int(amount_val if op == "ADD" else -amount_val)
-
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        legacy = await fetch_legacy_character_by_name(con, character)
-        if not legacy:
-            await interaction.followup.send("Character not found in Legacy records.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            return
-
-        async with con.transaction():
-            await con.execute("SELECT pg_advisory_xact_lock($1)", int(hash(f"{GUILD_ID}:{legacy.name}:{legacy.user_id}") & 0x7FFFFFFF))
-
-            ok, new_bal = await adjust_balance_val_guarded(con, GUILD_ID, legacy.name, legacy.user_id, delta)
-            if not ok:
-                await interaction.followup.send("❌ Insufficient funds. This adjustment would make the balance negative.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                return
-
-            await log_tx(
-                con,
-                GUILD_ID,
-                legacy.name,
-                legacy.user_id,
-                interaction.user.id,
-                "ADJUST",
-                delta,
-                reason,
-                details={"operation": op, "amount_val": amount_val},
-            )
-
-    await interaction.followup.send(
-        f"✅ Adjustment applied to **{legacy.name}**.\nDelta: **{format_denoms(delta if delta>0 else -delta)}** ({op})\nNew balance: **{format_denoms(new_bal)}**",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-    asyncio.create_task(send_log(f"[ADJUST] {interaction.user.id} {op} {amount_val} Val for {legacy.name}. Reason: {reason}"))
-    asyncio.create_task(rebuild_dashboard())
-
-
-@tree.command(name="econ_set_balance", description="Staff: set a character's balance exactly (non-negative).")
-@require_admin()
-@app_commands.describe(character="Character name", new_balance_val="New balance in Val", reason="Reason")
-@app_commands.autocomplete(character=character_autocomplete)
-async def econ_set_balance_cmd(interaction: discord.Interaction, character: str, new_balance_val: int, reason: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    if new_balance_val < 0:
-        await interaction.followup.send("New balance cannot be negative.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-    if not reason.strip():
-        await interaction.followup.send("Reason is required.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        legacy = await fetch_legacy_character_by_name(con, character)
-        if not legacy:
-            await interaction.followup.send("Character not found in Legacy records.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            return
-
-        async with con.transaction():
-            await con.execute("SELECT pg_advisory_xact_lock($1)", int(hash(f"{GUILD_ID}:{legacy.name}:{legacy.user_id}") & 0x7FFFFFFF))
-
-            current = await get_balance_val(con, GUILD_ID, legacy.name, legacy.user_id)
-            delta = int(new_balance_val) - int(current)
-            await set_balance_val(con, GUILD_ID, legacy.name, legacy.user_id, int(new_balance_val))
-            await log_tx(
-                con,
-                GUILD_ID,
-                legacy.name,
-                legacy.user_id,
-                interaction.user.id,
-                "SET_BALANCE",
-                delta,
-                reason,
-                details={"old_balance_val": current, "new_balance_val": int(new_balance_val)},
-            )
-
-    await interaction.followup.send(
-        f"✅ Balance set for **{legacy.name}**.\nNew balance: **{format_denoms(int(new_balance_val))}**",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-    asyncio.create_task(send_log(f"[SET_BALANCE] {interaction.user.id} set {legacy.name} to {new_balance_val} Val. Reason: {reason}"))
-    asyncio.create_task(rebuild_dashboard())
-
-
-@tree.command(name="econ_purchase", description="Staff: purchase a new asset or upgrade an existing one.")
-@require_admin()
-@app_commands.describe(
-    character="Character name",
-    action="NEW or UPGRADE",
-    asset_type="Property/asset type (from the asset table)",
-    tier_name="Tier name (from the asset table)",
-    asset_name="Asset name (required for NEW)",
-    upgrade_asset="Owned asset name to upgrade (required for UPGRADE)",
-    reason="Reason",
-)
-@app_commands.autocomplete(
-    character=character_autocomplete,
-    asset_type=asset_type_autocomplete,
-    tier_name=tier_name_autocomplete,
-    upgrade_asset=owned_asset_autocomplete,
-)
-async def econ_purchase_cmd(
-    interaction: discord.Interaction,
-    character: str,
-    action: str,
-    asset_type: str,
-    tier_name: str,
-    asset_name: str = "",
-    upgrade_asset: str = "",
-    reason: str = "",
-):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    act = (action or "").strip().upper()
-    if act not in {"NEW", "UPGRADE"}:
-        await interaction.followup.send("Action must be NEW or UPGRADE.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-    if not reason.strip():
-        await interaction.followup.send("Reason is required.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-    if not asset_type.strip() or not tier_name.strip():
-        await interaction.followup.send("Asset type and tier name are required.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-
-    pool = await get_pool()
-    async with pool.acquire() as con:
-        legacy = await fetch_legacy_character_by_name(con, character)
-        if not legacy:
-            await interaction.followup.send("Character not found in Legacy records.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            return
-
-        # Look up catalog row EXACTLY by (secondary_type, tier_name)
-        cat = await con.fetchrow(
-            """
-            SELECT asset_type, secondary_type, tier, tier_name, cost_val, income_val
-            FROM economy.asset_catalog
-            WHERE secondary_type=$1 AND tier_name=$2
-            LIMIT 1
-            """,
-            str(asset_type),
-            str(tier_name),
-        )
-        if not cat:
-            await interaction.followup.send("That asset type / tier name combination was not found in the asset table.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-            return
-
-        desired_tier = int(cat["tier"])
-        cat_asset_type = str(cat["asset_type"])
-        cat_secondary_type = str(cat["secondary_type"])
-        cat_tier_name = str(cat["tier_name"])
-        cost_val = int(cat["cost_val"])
-        income_val = int(cat["income_val"])
-
-        async with con.transaction():
-            await con.execute("SELECT pg_advisory_xact_lock($1)", int(hash(f"{GUILD_ID}:{legacy.name}:{legacy.user_id}") & 0x7FFFFFFF))
-
-            # Funds check + debit
-            current_bal = await get_balance_val(con, GUILD_ID, legacy.name, legacy.user_id)
-            if current_bal < cost_val:
-                await interaction.followup.send("❌ Insufficient funds for this transaction.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                return
-
-            if act == "NEW":
-                asset_name = (asset_name or "").strip()
-                if not asset_name:
-                    await interaction.followup.send("Asset name is required for NEW purchases.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
-
-                # Insert asset (unique per (guild, character, user, asset_name))
-                try:
-                    await con.execute(
-                        """
-                        INSERT INTO economy.character_assets
-                          (guild_id, character_name, character_user_id, asset_name, asset_type, secondary_type, tier, tier_name, cost_val, income_val)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                        """,
-                        GUILD_ID, legacy.name, legacy.user_id, asset_name,
-                        cat_asset_type, cat_secondary_type, desired_tier, cat_tier_name, cost_val, income_val
-                    )
-                except asyncpg.UniqueViolationError:
-                    await interaction.followup.send("That asset name already exists for this character. Choose a different name.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
-
-                ok, new_bal = await adjust_balance_val_guarded(con, GUILD_ID, legacy.name, legacy.user_id, -cost_val)
-                if not ok:
-                    await interaction.followup.send("❌ Insufficient funds (balance guard).", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
-
-                await log_tx(
-                    con, GUILD_ID, legacy.name, legacy.user_id, interaction.user.id,
-                    "PURCHASE", -cost_val, reason,
-                    details={"action": "NEW", "asset_name": asset_name, "secondary_type": cat_secondary_type, "tier": desired_tier, "tier_name": cat_tier_name, "cost_val": cost_val, "income_val": income_val}
-                )
-
-                await interaction.followup.send(
-                    f"✅ Purchased **{asset_name}** for **{legacy.name}**.\nTier: **{cat_tier_name}**\nCost: **{format_denoms(cost_val)}**\nNew balance: **{format_denoms(new_bal)}**",
+    def deco(func):
+        async def wrapper(interaction: discord.Interaction, *args, **kwargs):
+            if not ECON_ADMIN_ROLE_IDS:
+                await interaction.response.send_message(
+                    "Staff roles are not configured yet (missing ECON_ADMIN_ROLE_IDS). Set it in Railway Variables to enable staff commands.",
                     ephemeral=True,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+                return
 
-            else:
-                # UPGRADE
-                upgrade_asset = (upgrade_asset or "").strip()
-                if not upgrade_asset:
-                    await interaction.followup.send("Select an owned asset to upgrade.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
+            member = interaction.user if isinstance(interaction.user, discord.Member) else None
+            if member is None and interaction.guild is not None:
+                member = interaction.guild.get_member(interaction.user.id)
 
-                owned = await con.fetchrow(
-                    """
-                    SELECT asset_name, secondary_type, tier, tier_name
-                    FROM economy.character_assets
-                    WHERE guild_id=$1 AND character_name=$2 AND character_user_id=$3 AND asset_name=$4
-                    """,
-                    GUILD_ID, legacy.name, legacy.user_id, upgrade_asset
-                )
-                if not owned:
-                    await interaction.followup.send("That owned asset was not found for this character.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
-
-                current_tier = int(owned["tier"])
-                owned_type = str(owned["secondary_type"])
-
-                if owned_type != cat_secondary_type:
-                    await interaction.followup.send("Upgrade tier must be from the same property/asset type.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
-                if desired_tier <= current_tier:
-                    await interaction.followup.send("Upgrade tier must be higher than the current tier.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
-
-                # Apply upgrade (no rename)
-                await con.execute(
-                    """
-                    UPDATE economy.character_assets
-                    SET tier=$1, tier_name=$2, cost_val=$3, income_val=$4, updated_at=NOW()
-                    WHERE guild_id=$5 AND character_name=$6 AND character_user_id=$7 AND asset_name=$8
-                    """,
-                    desired_tier, cat_tier_name, cost_val, income_val,
-                    GUILD_ID, legacy.name, legacy.user_id, upgrade_asset
-                )
-
-                ok, new_bal = await adjust_balance_val_guarded(con, GUILD_ID, legacy.name, legacy.user_id, -cost_val)
-                if not ok:
-                    await interaction.followup.send("❌ Insufficient funds (balance guard).", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-                    return
-
-                await log_tx(
-                    con, GUILD_ID, legacy.name, legacy.user_id, interaction.user.id,
-                    "UPGRADE", -cost_val, reason,
-                    details={"action": "UPGRADE", "asset_name": upgrade_asset, "secondary_type": cat_secondary_type, "from_tier": current_tier, "to_tier": desired_tier, "tier_name": cat_tier_name, "cost_val": cost_val}
-                )
-
-                await interaction.followup.send(
-                    f"✅ Upgraded **{upgrade_asset}** for **{legacy.name}**.\nNew tier: **{cat_tier_name}**\nCost: **{format_denoms(cost_val)}**\nNew balance: **{format_denoms(new_bal)}**",
+            if member is None:
+                await interaction.response.send_message(
+                    "I couldn't verify your roles right now. Please try again in a few seconds.",
                     ephemeral=True,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
+                return
 
-    asyncio.create_task(send_log(f"[PURCHASE] {interaction.user.id} {act} {asset_type} / {tier_name} for {character}. Cost {cost_val}. Reason: {reason}"))
-    asyncio.create_task(rebuild_dashboard())
+            if not any(r.id in ECON_ADMIN_ROLE_IDS for r in getattr(member, "roles", [])):
+                await interaction.response.send_message(
+                    "You don’t have permission to use that command.",
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
 
-
+            return await func(interaction, *args, **kwargs)
+        return wrapper
+    return deco
 
 # -------------------------
 # Command help (admin)
@@ -1080,7 +559,7 @@ async def on_ready():
         print(f"[{VERSION}] Command sync failed: {e}")
 
     print(f"[test] Starting {VERSION}…")
-    print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
+    print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID or 'GLOBAL'}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
 
     # Initial dashboard refresh
     asyncio.create_task(rebuild_dashboard())
