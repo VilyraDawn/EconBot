@@ -1202,6 +1202,34 @@ async def character_autocomplete(interaction: discord.Interaction, current: str)
     if interaction.guild is None:
         return []
 
+
+async def tier_name_autocomplete(interaction: discord.Interaction, current: str):
+    """Autocomplete tier_name from economy.asset_catalog filtered by selected asset_type."""
+    try:
+        asset_type = None
+        for opt in interaction.data.get("options", []):
+            if opt.get("name") == "asset_type":
+                asset_type = opt.get("value")
+                break
+        if not asset_type:
+            return []
+        pool = await get_pool()
+        async with pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT DISTINCT tier_name
+                FROM economy.asset_catalog
+                WHERE secondary_type=$1 AND tier_name ILIKE $2
+                ORDER BY tier_name ASC
+                LIMIT 25
+                """,
+                str(asset_type),
+                f"%{current}%",
+            )
+        return [app_commands.Choice(name=str(r["tier_name"]), value=str(r["tier_name"])) for r in rows]
+    except Exception:
+        return []
+
 async def owned_asset_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     """Autocomplete owned asset names when upgrading."""
     if interaction.guild is None:
@@ -1646,6 +1674,11 @@ async def econ_purchase(
     asset_type, secondary_type = [a.strip() for a in asset.split("|", 1)]
     desired_tier = int(tier.value)
 
+    action = (action or "").strip().upper()
+    if action not in {"NEW","UPGRADE"}:
+        await interaction.followup.send("Action must be NEW or UPGRADE.", ephemeral=True)
+        return
+
     pool = await get_pool()
     async with pool.acquire() as con:
         async with con.transaction():
@@ -1653,23 +1686,27 @@ async def econ_purchase(
 
             cat = await con.fetchrow(
                 """
-                SELECT tier_name, cost_val, income_val
+                SELECT tier, tier_name, cost_val, income_val
                 FROM economy.asset_catalog
-                WHERE asset_type=$1 AND secondary_type=$2 AND tier=$3
+                WHERE secondary_type=$1 AND tier_name=$2
                 """,
                 asset_type,
-                secondary_type,
-                desired_tier,
+                tier_name,
             )
             if not cat:
                 return await interaction.followup.send("That tier does not exist for this asset in the catalog.", ephemeral=True)
 
+            desired_tier = int(cat["tier"])
             tier_name = str(cat["tier_name"])
             cost_val = int(cat["cost_val"])
             income_val = int(cat["income_val"])
 
             upgrade_asset = (upgrade_asset or "").strip()
-            if upgrade_asset:
+            if action == "UPGRADE":
+                if not upgrade_asset:
+                    await interaction.followup.send("Select an owned asset to upgrade.", ephemeral=True)
+                    return
+                
                 row = await con.fetchrow(
                     """
                     SELECT tier
@@ -1726,8 +1763,12 @@ async def econ_purchase(
                     upgrade_asset,
                 )
 
-            else:
+                        else:
+                # NEW purchase
                 asset_name = (asset_name or "").strip()
+                if action != "NEW":
+                    await interaction.followup.send("Choose NEW or UPGRADE.", ephemeral=True)
+                    return
                 if not asset_name:
                     return await interaction.followup.send("Asset name is required when creating a new asset.", ephemeral=True)
 
@@ -1743,9 +1784,7 @@ async def econ_purchase(
                 stackable = bool(rule["stackable"]) if rule else False
                 max_instances = int(rule["max_instances"]) if rule and rule["max_instances"] is not None else 1
 
-                qty = int(quantity) if int(quantity) > 0 else 1
-                if not stackable:
-                    qty = 1
+                                qty = 1
 
                 exists = await con.fetchval(
                     """
