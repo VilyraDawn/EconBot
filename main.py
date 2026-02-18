@@ -19,7 +19,7 @@ except Exception:
 # -------------------------
 # Version / Config
 # -------------------------
-VERSION = "EconBot_v23"
+VERSION = "EconBot_v25"
 
 TZ_NAME = "America/Chicago"
 TZ = ZoneInfo(TZ_NAME) if ZoneInfo else dt.timezone.utc
@@ -81,12 +81,12 @@ BANK_CHANNEL_ID = _parse_int(_get("BANK_CHANNEL_ID"))
 ECON_LOG_CHANNEL_ID = _parse_int(_get("ECON_LOG_CHANNEL_ID"))
 
 BANK_MESSAGE_IDS = _parse_int_list(_get("BANK_MESSAGE_IDS"))
-if not BANK_MESSAGE_IDS:
-    raise RuntimeError("BANK_MESSAGE_IDS must contain at least one message id")
 
+STAFF_ROLE_IDS = _parse_int_set(_get("STAFF_ROLE_IDS") or _get("Staff_Role_IDs") or _get("STAFF_ROLE_IDs") or _get("STAFF_ROLE_IDS"))
 ECON_ADMIN_ROLE_IDS = _parse_int_set(_get("ECON_ADMIN_ROLE_IDS"))
-if not ECON_ADMIN_ROLE_IDS:
-    raise RuntimeError("ECON_ADMIN_ROLE_IDS must contain at least one role id")
+# Back-compat: if ECON_ADMIN_ROLE_IDS is set but STAFF_ROLE_IDS is empty, use it.
+if (not STAFF_ROLE_IDS) and ECON_ADMIN_ROLE_IDS:
+    STAFF_ROLE_IDS = set(ECON_ADMIN_ROLE_IDS)
 
 
 # -------------------------
@@ -464,39 +464,50 @@ def is_admin_member(interaction: discord.Interaction) -> bool:
     m = interaction.guild.get_member(interaction.user.id)
     if m is None:
         return False
-    return any(r.id in ECON_ADMIN_ROLE_IDS for r in m.roles)
+    return any(r.id in STAFF_ROLE_IDS for r in m.roles)
 
 
 def require_admin():
+    """
+    Staff gating:
+      - If STAFF_ROLE_IDS is configured (preferred), user must have one of those roles.
+      - If not configured, fall back to Discord permissions (Administrator or Manage Guild).
+    This avoids deploy crashes while you bootstrap config.
+    """
     def deco(func):
         async def wrapper(interaction: discord.Interaction, *args, **kwargs):
-            if not ECON_ADMIN_ROLE_IDS:
-                await interaction.response.send_message(
-                    "Staff roles are not configured yet (missing ECON_ADMIN_ROLE_IDS). Set it in Railway Variables to enable staff commands.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                return
-
             member = interaction.user if isinstance(interaction.user, discord.Member) else None
             if member is None and interaction.guild is not None:
                 member = interaction.guild.get_member(interaction.user.id)
 
+            # If we can't resolve the member object, fail closed (no permission) but don't crash.
             if member is None:
                 await interaction.response.send_message(
-                    "I couldn't verify your roles right now. Please try again in a few seconds.",
+                    "I couldn't verify your roles/permissions right now. Please try again in a few seconds.",
                     ephemeral=True,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
 
-            if not any(r.id in ECON_ADMIN_ROLE_IDS for r in getattr(member, "roles", [])):
-                await interaction.response.send_message(
-                    "You don’t have permission to use that command.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                return
+            if STAFF_ROLE_IDS:
+                if not any(r.id in ECON_ADMIN_ROLE_IDS for r in getattr(member, "roles", [])):
+                    await interaction.response.send_message(
+                        "You don’t have permission to use that command.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+            else:
+                perms = getattr(member, "guild_permissions", None)
+                ok = bool(perms and (perms.administrator or perms.manage_guild))
+                if not ok:
+                    await interaction.response.send_message(
+                        "Staff roles are not configured yet, and you don’t have admin permissions. "
+                        "Ask an admin to set STAFF_ROLE_IDS in Railway Variables.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
 
             return await func(interaction, *args, **kwargs)
         return wrapper
