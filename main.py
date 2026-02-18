@@ -19,7 +19,7 @@ except Exception:
 # -------------------------
 # Version / Config
 # -------------------------
-VERSION = "EconBot_v25"
+VERSION = "EconBot_v26"
 
 TZ_NAME = "America/Chicago"
 TZ = ZoneInfo(TZ_NAME) if ZoneInfo else dt.timezone.utc
@@ -458,6 +458,27 @@ client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMention
 tree = app_commands.CommandTree(client)
 
 
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # Always respond ephemerally and never ping
+    msg: str
+    if isinstance(error, app_commands.CheckFailure):
+        msg = str(error) or "You don’t have permission to use that command."
+    elif isinstance(error, app_commands.CommandInvokeError) and getattr(error, "original", None) is not None:
+        orig = error.original
+        msg = f"Command error: {type(orig).__name__}: {orig}"
+    else:
+        msg = f"Command error: {type(error).__name__}: {error}"
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    except Exception:
+        pass
+
+
 def is_admin_member(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         return False
@@ -469,49 +490,41 @@ def is_admin_member(interaction: discord.Interaction) -> bool:
 
 def require_admin():
     """
+    Returns a discord.app_commands check.
+
     Staff gating:
-      - If STAFF_ROLE_IDS is configured (preferred), user must have one of those roles.
-      - If not configured, fall back to Discord permissions (Administrator or Manage Guild).
-    This avoids deploy crashes while you bootstrap config.
+      - If STAFF_ROLE_IDS (or back-compat ECON_ADMIN_ROLE_IDS) is configured:
+        user must have one of those roles.
+      - If not configured:
+        fall back to Discord permissions (Administrator or Manage Server).
     """
-    def deco(func):
-        async def wrapper(interaction: discord.Interaction, *args, **kwargs):
-            member = interaction.user if isinstance(interaction.user, discord.Member) else None
-            if member is None and interaction.guild is not None:
-                member = interaction.guild.get_member(interaction.user.id)
+    async def predicate(interaction: discord.Interaction) -> bool:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None and interaction.guild is not None:
+            member = interaction.guild.get_member(interaction.user.id)
 
-            # If we can't resolve the member object, fail closed (no permission) but don't crash.
-            if member is None:
-                await interaction.response.send_message(
-                    "I couldn't verify your roles/permissions right now. Please try again in a few seconds.",
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                return
+        if member is None:
+            raise app_commands.CheckFailure("I couldn't verify your roles/permissions right now. Please try again.")
 
-            if STAFF_ROLE_IDS:
-                if not any(r.id in ECON_ADMIN_ROLE_IDS for r in getattr(member, "roles", [])):
-                    await interaction.response.send_message(
-                        "You don’t have permission to use that command.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-            else:
-                perms = getattr(member, "guild_permissions", None)
-                ok = bool(perms and (perms.administrator or perms.manage_guild))
-                if not ok:
-                    await interaction.response.send_message(
-                        "Staff roles are not configured yet, and you don’t have admin permissions. "
-                        "Ask an admin to set STAFF_ROLE_IDS in Railway Variables.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
+        # Prefer STAFF_ROLE_IDS; if empty but ECON_ADMIN_ROLE_IDS exists, treat that as staff roles (back-compat).
+        staff_roles = set(STAFF_ROLE_IDS) if STAFF_ROLE_IDS else set(ECON_ADMIN_ROLE_IDS)
 
-            return await func(interaction, *args, **kwargs)
-        return wrapper
-    return deco
+        if staff_roles:
+            if any(r.id in staff_roles for r in getattr(member, "roles", [])):
+                return True
+            raise app_commands.CheckFailure("You don’t have permission to use that command.")
+
+        perms = getattr(member, "guild_permissions", None)
+        ok = bool(perms and (perms.administrator or perms.manage_guild))
+        if ok:
+            return True
+
+        raise app_commands.CheckFailure(
+            "Staff roles are not configured yet, and you don’t have admin permissions. "
+            "Ask an admin to set STAFF_ROLE_IDS in Railway Variables."
+        )
+
+    return app_commands.check(predicate)
 
 # -------------------------
 # Command help (admin)
