@@ -7,28 +7,23 @@ from discord import app_commands
 import asyncpg
 
 # =========================
-# Vilyra Economy Bot (V1) — Single-file version (EconBot_v2)
+# Vilyra Economy Bot (V1) — Single-file version (EconBot_v4)
 # =========================
 #
-# Fixes vs v1:
-# - Supports testing in a different guild while pulling characters from the "main" guild
-#   via LEGACY_SOURCE_GUILD_ID (optional).
+# V4 change:
+# - NO pings / mentions anywhere (no <@id>, no .mention usage)
+#   Dashboard and logs will display usernames/IDs without pinging.
+#
+# V3 change retained:
+# - Staff permission checks do not rely on member cache.
+#
+# V2 change retained:
+# - LEGACY_SOURCE_GUILD_ID optional: read characters from main server while testing in test server.
 #
 # Commands:
 # - /income      (once/day per character; +10 Val = 1 Arce)
 # - /balance     (character balance card)
 # - /econ_adjust (staff/admin add/subtract currency)
-#
-# Character source (legacy):
-# - Table: public.characters (configurable)
-# - Columns required: guild_id, user_id, name, archived
-# - "name" is treated as the unique character ID within a guild.
-#
-# Economy tables (created automatically under schema "economy"):
-# - economy.transactions
-# - economy.income_claims
-# - economy.assets (placeholder)
-# - economy.meta (stores bank dashboard message id)
 #
 # Required ENV vars:
 # - DISCORD_TOKEN
@@ -228,19 +223,47 @@ async def autocomplete_character_names(
 def legacy_guild_id(current_guild_id: int) -> int:
     return LEGACY_SOURCE_GUILD_ID or current_guild_id
 
+# ---------- No-ping formatting helpers ----------
+def user_label_from_cache(user_id: int) -> str:
+    """
+    No pings. If we have the user cached, show 'DisplayName (ID)'.
+    Otherwise show 'User ID: <id>'.
+    """
+    u = bot.get_user(user_id)  # type: ignore[name-defined]
+    if u:
+        # u.name is stable and won't ping; display_name isn't available on User
+        return f"{u.name} (ID {user_id})"
+    return f"User ID {user_id}"
+
+def actor_label(interaction: discord.Interaction) -> str:
+    # No pings. Prefer display_name for guild members.
+    if isinstance(interaction.user, discord.Member):
+        return f"{interaction.user.display_name} (ID {interaction.user.id})"
+    return f"{interaction.user.name} (ID {interaction.user.id})"  # type: ignore[union-attr]
+
 # ---------- Permissions / logging ----------
 def is_staff_member(interaction: discord.Interaction) -> bool:
+    """
+    Uses interaction.user roles (Member) instead of cache lookup.
+    """
     if interaction.guild is None or interaction.user is None:
         return False
-    member = interaction.guild.get_member(interaction.user.id)
+
+    if isinstance(interaction.user, discord.Member):
+        member = interaction.user
+    else:
+        member = interaction.guild.get_member(interaction.user.id)
+
     if member is None:
         return False
+
     if member.guild_permissions.administrator:
         return True
+
     return any(role.id in STAFF_ROLE_IDS for role in getattr(member, "roles", []))
 
-async def log_to_econ(bot: discord.Client, text: str) -> None:
-    ch = bot.get_channel(ECON_LOG_CHANNEL_ID)
+async def log_to_econ(bot_client: discord.Client, text: str) -> None:
+    ch = bot_client.get_channel(ECON_LOG_CHANNEL_ID)
     if isinstance(ch, discord.TextChannel):
         await ch.send(text)
 
@@ -293,7 +316,7 @@ async def render_bank_embed() -> discord.Embed:
         nonlocal current_user, current_lines
         if current_user is None:
             return
-        header = f"<@{current_user}>"
+        header = user_label_from_cache(current_user)
         body = "\n".join(current_lines) if current_lines else "_No balances yet._"
         blocks.append(f"**{header}**\n{body}")
         current_user = None
@@ -321,9 +344,8 @@ async def render_bank_embed() -> discord.Embed:
     embed.add_field(name="Balances", value=text, inline=False)
     return embed
 
-async def update_bank_dashboard(bot: discord.Client, current_guild_id: int) -> None:
-    # NOTE: Dashboard posts to the configured bank channel (test server).
-    channel = bot.get_channel(BANK_CHANNEL_ID)
+async def update_bank_dashboard(bot_client: discord.Client) -> None:
+    channel = bot_client.get_channel(BANK_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         return
     embed = await render_bank_embed()
@@ -348,12 +370,9 @@ class EconBot(discord.Client):
         self.guild_obj = discord.Object(id=GUILD_ID)
 
     async def setup_hook(self):
-        # Initialize DB + schema
         pool = await get_pool()
         async with pool.acquire() as con:
             await con.execute(SCHEMA_SQL)
-
-        # Sync commands to the single test guild for fast updates
         await self.tree.sync(guild=self.guild_obj)
 
     async def on_ready(self):
@@ -402,13 +421,10 @@ async def income(interaction: discord.Interaction, character: str):
         )
 
     today = datetime.now(TZ).date()
+    current_gid = interaction.guild.id
 
     pool = await get_pool()
     async with pool.acquire() as con:
-        # IMPORTANT: Claims + transactions are stored under the CURRENT guild (test server),
-        # even if characters are sourced from a different guild. This prevents polluting real data.
-        current_gid = interaction.guild.id
-
         try:
             await con.execute(
                 """
@@ -453,12 +469,12 @@ async def income(interaction: discord.Interaction, character: str):
 
     await interaction.response.send_message(
         f"✅ Income claimed for **{legacy_char.name}**: +1 Arce (10 Cinth).\n"
-        f"New balance (test server): **{format_currency(int(bal))}**",
+        f"New balance: **{format_currency(int(bal))}**",
         ephemeral=True,
     )
 
-    await log_to_econ(bot, f"💰 `/income` by {interaction.user.mention} → **{legacy_char.name}** (+1 Arce)")
-    await update_bank_dashboard(bot, interaction.guild.id)
+    await log_to_econ(bot, f"💰 /income by {actor_label(interaction)} → **{legacy_char.name}** (+1 Arce)")
+    await update_bank_dashboard(bot)
 
 @bot.tree.command(
     name="balance",
@@ -511,8 +527,8 @@ async def balance(interaction: discord.Interaction, character: str):
 
     e = discord.Embed(title="💳 Balance Card")
     e.add_field(name="Character", value=f"**{legacy_char.name}**", inline=True)
-    e.add_field(name="Owner", value=f"<@{legacy_char.user_id}>", inline=True)
-    e.add_field(name="Balance (test server)", value=f"**{format_currency(int(bal))}**", inline=False)
+    e.add_field(name="Owner", value=user_label_from_cache(legacy_char.user_id), inline=True)
+    e.add_field(name="Balance", value=f"**{format_currency(int(bal))}**", inline=False)
 
     if assets:
         lines = [f"• **{a['asset_type']}** — {a['label']}" for a in assets]
@@ -610,18 +626,18 @@ async def econ_adjust(
     await interaction.response.send_message(
         f"✅ Updated **{legacy_char.name}**: {sign}{format_currency(delta)}\n"
         f"Reason: {reason}\n"
-        f"New balance (test server): **{format_currency(int(bal))}**",
+        f"New balance: **{format_currency(int(bal))}**",
         ephemeral=True,
     )
 
     await log_to_econ(
         bot,
-        f"🛠️ `/econ_adjust` by {interaction.user.mention} → **{legacy_char.name}** ({sign}{format_currency(delta)}): {reason}",
+        f"🛠️ /econ_adjust by {actor_label(interaction)} → **{legacy_char.name}** ({sign}{format_currency(delta)}): {reason}",
     )
-    await update_bank_dashboard(bot, interaction.guild.id)
+    await update_bank_dashboard(bot)
 
 def main():
-    print(f"[{ENV}] Starting EconBot_v2…")
+    print(f"[{ENV}] Starting EconBot_v4…")
     bot.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":
