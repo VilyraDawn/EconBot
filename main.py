@@ -1,11 +1,13 @@
-import os, json, datetime as dt
+import os, json, datetime as dt, zipfile
+import re
 from dataclasses import dataclass
+import xml.etree.ElementTree as ET
 
 import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v46"
+APP_VERSION = "EconBot_v49"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -13,14 +15,6 @@ try:
     CHICAGO_TZ = ZoneInfo("America/Chicago")
 except Exception:
     CHICAGO_TZ = dt.timezone(dt.timedelta(hours=-6))  # fixed UTC-6 fallback (no DST auto-adjust)
-
-# --- Spreadsheet loader (authoritative asset source) ---
-# Per Continuity: the ONLY source of truth for assets is "NEW Asset Table.xlsx"
-# We do NOT introduce env vars. We look for the file in common deploy paths.
-try:
-    import openpyxl  # available in this environment
-except Exception:
-    openpyxl = None
 
 ASSET_XLSX_FILENAME = "NEW Asset Table.xlsx"
 SEP = "|||"
@@ -60,6 +54,8 @@ DISCORD_TOKEN = _req("DISCORD_TOKEN")
 DATABASE_URL = _req("DATABASE_URL")
 
 GUILD_ID = _int("GUILD_ID")
+if not GUILD_ID:
+    raise RuntimeError("Missing required env var: GUILD_ID")
 LEGACY_SOURCE_GUILD_ID = _int("LEGACY_SOURCE_GUILD_ID") or 0
 
 BANK_CHANNEL_ID = _int("BANK_CHANNEL_ID") or 0
@@ -97,20 +93,157 @@ class AssetRow:
     cost_val: int
     add_income_val: int
 
+def _col_letters_to_index(col_letters: str) -> int:
+    # A -> 0, B -> 1, Z -> 25, AA -> 26, etc.
+    col_letters = (col_letters or "").strip().upper()
+    n = 0
+    for ch in col_letters:
+        if "A" <= ch <= "Z":
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+    return max(0, n - 1)
+
+def _cell_ref_to_col_index(cell_ref: str) -> int:
+    # e.g. "C7" -> 2
+    m = re.match(r"^([A-Za-z]+)", cell_ref or "")
+    if not m:
+        return 0
+    return _col_letters_to_index(m.group(1))
+
+class SimpleXlsx:
+    """
+    Minimal XLSX reader (no openpyxl dependency).
+    Reads the FIRST worksheet and returns rows as lists of strings/numbers.
+    Supports sharedStrings and inline strings; enough for the Asset Table.
+    """
+    def __init__(self, path: str):
+        self.path = path
+
+    def _read_shared_strings(self, zf: zipfile.ZipFile):
+        try:
+            data = zf.read("xl/sharedStrings.xml")
+        except Exception:
+            return []
+        root = ET.fromstring(data)
+        ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        out = []
+        for si in root.findall("s:si", ns):
+            # shared string can be one <t> or multiple <r><t>
+            texts = []
+            t = si.find("s:t", ns)
+            if t is not None and t.text is not None:
+                texts.append(t.text)
+            else:
+                for r in si.findall("s:r", ns):
+                    tt = r.find("s:t", ns)
+                    if tt is not None and tt.text is not None:
+                        texts.append(tt.text)
+            out.append("".join(texts))
+        return out
+
+    def _find_first_sheet_path(self, zf: zipfile.ZipFile):
+        # Prefer xl/worksheets/sheet1.xml if present
+        try:
+            zf.getinfo("xl/worksheets/sheet1.xml")
+            return "xl/worksheets/sheet1.xml"
+        except Exception:
+            pass
+        # Fallback: parse workbook.xml for first sheet id and map via workbook relationships
+        try:
+            wb = ET.fromstring(zf.read("xl/workbook.xml"))
+            ns = {
+                "w": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            }
+            sheets = wb.find("w:sheets", ns)
+            if sheets is None:
+                return None
+            first = sheets.find("w:sheet", ns)
+            if first is None:
+                return None
+            rid = first.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            if not rid:
+                return None
+            rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            rns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+            for rel in rels.findall("r:Relationship", rns):
+                if rel.attrib.get("Id") == rid:
+                    target = rel.attrib.get("Target", "")
+                    target = target.lstrip("/")
+                    if not target.startswith("xl/"):
+                        target = "xl/" + target
+                    return target
+        except Exception:
+            return None
+        return None
+
+    def read_rows(self):
+        rows = []
+        with zipfile.ZipFile(self.path, "r") as zf:
+            shared = self._read_shared_strings(zf)
+            sheet_path = self._find_first_sheet_path(zf)
+            if not sheet_path:
+                return rows
+            xml = ET.fromstring(zf.read(sheet_path))
+            ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            sheet_data = xml.find("s:sheetData", ns)
+            if sheet_data is None:
+                return rows
+
+            for row in sheet_data.findall("s:row", ns):
+                # Build dict col_index -> value
+                cells = {}
+                for c in row.findall("s:c", ns):
+                    ref = c.attrib.get("r", "")
+                    col_i = _cell_ref_to_col_index(ref)
+                    t = c.attrib.get("t", "")  # 's' for shared string, 'inlineStr' for inline
+                    v = c.find("s:v", ns)
+                    if t == "s":
+                        try:
+                            idx = int(v.text) if v is not None and v.text is not None else None
+                            cells[col_i] = shared[idx] if idx is not None and 0 <= idx < len(shared) else ""
+                        except Exception:
+                            cells[col_i] = ""
+                    elif t == "inlineStr":
+                        is_el = c.find("s:is", ns)
+                        tt = is_el.find("s:t", ns) if is_el is not None else None
+                        cells[col_i] = tt.text if tt is not None and tt.text is not None else ""
+                    else:
+                        # number or plain string
+                        if v is not None and v.text is not None:
+                            cells[col_i] = v.text
+                        else:
+                            cells[col_i] = ""
+
+                if not cells:
+                    continue
+                max_col = max(cells.keys())
+                out = []
+                for i in range(max_col + 1):
+                    out.append(cells.get(i, ""))
+                rows.append(out)
+        return rows
+
 class AssetCatalog:
     """
-    Loads asset definitions from the authoritative spreadsheet:
-        NEW Asset Table.xlsx
+    Single source of truth: NEW Asset Table.xlsx
+    Columns required (case-insensitive):
+      - Asset Type
+      - Tier
+      - Cost to Acquire
+      - Add to Income
     """
     def __init__(self):
         self.path = None
-        self.rows = []               # list[AssetRow] in sheet order
-        self.by_type = {}            # asset_type -> list[AssetRow] in sheet order
-        self.by_type_tier = {}       # (asset_type, tier) -> AssetRow
+        self.rows = []                 # list[AssetRow] in sheet order
+        self.by_type = {}              # asset_type -> list[AssetRow] in sheet order
+        self.by_type_tier = {}         # (asset_type, tier) -> AssetRow
+        self.asset_types = []          # unique types in first-appearance order
 
     def _find_xlsx(self):
-        # common paths: current working dir, alongside this file, /app
         candidates = []
+        # prefer /app (Railway)
+        candidates.append(os.path.join("/app", ASSET_XLSX_FILENAME))
+        # also allow local dir and cwd
         try:
             candidates.append(os.path.join(os.getcwd(), ASSET_XLSX_FILENAME))
         except Exception:
@@ -120,7 +253,6 @@ class AssetCatalog:
             candidates.append(os.path.join(here, ASSET_XLSX_FILENAME))
         except Exception:
             pass
-        candidates.append(os.path.join("/app", ASSET_XLSX_FILENAME))
 
         for p in candidates:
             if p and os.path.exists(p):
@@ -131,29 +263,25 @@ class AssetCatalog:
         self.rows = []
         self.by_type = {}
         self.by_type_tier = {}
+        self.asset_types = []
         self.path = self._find_xlsx()
 
-        if openpyxl is None:
-            print("[warn] openpyxl not available; asset dropdown will be empty.")
-            return
-
         if not self.path:
-            print(f"[warn] Asset spreadsheet not found: {ASSET_XLSX_FILENAME} (asset dropdown will be empty)")
+            print(f"[warn] Asset spreadsheet not found: {ASSET_XLSX_FILENAME} (expected at /app/{ASSET_XLSX_FILENAME})")
             return
 
         try:
-            wb = openpyxl.load_workbook(self.path, data_only=True)
-            ws = wb.active
+            sx = SimpleXlsx(self.path)
+            raw = sx.read_rows()
         except Exception as e:
-            print(f"[warn] Failed to load asset spreadsheet ({self.path}): {e}")
+            print(f"[warn] Failed to read asset spreadsheet ({self.path}): {e}")
             return
 
-        # Expect header row with these columns:
-        # Asset Type | Tier | Cost to Acquire | Add to Income
-        # We match headers case-insensitively.
-        header = []
-        for cell in ws[1]:
-            header.append(str(cell.value).strip() if cell.value is not None else "")
+        if not raw:
+            print(f"[warn] Asset spreadsheet loaded but contains no rows: {self.path}")
+            return
+
+        header = [str(x).strip() if x is not None else "" for x in raw[0]]
 
         def idx_of(name):
             name = name.strip().lower()
@@ -172,38 +300,43 @@ class AssetCatalog:
             print(f"[warn] Found headers: {header}")
             return
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            asset_type = (row[i_type] if i_type is not None else "") or ""
-            tier = (row[i_tier] if i_tier is not None else "") or ""
-            cost = row[i_cost] if i_cost is not None else 0
-            add  = row[i_add]  if i_add  is not None else 0
-
-            asset_type = str(asset_type).strip()
-            tier = str(tier).strip()
-
+        seen_types = set()
+        for r in raw[1:]:
+            # tolerate short rows
+            def get(i):
+                return r[i] if i is not None and i < len(r) else ""
+            asset_type = str(get(i_type) or "").strip()
+            tier = str(get(i_tier) or "").strip()
             if not asset_type or not tier:
                 continue
 
-            try:
-                cost_val = int(cost)
-            except Exception:
-                try:
-                    cost_val = int(float(cost))
-                except Exception:
-                    cost_val = 0
+            cost = get(i_cost)
+            add = get(i_add)
 
-            try:
-                add_income_val = int(add)
-            except Exception:
+            def to_int(x):
+                if x is None:
+                    return 0
+                s = str(x).strip()
+                if s == "":
+                    return 0
                 try:
-                    add_income_val = int(float(add))
+                    return int(s)
                 except Exception:
-                    add_income_val = 0
+                    try:
+                        return int(float(s))
+                    except Exception:
+                        return 0
 
-            ar = AssetRow(asset_type=asset_type, tier=tier, cost_val=cost_val, add_income_val=add_income_val)
+            cost_val = to_int(cost)
+            add_val = to_int(add)
+
+            ar = AssetRow(asset_type=asset_type, tier=tier, cost_val=cost_val, add_income_val=add_val)
             self.rows.append(ar)
             self.by_type.setdefault(asset_type, []).append(ar)
             self.by_type_tier[(asset_type, tier)] = ar
+            if asset_type not in seen_types:
+                seen_types.add(asset_type)
+                self.asset_types.append(asset_type)
 
         print(f"[test] Asset catalog loaded: {len(self.rows)} row(s) from {self.path}")
 
@@ -211,38 +344,13 @@ class AssetCatalog:
         return bool(self.rows)
 
     def list_asset_types(self):
-        # Unique asset types in sheet order of first appearance.
-        seen = set()
-        out = []
-        for r in self.rows:
-            if r.asset_type in seen:
-                continue
-            seen.add(r.asset_type)
-            out.append(r.asset_type)
-        return out
+        return list(self.asset_types)
 
     def list_tiers_for_type(self, asset_type):
         tiers = self.by_type.get(asset_type) or []
         return [r.tier for r in tiers]
 
-    def autocomplete_choices(self, current, limit=25):
-        q = (current or "").strip().lower()
-        out = []
-        if not self.rows:
-            return []
-        # Provide "Asset Type — Tier" choices in sheet order.
-        for ar in self.rows:
-            label = f"{ar.asset_type} — {ar.tier}"
-            if q and q not in label.lower():
-                continue
-            value = f"{ar.asset_type}{SEP}{ar.tier}"
-            out.append(app_commands.Choice(name=label[:100], value=value[:100]))
-            if len(out) >= limit:
-                break
-        return out
-
     def get_chain_cost(self, asset_type, tier):
-        # Purchase rule: selecting Tier N costs sum of all tiers up to that tier, in sheet order for that asset_type.
         tiers = self.by_type.get(asset_type) or []
         if not tiers:
             return None
@@ -253,11 +361,26 @@ class AssetCatalog:
                 break
         if idx is None:
             return None
-        return sum(int(ar.cost_val) for ar in tiers[:idx+1])
+        return sum(int(ar.cost_val) for ar in tiers[:idx + 1])
 
     def get_add_income(self, asset_type, tier):
         ar = self.by_type_tier.get((asset_type, tier))
         return int(ar.add_income_val) if ar else 0
+
+    def autocomplete_asset_choices(self, current, limit=25):
+        # single field that encodes type+tier, but displays "Type — Tier"
+        if not self.rows:
+            return []
+        q = (current or "").strip().lower()
+        out = []
+        for ar in self.rows:
+            label = f"{ar.asset_type} — {ar.tier}"
+            if q and q not in label.lower():
+                continue
+            out.append(app_commands.Choice(name=label[:100], value=f"{ar.asset_type}{SEP}{ar.tier}"[:100]))
+            if len(out) >= limit:
+                break
+        return out
 
 assets = AssetCatalog()
 
@@ -300,7 +423,6 @@ class DB:
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
 
-            # Runtime migration checks (existing v38 behavior)
             cols = await con.fetch("""
                 SELECT column_name FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='econ_assets';
@@ -343,7 +465,6 @@ class DB:
             )
 
     async def search_characters(self, legacy_guild_id, query, limit=25):
-        # Character dropdown must pull from Postgres table: characters
         assert self.pool is not None
         like = f"%{(query or '').strip().lower()}%"
         async with self.pool.acquire() as con:
@@ -430,70 +551,37 @@ intents = discord.Intents.none()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+
 async def character_autocomplete(interaction, current):
     try:
         res = await db.search_characters(LEGACY_SOURCE_GUILD_ID, current or "", 25)
-        return [app_commands.Choice(name=n, value=n) for n,_uid in res]
+        return [app_commands.Choice(name=n, value=n) for n, _uid in res]
     except Exception:
         return []
 
-async def asset_type_autocomplete(interaction, current):
+async def asset_autocomplete(interaction, current):
     try:
         if not assets.is_loaded():
             return [app_commands.Choice(name="(Asset sheet missing: NEW Asset Table.xlsx)", value="__MISSING__")]
-        q = (current or "").strip().lower()
-        out = []
-        for at in assets.list_asset_types():
-            if q and q not in at.lower():
-                continue
-            out.append(app_commands.Choice(name=at[:100], value=at[:100]))
-            if len(out) >= 25:
-                break
-        return out
-    except Exception:
-        return []
-
-async def tier_autocomplete(interaction, current):
-    try:
-        if not assets.is_loaded():
-            return [app_commands.Choice(name="(Asset sheet missing: NEW Asset Table.xlsx)", value="__MISSING__")]
-
-        # Read the selected asset_type from the interaction namespace (Discord supplies filled options here).
-        selected_type = None
-        try:
-            ns = getattr(interaction, "namespace", None)
-            selected_type = getattr(ns, "asset_type", None) if ns else None
-        except Exception:
-            selected_type = None
-
-        if not selected_type or str(selected_type).strip() in ("__MISSING__", ""):
-            return [app_commands.Choice(name="(Select an Asset Type first)", value="__SELECT_TYPE__")]
-
-        selected_type = str(selected_type).strip()
-        q = (current or "").strip().lower()
-        out = []
-        for tr in assets.list_tiers_for_type(selected_type):
-            if q and q not in tr.lower():
-                continue
-            out.append(app_commands.Choice(name=tr[:100], value=tr[:100]))
-            if len(out) >= 25:
-                break
-        if not out:
-            return [app_commands.Choice(name="(No tiers found for that type)", value="__NO_TIERS__")]
-        return out
+        return assets.autocomplete_asset_choices(current, 25)
     except Exception:
         return []
 
 async def build_balance_embed(guild, character):
     bal = await db.get_balance(guild.id, character)
-    assets_owned = await db.get_assets(guild.id, character)
+    owned = await db.get_assets(guild.id, character)
     lines = []
-    for a in assets_owned:
+    for a in owned:
         nm = (a.get("asset_name") or "").strip() or "Unnamed"
         tier = (a.get("tier") or "").strip()
-        at = (a.get("asset_type") or "").strip()
+        # Requested display: Asset Tier - Asset Name
         lines.append(f"{tier} — {nm}")
-    e = discord.Embed(title=str(character), description=f"**Balance:** {format_val(bal)} *(= {bal} Val)*", color=discord.Color.teal())
+    e = discord.Embed(
+        title=str(character),
+        description=f"**Balance:** {format_val(bal)} *(= {bal} Val)*",
+        color=discord.Color.teal()
+    )
     e.set_footer(text="Bank of Vilyra")
     e.add_field(name="__*Assets*__", value=("\n".join(lines)[:1024] if lines else "None"), inline=False)
     return e
@@ -555,14 +643,11 @@ def chicago_today():
 async def calc_asset_income(guild_id, character):
     owned = await db.get_assets(guild_id, character)
     total = 0
-    # Income adds are pulled from the asset spreadsheet (authoritative).
     for a in owned:
         total += assets.get_add_income(str(a.get("asset_type") or ""), str(a.get("tier") or ""))
     return int(total)
 
-# --- Commands ---
-
-@tree.command(name="balance", description="Show a character’s current money and owned assets.")
+@tree.command(name="balance", description="Show a character’s current money and owned assets.", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_balance(interaction, character: str):
@@ -572,7 +657,7 @@ async def cmd_balance(interaction, character: str):
     embed = await build_balance_embed(interaction.guild, character)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).")
+@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick one of your characters")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_income(interaction, character: str):
@@ -590,12 +675,16 @@ async def cmd_income(interaction, character: str):
     today = chicago_today()
     assert db.pool is not None
     async with db.pool.acquire() as con:
-        row = await con.fetchrow("SELECT last_claim_date FROM econ_income_claims WHERE guild_id=$1 AND character_name=$2;", int(g.id), str(character))
+        row = await con.fetchrow(
+            "SELECT last_claim_date FROM econ_income_claims WHERE guild_id=$1 AND character_name=$2;",
+            int(g.id), str(character)
+        )
         if row and row["last_claim_date"] == today:
             return await interaction.followup.send("You already claimed income for this character today (Chicago time).", ephemeral=True)
 
         asset_income = await calc_asset_income(g.id, character)
         delta = int(BASE_DAILY_INCOME_VAL) + int(asset_income)
+
         bal = await db.get_balance(g.id, character)
         new_bal = bal + delta
 
@@ -613,14 +702,23 @@ async def cmd_income(interaction, character: str):
             DO UPDATE SET last_claim_date=EXCLUDED.last_claim_date;
         """, int(g.id), str(character), today)
 
-    await db.log(g.id, interaction.user.id, "income", {"character": character, "delta_val": delta, "base_val": BASE_DAILY_INCOME_VAL, "asset_income_val": asset_income})
-    await interaction.followup.send(f"Income claimed for **{character}**: +{format_val(delta)}. New balance: {format_val(new_bal)}.", ephemeral=True)
+    await db.log(g.id, interaction.user.id, "income", {
+        "character": character,
+        "delta_val": delta,
+        "base_val": BASE_DAILY_INCOME_VAL,
+        "asset_income_val": asset_income
+    })
+    await interaction.followup.send(
+        f"Income claimed for **{character}**: +{format_val(delta)}. New balance: {format_val(new_bal)}.\n"
+        f"Asset income included today: {format_val(asset_income)}.",
+        ephemeral=True
+    )
     try:
         await refresh_bank_dashboard(g)
     except Exception:
         pass
 
-@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).")
+@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", delta_val="Positive or negative Val", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_adjust(interaction, character: str, delta_val: int, reason: str=None):
@@ -645,7 +743,7 @@ async def cmd_econ_adjust(interaction, character: str, delta_val: int, reason: s
     except Exception:
         pass
 
-@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).")
+@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", new_balance_val="New balance in Val (>=0)", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int, reason: str=None):
@@ -667,10 +765,12 @@ async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int
     except Exception:
         pass
 
-@tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character (tiered cost sum).")
-@app_commands.describe(character="Pick a character", asset_type="Pick an Asset Type", tier="Pick a Tier (depends on Asset Type)", asset_name="Name this asset (unique per character)")
-@app_commands.autocomplete(character=character_autocomplete, asset_type=asset_type_autocomplete, tier=tier_autocomplete)
-async def cmd_purchase_new(interaction, character: str, asset_type: str, tier: str, asset_name: str):
+# IMPORTANT: Keep purchase_new signature compatible with prior deployed versions to avoid global/guild drift issues.
+# We encode asset_type+tier into ONE choice value "type|||tier".
+@tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character.", guild=GUILD_OBJ)
+@app_commands.describe(character="Pick a character", asset="Pick an Asset Type — Tier (from spreadsheet)", asset_name="Unique asset name (executor entered)")
+@app_commands.autocomplete(character=character_autocomplete, asset=asset_autocomplete)
+async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: str):
     await interaction.response.defer(ephemeral=True)
     g = interaction.guild
     if not g:
@@ -679,22 +779,25 @@ async def cmd_purchase_new(interaction, character: str, asset_type: str, tier: s
     if not is_staff(mem):
         return await interaction.followup.send("You do not have permission.", ephemeral=True)
 
-    if asset_type in ("__MISSING__", "") or tier in ("__MISSING__", ""):
+    if asset == "__MISSING__" or not assets.is_loaded():
         return await interaction.followup.send(
-            f"Asset sheet not found. Place **{ASSET_XLSX_FILENAME}** in the bot directory (Railway /app) and redeploy.",
+            f"Asset sheet missing. Ensure **{ASSET_XLSX_FILENAME}** is included in the Railway deploy at **/app/{ASSET_XLSX_FILENAME}**.",
             ephemeral=True
         )
-
-    if asset_type in ("__SELECT_TYPE__", "__NO_TIERS__") or tier in ("__SELECT_TYPE__", "__NO_TIERS__", "__SELECT_TYPE__"):
-        return await interaction.followup.send("Select a valid Asset Type and Tier.", ephemeral=True)
 
     asset_name = (asset_name or "").strip()
     if not asset_name:
         return await interaction.followup.send("Asset name is required.", ephemeral=True)
+    if SEP not in (asset or ""):
+        return await interaction.followup.send("Invalid asset selection.", ephemeral=True)
+
+    asset_type, tier = [x.strip() for x in asset.split(SEP, 1)]
+
     owner_user_id = await db.get_character_owner(LEGACY_SOURCE_GUILD_ID, character)
     if owner_user_id is None:
         return await interaction.followup.send("Character not found in characters table.", ephemeral=True)
 
+    # uniqueness: user_id → character → asset_name
     existing = await db.get_assets(g.id, character)
     for a in existing:
         if int(a.get("user_id") or 0) == int(owner_user_id) and (a.get("asset_name") or "").strip().lower() == asset_name.lower():
@@ -702,10 +805,7 @@ async def cmd_purchase_new(interaction, character: str, asset_type: str, tier: s
 
     total_cost = assets.get_chain_cost(asset_type, tier)
     if total_cost is None:
-        return await interaction.followup.send(
-            "That Asset Type/Tier is not recognized from the asset spreadsheet. (Did the sheet change?)",
-            ephemeral=True
-        )
+        return await interaction.followup.send("That Asset Type/Tier is not recognized in the spreadsheet.", ephemeral=True)
 
     bal = await db.get_balance(g.id, character)
     if bal < total_cost:
@@ -720,10 +820,20 @@ async def cmd_purchase_new(interaction, character: str, asset_type: str, tier: s
 
     await db.set_balance(g.id, character, bal - total_cost)
     await db.add_asset(g.id, character, owner_user_id, asset_type, tier, asset_name)
-    await db.log(g.id, interaction.user.id, "purchase_new", {"character": character, "owner_user_id": owner_user_id, "asset_type": asset_type, "tier": tier, "asset_name": asset_name, "total_cost_val": total_cost})
+    await db.log(g.id, interaction.user.id, "purchase_new", {
+        "character": character,
+        "owner_user_id": owner_user_id,
+        "asset_type": asset_type,
+        "tier": tier,
+        "asset_name": asset_name,
+        "total_cost_val": total_cost
+    })
+
+    add_income = assets.get_add_income(asset_type, tier)
     await interaction.followup.send(
         f"Purchased **{asset_type} — {tier}** for **{character}** as **{asset_name}**.\n"
-        f"Cost: {format_val(total_cost)}. New balance: {format_val(bal-total_cost)}.",
+        f"Cost: {format_val(total_cost)}. New balance: {format_val(bal-total_cost)}.\n"
+        f"Adds to daily income: {format_val(add_income)} (from spreadsheet).",
         ephemeral=True
     )
     try:
@@ -731,7 +841,7 @@ async def cmd_purchase_new(interaction, character: str, asset_type: str, tier: s
     except Exception:
         pass
 
-@tree.command(name="econ_refresh_bank", description="Staff: manually refresh the Bank of Vilyra dashboard.")
+@tree.command(name="econ_refresh_bank", description="Staff: manually refresh the Bank of Vilyra dashboard.", guild=GUILD_OBJ)
 async def cmd_refresh_bank(interaction):
     await interaction.response.defer(ephemeral=True)
     g = interaction.guild
@@ -743,7 +853,7 @@ async def cmd_refresh_bank(interaction):
     await refresh_bank_dashboard(g)
     await interaction.followup.send("Bank dashboard refreshed.", ephemeral=True)
 
-@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.")
+@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.", guild=GUILD_OBJ)
 async def cmd_econ_commands(interaction):
     await interaction.response.defer(ephemeral=True)
     mem = interaction.user if isinstance(interaction.user, discord.Member) else None
@@ -752,11 +862,11 @@ async def cmd_econ_commands(interaction):
     text = (
         "**Player Commands**\n"
         "/balance — Show a character’s current money and owned assets.\n"
-        "/income — Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets.\n\n"
+        "/income — Claim daily income for one of YOUR characters (once per day, Chicago time). Daily income = base + sum(Add to Income) for owned assets.\n\n"
         "**Staff Commands**\n"
         "/econ_adjust — Add or subtract money from a character (never allows negative balances).\n"
         "/econ_set_balance — Set a character’s balance to an exact Val amount (non-negative).\n"
-        "/purchase_new — Purchase a new asset for a character. Select an Asset Type — Tier from the spreadsheet, then provide a unique asset name.\n"
+        "/purchase_new — Purchase a new asset for a character. Asset choices come from NEW Asset Table.xlsx. Enter a unique asset name.\n"
         "/econ_refresh_bank — Force-refresh the Bank of Vilyra dashboard messages.\n"
         "/econ_commands — Show this command list.\n"
     )
@@ -767,23 +877,28 @@ async def on_ready():
     print(f"[test] Starting {APP_VERSION}…")
     await db.init()
 
-    # Load asset spreadsheet once at startup (authoritative).
+    # Load spreadsheet (no openpyxl dependency)
     assets.load()
 
-    if not GUILD_ID:
-        print("[warn] GUILD_ID env var is missing; slash commands may register globally and appear slowly.")
-        try:
-            await tree.sync()
-        except Exception as e:
-            print(f"[warn] Global sync failed: {e}")
-        print(f"[test] Logged in as {client.user} (commands guild: GLOBAL; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
-        return
+    # --- Global command cleanup (requested) ---
+    # You requested ONE /purchase_new command. Older iterations may have left a GLOBAL /purchase_new registered.
+    # We delete ONLY the global command named 'purchase_new' (no other global commands are touched).
+    try:
+        global_cmds = await tree.fetch_commands()  # global
+        for c in global_cmds:
+            if getattr(c, "name", "") == "purchase_new":
+                try:
+                    await tree.delete_command(c, guild=None)  # deletes global command registration
+                    print("[test] Deleted GLOBAL /purchase_new (cleanup).")
+                except Exception as e:
+                    print(f"[warn] Failed to delete GLOBAL /purchase_new: {e}")
+    except Exception as e:
+        print(f"[warn] Global command fetch/delete skipped: {e}")
 
-    # IMPORTANT: Our commands are defined as GLOBAL in-code, but we ONLY sync them to the guild.
-    # To do that reliably, we must copy the global command definitions into the guild command list first.
+
     guild_obj = discord.Object(id=int(GUILD_ID))
     try:
-        tree.copy_global_to(guild=guild_obj)
+        # Keep guild-only sync, but ensure the guild gets the latest schema from our global definitions.
         synced = await tree.sync(guild=guild_obj)
         print(f"[test] Synced {len(synced)} guild command(s).")
     except Exception as e:
