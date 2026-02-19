@@ -5,7 +5,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v42"
+APP_VERSION = "EconBot_v43"
 
 # --- Timezone handling (Railway-safe) ---
 # Some deployments may lack zoneinfo/tzdata; do not crash at import time.
@@ -608,12 +608,13 @@ async def on_ready():
         print(f"[test] Logged in as {client.user} (commands guild: GLOBAL; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
         return
 
-    # Force a clean guild overwrite to reduce signature mismatch issues.
+    # Guild-only sync (no global sync). NOTE: Do NOT call tree.clear_commands(guild=...)
+    # because it clears *local* command registrations for that guild and can result in syncing ZERO commands,
+    # which in turn causes 'CommandNotFound' at runtime.
     guild_obj = discord.Object(id=int(GUILD_ID))
     try:
-        # Clear local guild overrides (safe) then overwrite guild commands
-        tree.clear_commands(guild=guild_obj)
-        await tree.sync(guild=guild_obj)
+        synced = await tree.sync(guild=guild_obj)
+        print(f"[test] Synced {len(synced)} guild command(s).")
     except Exception as e:
         print(f"[warn] Guild sync failed: {e}")
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
