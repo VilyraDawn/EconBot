@@ -19,7 +19,7 @@ except Exception:
 # -------------------------
 # Version / Config
 # -------------------------
-VERSION = "EconBot_v28"
+VERSION = "EconBot_v30"
 
 TZ_NAME = "America/Chicago"
 TZ = ZoneInfo(TZ_NAME) if ZoneInfo else dt.timezone.utc
@@ -1256,6 +1256,16 @@ async def on_ready():
     # Sync commands (guild-scoped for fast iteration)
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
+        # IMPORTANT: When changing a command from a simple command to a Group with subcommands
+        # (like /econ_purchase -> /econ_purchase new|upgrade), Discord can keep the old shape
+        # unless we delete the guild commands first. We do a "clear + sync empty" pass, then
+        # sync the current definitions.
+        try:
+            tree.clear_commands(guild=guild_obj)
+            await tree.sync(guild=guild_obj)  # pushes an empty command set -> deletes old guild commands
+        except Exception as e:
+            print(f"[{VERSION}] Guild command clear failed (continuing): {e}")
+
         try:
             tree.copy_global_to(guild=guild_obj)
             await tree.sync(guild=guild_obj)
@@ -1267,7 +1277,7 @@ async def on_ready():
         except Exception as e:
             print(f"[{VERSION}] Global command sync failed: {e}")
 
-    print(f"[test] Starting {VERSION}…")
+print(f"[test] Starting {VERSION}…")
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID or 'GLOBAL'}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
 
     asyncio.create_task(rebuild_dashboard())
@@ -1279,4 +1289,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
