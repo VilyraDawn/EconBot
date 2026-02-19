@@ -5,7 +5,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v43"
+APP_VERSION = "EconBot_v44"
 
 # --- Timezone handling (Railway-safe) ---
 # Some deployments may lack zoneinfo/tzdata; do not crash at import time.
@@ -59,9 +59,6 @@ BANK_MESSAGE_IDS = _int_list("BANK_MESSAGE_IDS")
 STAFF_ROLE_IDS = set(_int_list("STAFF_ROLE_IDS"))
 BANK_REFRESH_ROLE_IDS = set(_int_list("BANK_REFRESH_ROLE_IDS"))
 
-# IMPORTANT: to reduce command signature mismatch issues caused by lingering GLOBAL commands,
-# we register commands as GUILD-SCOPED at definition time when GUILD_ID is available.
-GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
 DENOMS = [("NOVIR", 10000), ("ORIN", 1000), ("ELSH", 100), ("ARCE", 10), ("CINTH", 1)]
 
@@ -294,6 +291,9 @@ async def character_autocomplete(interaction, current):
 async def asset_tier_autocomplete(interaction, current):
     try:
         defs = await db.list_asset_defs()
+        if not defs:
+            # Helpful placeholder so users can see why the dropdown is empty.
+            return [app_commands.Choice(name="(No asset definitions loaded)", value="__NONE__")]
         q = (current or "").lower().strip()
         out = []
         for a in defs:
@@ -385,7 +385,7 @@ async def calc_asset_income(guild_id, character):
 
 # --- Commands (guild-scoped when possible) ---
 
-@tree.command(name="balance", description="Show a character’s current money and owned assets.", guild=GUILD_OBJ)
+@tree.command(name="balance", description="Show a character’s current money and owned assets.")
 @app_commands.describe(character="Pick a character")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_balance(interaction, character: str):
@@ -395,7 +395,7 @@ async def cmd_balance(interaction, character: str):
     embed = await build_balance_embed(interaction.guild, character)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).", guild=GUILD_OBJ)
+@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).")
 @app_commands.describe(character="Pick one of your characters")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_income(interaction, character: str):
@@ -443,7 +443,7 @@ async def cmd_income(interaction, character: str):
     except Exception:
         pass
 
-@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).", guild=GUILD_OBJ)
+@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).")
 @app_commands.describe(character="Pick a character", delta_val="Positive or negative Val", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_adjust(interaction, character: str, delta_val: int, reason: str=None):
@@ -468,7 +468,7 @@ async def cmd_econ_adjust(interaction, character: str, delta_val: int, reason: s
     except Exception:
         pass
 
-@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).", guild=GUILD_OBJ)
+@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).")
 @app_commands.describe(character="Pick a character", new_balance_val="New balance in Val (>=0)", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int, reason: str=None):
@@ -490,7 +490,7 @@ async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int
     except Exception:
         pass
 
-@tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character (tiered cost sum).", guild=GUILD_OBJ)
+@tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character (tiered cost sum).")
 @app_commands.describe(character="Pick a character", asset="Pick an Asset Type — Tier", asset_name="Name this asset (unique per character)")
 @app_commands.autocomplete(character=character_autocomplete, asset=asset_tier_autocomplete)
 async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: str):
@@ -505,6 +505,8 @@ async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: 
     asset_name = (asset_name or "").strip()
     if not asset_name:
         return await interaction.followup.send("Asset name is required.", ephemeral=True)
+    if asset == "__NONE__":
+        return await interaction.followup.send("No asset definitions are loaded yet, so there is nothing to select. Load econ_asset_definitions first.", ephemeral=True)
     if SEP not in asset:
         return await interaction.followup.send("Invalid asset selection.", ephemeral=True)
     asset_type, tier = [x.strip() for x in asset.split(SEP, 1)]
@@ -563,7 +565,7 @@ async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: 
     except Exception:
         pass
 
-@tree.command(name="econ_refresh_bank", description="Staff: manually refresh the Bank of Vilyra dashboard.", guild=GUILD_OBJ)
+@tree.command(name="econ_refresh_bank", description="Staff: manually refresh the Bank of Vilyra dashboard.")
 async def cmd_refresh_bank(interaction):
     await interaction.response.defer(ephemeral=True)
     g = interaction.guild
@@ -575,7 +577,7 @@ async def cmd_refresh_bank(interaction):
     await refresh_bank_dashboard(g)
     await interaction.followup.send("Bank dashboard refreshed.", ephemeral=True)
 
-@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.", guild=GUILD_OBJ)
+@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.")
 async def cmd_econ_commands(interaction):
     await interaction.response.defer(ephemeral=True)
     mem = interaction.user if isinstance(interaction.user, discord.Member) else None
