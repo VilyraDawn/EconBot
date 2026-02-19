@@ -2,8 +2,17 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v38"
-CHICAGO_TZ = ZoneInfo("America/Chicago")
+APP_VERSION = "EconBot_v39"
+
+# --- Timezone handling (Railway-safe) ---
+# Railway deployments have previously run Python versions/environments where `zoneinfo` isn't available.
+# We fall back to a fixed UTC-6 offset (Central Standard Time) if ZoneInfo can't be imported/used.
+# This prevents boot-time crashes like: NameError: ZoneInfo is not defined.
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+    CHICAGO_TZ = ZoneInfo("America/Chicago")
+except Exception:
+    CHICAGO_TZ = dt.timezone(dt.timedelta(hours=-6))  # Safe fallback (no DST auto-adjust)
 
 def _get(name: str, default: Optional[str]=None) -> Optional[str]:
     v = os.getenv(name)
