@@ -1,5 +1,4 @@
-import os, json, datetime as dt, zipfile
-import re
+import os, json, datetime as dt, zipfile, re
 from dataclasses import dataclass
 import xml.etree.ElementTree as ET
 
@@ -7,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v49"
+APP_VERSION = "EconBot_v50"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -53,9 +52,11 @@ def _int_list(name):
 DISCORD_TOKEN = _req("DISCORD_TOKEN")
 DATABASE_URL = _req("DATABASE_URL")
 
+# Required to avoid global drift / duplicates
 GUILD_ID = _int("GUILD_ID")
 if not GUILD_ID:
     raise RuntimeError("Missing required env var: GUILD_ID")
+
 LEGACY_SOURCE_GUILD_ID = _int("LEGACY_SOURCE_GUILD_ID") or 0
 
 BANK_CHANNEL_ID = _int("BANK_CHANNEL_ID") or 0
@@ -94,7 +95,6 @@ class AssetRow:
     add_income_val: int
 
 def _col_letters_to_index(col_letters: str) -> int:
-    # A -> 0, B -> 1, Z -> 25, AA -> 26, etc.
     col_letters = (col_letters or "").strip().upper()
     n = 0
     for ch in col_letters:
@@ -103,18 +103,13 @@ def _col_letters_to_index(col_letters: str) -> int:
     return max(0, n - 1)
 
 def _cell_ref_to_col_index(cell_ref: str) -> int:
-    # e.g. "C7" -> 2
     m = re.match(r"^([A-Za-z]+)", cell_ref or "")
     if not m:
         return 0
     return _col_letters_to_index(m.group(1))
 
 class SimpleXlsx:
-    """
-    Minimal XLSX reader (no openpyxl dependency).
-    Reads the FIRST worksheet and returns rows as lists of strings/numbers.
-    Supports sharedStrings and inline strings; enough for the Asset Table.
-    """
+    """Minimal XLSX reader (stdlib-only). Reads the FIRST worksheet."""
     def __init__(self, path: str):
         self.path = path
 
@@ -127,7 +122,6 @@ class SimpleXlsx:
         ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
         out = []
         for si in root.findall("s:si", ns):
-            # shared string can be one <t> or multiple <r><t>
             texts = []
             t = si.find("s:t", ns)
             if t is not None and t.text is not None:
@@ -141,18 +135,17 @@ class SimpleXlsx:
         return out
 
     def _find_first_sheet_path(self, zf: zipfile.ZipFile):
-        # Prefer xl/worksheets/sheet1.xml if present
+        # prefer sheet1.xml
         try:
             zf.getinfo("xl/worksheets/sheet1.xml")
             return "xl/worksheets/sheet1.xml"
         except Exception:
             pass
-        # Fallback: parse workbook.xml for first sheet id and map via workbook relationships
+        # fallback via workbook relationships
         try:
             wb = ET.fromstring(zf.read("xl/workbook.xml"))
             ns = {
                 "w": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-                "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
             }
             sheets = wb.find("w:sheets", ns)
             if sheets is None:
@@ -167,8 +160,7 @@ class SimpleXlsx:
             rns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
             for rel in rels.findall("r:Relationship", rns):
                 if rel.attrib.get("Id") == rid:
-                    target = rel.attrib.get("Target", "")
-                    target = target.lstrip("/")
+                    target = (rel.attrib.get("Target", "") or "").lstrip("/")
                     if not target.startswith("xl/"):
                         target = "xl/" + target
                     return target
@@ -190,12 +182,11 @@ class SimpleXlsx:
                 return rows
 
             for row in sheet_data.findall("s:row", ns):
-                # Build dict col_index -> value
                 cells = {}
                 for c in row.findall("s:c", ns):
                     ref = c.attrib.get("r", "")
                     col_i = _cell_ref_to_col_index(ref)
-                    t = c.attrib.get("t", "")  # 's' for shared string, 'inlineStr' for inline
+                    t = c.attrib.get("t", "")
                     v = c.find("s:v", ns)
                     if t == "s":
                         try:
@@ -208,25 +199,19 @@ class SimpleXlsx:
                         tt = is_el.find("s:t", ns) if is_el is not None else None
                         cells[col_i] = tt.text if tt is not None and tt.text is not None else ""
                     else:
-                        # number or plain string
-                        if v is not None and v.text is not None:
-                            cells[col_i] = v.text
-                        else:
-                            cells[col_i] = ""
+                        cells[col_i] = (v.text if v is not None and v.text is not None else "")
 
                 if not cells:
                     continue
                 max_col = max(cells.keys())
-                out = []
-                for i in range(max_col + 1):
-                    out.append(cells.get(i, ""))
+                out = [cells.get(i, "") for i in range(max_col + 1)]
                 rows.append(out)
         return rows
 
 class AssetCatalog:
     """
     Single source of truth: NEW Asset Table.xlsx
-    Columns required (case-insensitive):
+    Required columns (case-insensitive exact):
       - Asset Type
       - Tier
       - Cost to Acquire
@@ -234,29 +219,56 @@ class AssetCatalog:
     """
     def __init__(self):
         self.path = None
-        self.rows = []                 # list[AssetRow] in sheet order
-        self.by_type = {}              # asset_type -> list[AssetRow] in sheet order
-        self.by_type_tier = {}         # (asset_type, tier) -> AssetRow
-        self.asset_types = []          # unique types in first-appearance order
+        self.rows = []
+        self.by_type = {}
+        self.by_type_tier = {}
+        self.asset_types = []
+
+    def _debug_listdir(self, p: str):
+        try:
+            items = os.listdir(p)
+            preview = ", ".join(items[:50])
+            print(f"[debug] listdir({p}): {preview}{' …' if len(items)>50 else ''}")
+        except Exception as e:
+            print(f"[debug] listdir({p}) failed: {e}")
 
     def _find_xlsx(self):
-        candidates = []
-        # prefer /app (Railway)
-        candidates.append(os.path.join("/app", ASSET_XLSX_FILENAME))
-        # also allow local dir and cwd
+        # 1) exact expected location
+        p = os.path.join("/app", ASSET_XLSX_FILENAME)
+        if os.path.exists(p):
+            return p
+
+        # helpful diagnostics
+        self._debug_listdir("/app")
+        self._debug_listdir(os.getcwd())
+
+        # 2) case-insensitive match in /app
         try:
-            candidates.append(os.path.join(os.getcwd(), ASSET_XLSX_FILENAME))
-        except Exception:
-            pass
-        try:
-            here = os.path.dirname(os.path.abspath(__file__))
-            candidates.append(os.path.join(here, ASSET_XLSX_FILENAME))
+            for fn in os.listdir("/app"):
+                if fn.lower() == ASSET_XLSX_FILENAME.lower():
+                    cand = os.path.join("/app", fn)
+                    if os.path.exists(cand):
+                        return cand
         except Exception:
             pass
 
-        for p in candidates:
-            if p and os.path.exists(p):
-                return p
+        # 3) any .xlsx in /app that contains "asset" and "table" (fallback)
+        try:
+            for fn in os.listdir("/app"):
+                low = fn.lower()
+                if low.endswith(".xlsx") and ("asset" in low) and ("table" in low):
+                    cand = os.path.join("/app", fn)
+                    if os.path.exists(cand):
+                        print(f"[warn] Using fallback asset spreadsheet name: {fn}")
+                        return cand
+        except Exception:
+            pass
+
+        # 4) working directory
+        p2 = os.path.join(os.getcwd(), ASSET_XLSX_FILENAME)
+        if os.path.exists(p2):
+            return p2
+
         return None
 
     def load(self):
@@ -271,8 +283,7 @@ class AssetCatalog:
             return
 
         try:
-            sx = SimpleXlsx(self.path)
-            raw = sx.read_rows()
+            raw = SimpleXlsx(self.path).read_rows()
         except Exception as e:
             print(f"[warn] Failed to read asset spreadsheet ({self.path}): {e}")
             return
@@ -293,42 +304,36 @@ class AssetCatalog:
         i_type = idx_of("asset type")
         i_tier = idx_of("tier")
         i_cost = idx_of("cost to acquire")
-        i_add  = idx_of("add to income")
+        i_add = idx_of("add to income")
 
         if None in (i_type, i_tier, i_cost, i_add):
             print("[warn] Asset spreadsheet headers not recognized. Expected: Asset Type, Tier, Cost to Acquire, Add to Income")
             print(f"[warn] Found headers: {header}")
             return
 
+        def to_int(x):
+            if x is None:
+                return 0
+            s = str(x).strip()
+            if s == "":
+                return 0
+            try:
+                return int(s)
+            except Exception:
+                try:
+                    return int(float(s))
+                except Exception:
+                    return 0
+
         seen_types = set()
         for r in raw[1:]:
-            # tolerate short rows
-            def get(i):
-                return r[i] if i is not None and i < len(r) else ""
-            asset_type = str(get(i_type) or "").strip()
-            tier = str(get(i_tier) or "").strip()
+            asset_type = str(r[i_type] if i_type < len(r) else "" or "").strip()
+            tier = str(r[i_tier] if i_tier < len(r) else "" or "").strip()
             if not asset_type or not tier:
                 continue
 
-            cost = get(i_cost)
-            add = get(i_add)
-
-            def to_int(x):
-                if x is None:
-                    return 0
-                s = str(x).strip()
-                if s == "":
-                    return 0
-                try:
-                    return int(s)
-                except Exception:
-                    try:
-                        return int(float(s))
-                    except Exception:
-                        return 0
-
-            cost_val = to_int(cost)
-            add_val = to_int(add)
+            cost_val = to_int(r[i_cost] if i_cost < len(r) else 0)
+            add_val = to_int(r[i_add] if i_add < len(r) else 0)
 
             ar = AssetRow(asset_type=asset_type, tier=tier, cost_val=cost_val, add_income_val=add_val)
             self.rows.append(ar)
@@ -342,13 +347,6 @@ class AssetCatalog:
 
     def is_loaded(self):
         return bool(self.rows)
-
-    def list_asset_types(self):
-        return list(self.asset_types)
-
-    def list_tiers_for_type(self, asset_type):
-        tiers = self.by_type.get(asset_type) or []
-        return [r.tier for r in tiers]
 
     def get_chain_cost(self, asset_type, tier):
         tiers = self.by_type.get(asset_type) or []
@@ -368,7 +366,6 @@ class AssetCatalog:
         return int(ar.add_income_val) if ar else 0
 
     def autocomplete_asset_choices(self, current, limit=25):
-        # single field that encodes type+tier, but displays "Type — Tier"
         if not self.rows:
             return []
         q = (current or "").strip().lower()
@@ -551,7 +548,7 @@ intents = discord.Intents.none()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+GUILD_OBJ = discord.Object(id=int(GUILD_ID))
 
 async def character_autocomplete(interaction, current):
     try:
@@ -575,7 +572,6 @@ async def build_balance_embed(guild, character):
     for a in owned:
         nm = (a.get("asset_name") or "").strip() or "Unnamed"
         tier = (a.get("tier") or "").strip()
-        # Requested display: Asset Tier - Asset Name
         lines.append(f"{tier} — {nm}")
     e = discord.Embed(
         title=str(character),
@@ -765,8 +761,6 @@ async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int
     except Exception:
         pass
 
-# IMPORTANT: Keep purchase_new signature compatible with prior deployed versions to avoid global/guild drift issues.
-# We encode asset_type+tier into ONE choice value "type|||tier".
 @tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character.", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", asset="Pick an Asset Type — Tier (from spreadsheet)", asset_name="Unique asset name (executor entered)")
 @app_commands.autocomplete(character=character_autocomplete, asset=asset_autocomplete)
@@ -797,7 +791,6 @@ async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: 
     if owner_user_id is None:
         return await interaction.followup.send("Character not found in characters table.", ephemeral=True)
 
-    # uniqueness: user_id → character → asset_name
     existing = await db.get_assets(g.id, character)
     for a in existing:
         if int(a.get("user_id") or 0) == int(owner_user_id) and (a.get("asset_name") or "").strip().lower() == asset_name.lower():
@@ -877,28 +870,44 @@ async def on_ready():
     print(f"[test] Starting {APP_VERSION}…")
     await db.init()
 
-    # Load spreadsheet (no openpyxl dependency)
     assets.load()
 
-    # --- Global command cleanup (requested) ---
-    # You requested ONE /purchase_new command. Older iterations may have left a GLOBAL /purchase_new registered.
-    # We delete ONLY the global command named 'purchase_new' (no other global commands are touched).
-    try:
-        global_cmds = await tree.fetch_commands()  # global
-        for c in global_cmds:
-            if getattr(c, "name", "") == "purchase_new":
-                try:
-                    await tree.delete_command(c, guild=None)  # deletes global command registration
-                    print("[test] Deleted GLOBAL /purchase_new (cleanup).")
-                except Exception as e:
-                    print(f"[warn] Failed to delete GLOBAL /purchase_new: {e}")
-    except Exception as e:
-        print(f"[warn] Global command fetch/delete skipped: {e}")
-
-
     guild_obj = discord.Object(id=int(GUILD_ID))
+
+    # --- HARD cleanup of duplicates (requested) ---
+    # Delete ALL 'purchase_new' commands registered globally and in this guild, then re-sync guild-only.
     try:
-        # Keep guild-only sync, but ensure the guild gets the latest schema from our global definitions.
+        # Global commands
+        try:
+            global_cmds = await tree.fetch_commands()  # global
+            for c in global_cmds:
+                if getattr(c, "name", "") == "purchase_new":
+                    try:
+                        await c.delete()
+                        print("[test] Deleted GLOBAL /purchase_new (cleanup).")
+                    except Exception as e:
+                        print(f"[warn] Failed to delete GLOBAL /purchase_new via cmd.delete(): {e}")
+        except Exception as e:
+            print(f"[warn] Global command fetch skipped: {e}")
+
+        # Guild commands
+        try:
+            guild_cmds = await tree.fetch_commands(guild=guild_obj)
+            for c in guild_cmds:
+                if getattr(c, "name", "") == "purchase_new":
+                    try:
+                        await c.delete()
+                        print("[test] Deleted GUILD /purchase_new (cleanup).")
+                    except Exception as e:
+                        print(f"[warn] Failed to delete GUILD /purchase_new via cmd.delete(): {e}")
+        except Exception as e:
+            print(f"[warn] Guild command fetch skipped: {e}")
+
+    except Exception as e:
+        print(f"[warn] Duplicate cleanup step failed: {e}")
+
+    # Sync guild-only command set
+    try:
         synced = await tree.sync(guild=guild_obj)
         print(f"[test] Synced {len(synced)} guild command(s).")
     except Exception as e:
