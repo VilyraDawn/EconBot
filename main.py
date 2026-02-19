@@ -489,6 +489,9 @@ intents.guilds = True
 client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
 tree = app_commands.CommandTree(client)
 
+# Register commands as *guild* commands when GUILD_ID is set (instant availability).
+GUILD_OBJ = discord.Object(id=GUILD_ID) if GUILD_ID else None
+
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -583,7 +586,7 @@ COMMAND_HELP_LINES = [
 
 
 
-@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.")
+@tree.command(guild=GUILD_OBJ, name="econ_commands", description="Staff: show EconBot command list and what each command does.")
 @require_admin()
 async def econ_commands_cmd(interaction: discord.Interaction):
     await interaction.response.defer(thinking=False, ephemeral=True)
@@ -607,7 +610,7 @@ async def econ_commands_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=em, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-@tree.command(name="balance", description="Show a character’s money + assets.")
+@tree.command(guild=GUILD_OBJ, name="balance", description="Show a character’s money + assets.")
 @app_commands.describe(character="Pick a character")
 @app_commands.autocomplete(character=character_name_autocomplete)
 async def balance_cmd(interaction: discord.Interaction, character: str):
@@ -631,7 +634,7 @@ async def balance_cmd(interaction: discord.Interaction, character: str):
     await interaction.followup.send(embed=em, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-@tree.command(name="income", description="Owner-only: claim daily income for your character (Chicago time).")
+@tree.command(guild=GUILD_OBJ, name="income", description="Owner-only: claim daily income for your character (Chicago time).")
 @app_commands.describe(character="Pick one of your characters")
 @app_commands.autocomplete(character=character_name_autocomplete)
 async def income_cmd(interaction: discord.Interaction, character: str):
@@ -720,7 +723,7 @@ async def income_cmd(interaction: discord.Interaction, character: str):
     asyncio.create_task(rebuild_dashboard())
 
 
-@tree.command(name="econ_adjust", description="Staff: add/subtract currency (never negative).")
+@tree.command(guild=GUILD_OBJ, name="econ_adjust", description="Staff: add/subtract currency (never negative).")
 @require_admin()
 @app_commands.describe(character="Pick a character", delta_val="Delta in Val (negative subtracts)", reason="Why")
 @app_commands.autocomplete(character=character_name_autocomplete)
@@ -753,7 +756,7 @@ async def econ_adjust_cmd(interaction: discord.Interaction, character: str, delt
     asyncio.create_task(rebuild_dashboard())
 
 
-@tree.command(name="econ_set_balance", description="Staff: set exact balance (non-negative).")
+@tree.command(guild=GUILD_OBJ, name="econ_set_balance", description="Staff: set exact balance (non-negative).")
 @require_admin()
 @app_commands.describe(character="Pick a character", balance_val="Exact balance in Val", reason="Why")
 @app_commands.autocomplete(character=character_name_autocomplete)
@@ -816,7 +819,7 @@ def cumulative_tier_cost(asset_type: str, target_tier: int) -> int:
     costs = [r['cost_val'] for r in ASSET_CATALOG if r['asset_type'] == asset_type and int(r['tier_num']) <= int(target_tier)]
     return int(sum(costs))
 
-@tree.command(name="purchase_new", description="Staff: buy a new asset for a character (tier 1..target tier cost, no negative balances).")
+@tree.command(guild=GUILD_OBJ, name="purchase_new", description="Staff: buy a new asset for a character (tier 1..target tier cost, no negative balances).")
 @require_admin()
 @app_commands.describe(character="Character name", tier_choice="Asset Type + Tier (from NEW Asset Table)", asset_name="Custom name for this asset (unique per character)")
 @app_commands.autocomplete(character=character_name_autocomplete, tier_choice=tier_choice_autocomplete)
@@ -914,7 +917,7 @@ async def purchase_new(interaction: discord.Interaction, character: str, tier_ch
         ephemeral=True,
     )
 
-@tree.command(name="econ_refresh_bank", description="Staff: force-refresh the Bank of Vilyra dashboard.")
+@tree.command(guild=GUILD_OBJ, name="econ_refresh_bank", description="Staff: force-refresh the Bank of Vilyra dashboard.")
 @require_admin()
 async def econ_refresh_bank(interaction: discord.Interaction):
     await interaction.response.defer(thinking=False, ephemeral=True)
