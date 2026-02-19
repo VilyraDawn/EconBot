@@ -1,17 +1,16 @@
 import os, json, datetime as dt
 from dataclasses import dataclass
-from zoneinfo import ZoneInfo  # may fail on some Railway runtimes; handled below
 
 import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v41"
+APP_VERSION = "EconBot_v42"
 
 # --- Timezone handling (Railway-safe) ---
-# Some Railway deployments run Python/envs where `zoneinfo` isn't available or tzdata is missing.
-# We must not crash at import time.
+# Some deployments may lack zoneinfo/tzdata; do not crash at import time.
 try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
     CHICAGO_TZ = ZoneInfo("America/Chicago")
 except Exception:
     CHICAGO_TZ = dt.timezone(dt.timedelta(hours=-6))  # fixed UTC-6 fallback (no DST auto-adjust)
@@ -59,6 +58,10 @@ BANK_MESSAGE_IDS = _int_list("BANK_MESSAGE_IDS")
 
 STAFF_ROLE_IDS = set(_int_list("STAFF_ROLE_IDS"))
 BANK_REFRESH_ROLE_IDS = set(_int_list("BANK_REFRESH_ROLE_IDS"))
+
+# IMPORTANT: to reduce command signature mismatch issues caused by lingering GLOBAL commands,
+# we register commands as GUILD-SCOPED at definition time when GUILD_ID is available.
+GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
 DENOMS = [("NOVIR", 10000), ("ORIN", 1000), ("ELSH", 100), ("ARCE", 10), ("CINTH", 1)]
 
@@ -129,7 +132,6 @@ class DB:
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
 
-            # Runtime migration checks (v38 doctrine)
             cols = await con.fetch("""
                 SELECT column_name FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='econ_assets';
@@ -141,7 +143,6 @@ class DB:
                 await con.execute("ALTER TABLE econ_assets ADD COLUMN user_id BIGINT;")
             await con.execute("UPDATE econ_assets SET asset_name = COALESCE(asset_name,'') WHERE asset_name IS NULL;")
             await con.execute("UPDATE econ_assets SET user_id = COALESCE(user_id,0) WHERE user_id IS NULL;")
-
             exists = await con.fetchval("SELECT 1 FROM pg_constraint WHERE conname='econ_assets_unique_assetname' LIMIT 1;")
             if not exists:
                 try:
@@ -151,7 +152,6 @@ class DB:
                         UNIQUE (guild_id, user_id, character_name, asset_name);
                     """)
                 except Exception:
-                    # If it fails due to existing duplicates or permissions, we avoid crashing the bot.
                     pass
 
             await con.execute("""
@@ -242,9 +242,7 @@ class DB:
     async def list_asset_defs(self):
         assert self.pool is not None
         async with self.pool.acquire() as con:
-            rows = await con.fetch(
-                "SELECT asset_type, tier, cost_val, add_income_val FROM econ_asset_definitions ORDER BY asset_type, tier;"
-            )
+            rows = await con.fetch("SELECT asset_type, tier, cost_val, add_income_val FROM econ_asset_definitions ORDER BY asset_type, tier;")
         return [AssetDef(r["asset_type"], r["tier"], int(r["cost_val"]), int(r["add_income_val"])) for r in rows]
 
     async def get_asset_def(self, asset_type, tier):
@@ -345,7 +343,6 @@ async def refresh_bank_dashboard(guild):
             WHERE guild_id=$1 AND archived=FALSE
             ORDER BY user_id, name;
         """, int(LEGACY_SOURCE_GUILD_ID))
-
     by_user = {}
     for r in rows:
         by_user.setdefault(int(r["user_id"]), []).append(r["name"])
@@ -370,11 +367,7 @@ async def refresh_bank_dashboard(guild):
         for cname in by_user[uid]:
             bal = await db.get_balance(guild.id, cname)
             lines.append(f"**{cname}** — {format_val(bal)}")
-        embed = discord.Embed(
-            title=display,
-            description="\n".join(lines)[:4096] if lines else "No characters.",
-            color=discord.Color.blurple()
-        )
+        embed = discord.Embed(title=display, description="\n".join(lines)[:4096] if lines else "No characters.", color=discord.Color.blurple())
         embed.set_footer(text="Bank of Vilyra • Public ledger")
         await msg.edit(content="", embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
@@ -390,7 +383,9 @@ async def calc_asset_income(guild_id, character):
             total += int(ad.add_income_val)
     return total
 
-@tree.command(name="balance", description="Show a character’s current money and owned assets.")
+# --- Commands (guild-scoped when possible) ---
+
+@tree.command(name="balance", description="Show a character’s current money and owned assets.", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_balance(interaction, character: str):
@@ -400,7 +395,7 @@ async def cmd_balance(interaction, character: str):
     embed = await build_balance_embed(interaction.guild, character)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).")
+@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick one of your characters")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_income(interaction, character: str):
@@ -418,10 +413,7 @@ async def cmd_income(interaction, character: str):
     today = chicago_today()
     assert db.pool is not None
     async with db.pool.acquire() as con:
-        row = await con.fetchrow(
-            "SELECT last_claim_date FROM econ_income_claims WHERE guild_id=$1 AND character_name=$2;",
-            int(g.id), str(character)
-        )
+        row = await con.fetchrow("SELECT last_claim_date FROM econ_income_claims WHERE guild_id=$1 AND character_name=$2;", int(g.id), str(character))
         if row and row["last_claim_date"] == today:
             return await interaction.followup.send("You already claimed income for this character today (Chicago time).", ephemeral=True)
 
@@ -451,7 +443,7 @@ async def cmd_income(interaction, character: str):
     except Exception:
         pass
 
-@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).")
+@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", delta_val="Positive or negative Val", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_adjust(interaction, character: str, delta_val: int, reason: str=None):
@@ -476,7 +468,7 @@ async def cmd_econ_adjust(interaction, character: str, delta_val: int, reason: s
     except Exception:
         pass
 
-@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).")
+@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", new_balance_val="New balance in Val (>=0)", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int, reason: str=None):
@@ -498,7 +490,7 @@ async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int
     except Exception:
         pass
 
-@tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character (tiered cost sum).")
+@tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character (tiered cost sum).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", asset="Pick an Asset Type — Tier", asset_name="Name this asset (unique per character)")
 @app_commands.autocomplete(character=character_autocomplete, asset=asset_tier_autocomplete)
 async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: str):
@@ -571,7 +563,7 @@ async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: 
     except Exception:
         pass
 
-@tree.command(name="econ_refresh_bank", description="Staff: manually refresh the Bank of Vilyra dashboard.")
+@tree.command(name="econ_refresh_bank", description="Staff: manually refresh the Bank of Vilyra dashboard.", guild=GUILD_OBJ)
 async def cmd_refresh_bank(interaction):
     await interaction.response.defer(ephemeral=True)
     g = interaction.guild
@@ -583,7 +575,7 @@ async def cmd_refresh_bank(interaction):
     await refresh_bank_dashboard(g)
     await interaction.followup.send("Bank dashboard refreshed.", ephemeral=True)
 
-@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.")
+@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.", guild=GUILD_OBJ)
 async def cmd_econ_commands(interaction):
     await interaction.response.defer(ephemeral=True)
     mem = interaction.user if isinstance(interaction.user, discord.Member) else None
@@ -616,8 +608,10 @@ async def on_ready():
         print(f"[test] Logged in as {client.user} (commands guild: GLOBAL; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
         return
 
+    # Force a clean guild overwrite to reduce signature mismatch issues.
     guild_obj = discord.Object(id=int(GUILD_ID))
     try:
+        # Clear local guild overrides (safe) then overwrite guild commands
         tree.clear_commands(guild=guild_obj)
         await tree.sync(guild=guild_obj)
     except Exception as e:
