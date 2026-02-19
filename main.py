@@ -1277,7 +1277,7 @@ async def on_ready():
         except Exception as e:
             print(f"[{VERSION}] Global command sync failed: {e}")
 
-print(f"[test] Starting {VERSION}…")
+    print(f"[test] Starting {VERSION}…")
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID or 'GLOBAL'}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
 
     asyncio.create_task(rebuild_dashboard())
