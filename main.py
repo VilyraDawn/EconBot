@@ -19,7 +19,7 @@ except Exception:
 # -------------------------
 # Version / Config
 # -------------------------
-VERSION = "EconBot_v30"
+VERSION = "EconBot_v36"
 
 TZ_NAME = "America/Chicago"
 TZ = ZoneInfo(TZ_NAME) if ZoneInfo else dt.timezone.utc
@@ -1072,26 +1072,36 @@ async def on_ready():
         raise
 
     # Sync commands (guild-scoped for fast iteration)
+    #
+    # IMPORTANT:
+    # - We do NOT "copy_global_to" because that can re-introduce stale/legacy global commands.
+    # - We proactively clear GLOBAL commands to avoid ghost commands like /econ_purchase lingering.
+    # - Then we clear GUILD commands and sync the current definitions.
+    try:
+        tree.clear_commands(guild=None)
+        cleared = await tree.sync()  # empty global sync -> deletes global commands for this app
+        print(f"[{VERSION}] Cleared global commands: {len(cleared)}")
+    except Exception as e:
+        print(f"[{VERSION}] Global command clear failed (continuing): {e}")
+
     if GUILD_ID:
         guild_obj = discord.Object(id=int(GUILD_ID))
-        # IMPORTANT: When changing a command from a simple command to a Group with subcommands
-        # (like /econ_purchase -> /econ_purchase new|upgrade), Discord can keep the old shape
-        # unless we delete the guild commands first. We do a "clear + sync empty" pass, then
-        # sync the current definitions.
         try:
             tree.clear_commands(guild=guild_obj)
-            await tree.sync(guild=guild_obj)  # pushes an empty command set -> deletes old guild commands
+            await tree.sync(guild=guild_obj)  # empty guild sync -> deletes old guild commands
+            print(f"[{VERSION}] Cleared guild commands for {GUILD_ID}")
         except Exception as e:
             print(f"[{VERSION}] Guild command clear failed (continuing): {e}")
 
         try:
-            tree.copy_global_to(guild=guild_obj)
-            await tree.sync(guild=guild_obj)
+            synced = await tree.sync(guild=guild_obj)
+            print(f"[{VERSION}] Synced guild commands: {len(synced)}")
         except Exception as e:
             print(f"[{VERSION}] Command sync failed: {e}")
     else:
         try:
-            await tree.sync()
+            synced = await tree.sync()
+            print(f"[{VERSION}] Synced global commands: {len(synced)}")
         except Exception as e:
             print(f"[{VERSION}] Global command sync failed: {e}")
 
