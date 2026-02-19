@@ -574,13 +574,18 @@ async def owned_asset_name_autocomplete(interaction: discord.Interaction, curren
 # Commands
 # -------------------------
 COMMAND_HELP_LINES = [
-    ("balance", "Show a character’s current money and owned assets. Anyone can use this; it matches the public bank dashboard."),
-    ("income", "Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets."),
-    ("econ_adjust", "Staff-only. Add or subtract money from a character. The bot will not allow balances to go negative."),
-    ("econ_set_balance", "Staff-only. Set a character’s balance to an exact amount (non-negative). Useful for corrections."),
-    ("econ_purchase", "Staff-only. NEW purchase or UPGRADE an existing asset. Charges the full cost listed in the asset spreadsheet."),
-    ("econ_commands", "Staff-only. Shows this command list with short descriptions (kept updated as we add features)."),
+    "Player Commands",
+    "/balance — Show a character’s current money and owned assets. Anyone can use this; it matches the public bank dashboard.",
+    "/income — Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets.",
+    "",
+    "Staff Commands",
+    "/econ_adjust — Staff-only. Add or subtract money from a character. The bot will not allow balances to go negative.",
+    "/econ_set_balance — Staff-only. Set a character’s balance to an exact amount (non-negative). Useful for corrections.",
+    "/econ_purchase_new — Staff-only. Buy a new asset at a chosen tier (cost is tier 1 + ... + target tier, per NEW Asset Table).",
+    "/econ_refresh_bank — Staff-only. Force-refresh the Bank of Vilyra dashboard.",
+    "/econ_commands — Staff-only. Shows this command list with short descriptions (kept updated as we add features).",
 ]
+
 
 
 @tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.")
@@ -786,318 +791,133 @@ async def econ_set_balance_cmd(interaction: discord.Interaction, character: str,
     asyncio.create_task(rebuild_dashboard())
 
 
-PURCHASE_MODE_CHOICES = [
-    app_commands.Choice(name="New Purchase", value="NEW"),
-    app_commands.Choice(name="Upgrade Existing", value="UPGRADE"),
-]
+# Helper: build tier choices from the NEW Asset Table catalog
+def _tier_choice_value(asset_type: str, tier_name: str) -> str:
+    return f"{asset_type}||{tier_name}"
 
+def _parse_tier_choice_value(val: str) -> tuple[str, str]:
+    if "||" not in val:
+        raise ValueError("Invalid tier selection")
+    a, t = val.split("||", 1)
+    return a.strip(), t.strip()
 
-async def asset_type_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    cur = (current or "").lower().strip()
-    types = sorted({str(a["asset_type"]) for a in ASSET_CATALOG})
-    out = [t for t in types if not cur or cur in t.lower()]
-    return [app_commands.Choice(name=t, value=t) for t in out[:25]]
-
-
-async def tier_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    asset_type = str(getattr(interaction.namespace, "asset_type", "") or "").strip()
-    cur = (current or "").lower().strip()
-    names = []
-    for a in ASSET_CATALOG:
-        if asset_type and str(a["asset_type"]) != asset_type:
-            continue
-        tn = str(a["tier_name"]) 
-        if not cur or cur in tn.lower():
-            names.append(tn)
-    names = sorted(set(names))[:25]
-    return [app_commands.Choice(name=n, value=n) for n in names]
-
-
-async def secondary_type_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    asset_type = str(getattr(interaction.namespace, "asset_type", "") or "").strip()
-    tier_name = str(getattr(interaction.namespace, "tier_name", "") or "").strip()
-    cur = (current or "").lower().strip()
-    secs = []
-    for a in ASSET_CATALOG:
-        if asset_type and str(a["asset_type"]) != asset_type:
-            continue
-        if tier_name and str(a["tier_name"]) != tier_name:
-            continue
-        st = str(a["secondary_type"]) 
-        if not cur or cur in st.lower():
-            secs.append(st)
-    secs = sorted(set(secs))[:25]
-    return [app_commands.Choice(name=s, value=s) for s in secs]
-
-
-
-# -------------------------
-# /econ_purchase group (rebuilt v29)
-# - Conditional fields are NOT supported in Discord slash commands.
-#   So we implement two subcommands:
-#   /econ_purchase new
-#   /econ_purchase upgrade
-# -------------------------
-
-econ_purchase_group = app_commands.Group(
-    name="econ_purchase",
-    description="Staff: transact asset purchases (new) or upgrades (upgrade).",
-)
-
-def _secondary_types() -> List[str]:
-    return sorted({str(r["secondary_type"]) for r in ASSET_CATALOG if str(r.get("secondary_type", "")).strip()})
-
-def _tiers_for_secondary(secondary_type: str) -> List[Dict[str, object]]:
-    st = secondary_type.strip().lower()
-    rows = [r for r in ASSET_CATALOG if str(r["secondary_type"]).strip().lower() == st]
-    rows.sort(key=lambda x: int(x["tier"]))
-    return rows
-
-def _row_for_secondary_and_tier_name(secondary_type: str, tier_name: str) -> Optional[Dict[str, object]]:
-    st = secondary_type.strip().lower()
-    tn = tier_name.strip().lower()
-    for r in ASSET_CATALOG:
-        if str(r["secondary_type"]).strip().lower() == st and str(r["tier_name"]).strip().lower() == tn:
-            return r
-    return None
-
-async def property_type_autocomplete(interaction: discord.Interaction, current: str):
-    current = (current or "").lower()
-    opts = [x for x in _secondary_types() if current in x.lower()]
-    opts = opts[:25]
-    return [app_commands.Choice(name=o, value=o) for o in opts]
-
-async def tier_name_for_property_autocomplete(interaction: discord.Interaction, current: str):
-    # This autocomplete reads the already-selected "property_type" from the interaction namespace.
-    current_l = (current or "").lower()
-    ns = getattr(interaction, "namespace", None)
-    prop = getattr(ns, "property_type", None) if ns else None
-    if not prop:
+async def tier_choice_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    q = (current or "").lower().strip()
+    out: list[app_commands.Choice[str]] = []
+    try:
+        for row in ASSET_CATALOG:
+            label = f"{row['asset_type']} — {row['tier_name']}"
+            if q and q not in label.lower():
+                continue
+            out.append(app_commands.Choice(name=label[:100], value=_tier_choice_value(row['asset_type'], row['tier_name'])[:100]))
+            if len(out) >= 25:
+                break
+        return out
+    except Exception:
         return []
-    rows = _tiers_for_secondary(str(prop))
-    names = [str(r["tier_name"]) for r in rows if current_l in str(r["tier_name"]).lower()]
-    names = names[:25]
-    return [app_commands.Choice(name=n, value=n) for n in names]
 
-async def upgrade_target_tier_autocomplete(interaction: discord.Interaction, current: str):
-    current_l = (current or "").lower()
-    ns = getattr(interaction, "namespace", None)
-    character = getattr(ns, "character", None) if ns else None
-    upgrade_asset_name = getattr(ns, "upgrade_asset_name", None) if ns else None
-    if not character or not upgrade_asset_name:
-        return []
-    owned = await fetch_assets_owned(int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID), str(character))
-    chosen = None
-    for a in owned:
-        if str(a["asset_name"]).strip().lower() == str(upgrade_asset_name).strip().lower():
-            chosen = a
-            break
-    if not chosen:
-        return []
-    prop = str(chosen["secondary_type"])
-    current_tier = int(chosen["tier"])
-    rows = _tiers_for_secondary(prop)
-    names = [str(r["tier_name"]) for r in rows if int(r["tier"]) > current_tier and current_l in str(r["tier_name"]).lower()]
-    return [app_commands.Choice(name=n, value=n) for n in names[:25]]
+def cumulative_tier_cost(asset_type: str, target_tier: int) -> int:
+    # Sum cost to acquire for tiers 1..target_tier of the given asset_type.
+    costs = [r['cost_val'] for r in ASSET_CATALOG if r['asset_type'] == asset_type and int(r['tier']) <= int(target_tier)]
+    return int(sum(costs))
 
-@econ_purchase_group.command(name="new", description="Staff: purchase a new asset for a character (costs Val from their balance).")
+@tree.command(name="econ_purchase_new", description="Staff: buy a new asset for a character (tier 1..target tier cost, no negative balances).")
 @require_admin()
-@app_commands.describe(
-    character="Pick a character",
-    property_type="Pick an asset category (from spreadsheet Secondary Type)",
-    tier_name="Pick a tier (from spreadsheet Tier Name)",
-    asset_name="Name the asset (e.g., 'Vaelith Ranch')",
-)
-@app_commands.autocomplete(
-    character=character_name_autocomplete,
-    property_type=property_type_autocomplete,
-    tier_name=tier_name_for_property_autocomplete,
-)
-async def econ_purchase_new(
-    interaction: discord.Interaction,
-    character: str,
-    property_type: str,
-    tier_name: str,
-    asset_name: str,
-):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    guild_id = int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or interaction.guild_id or 0)
-    if not guild_id:
-        await interaction.followup.send("Bot is not configured with a legacy source guild id.", ephemeral=True)
+@app_commands.describe(character="Character name", tier_choice="Asset Type + Tier (from NEW Asset Table)", asset_name="Custom name for this asset (unique per character)")
+@app_commands.autocomplete(character=character_name_autocomplete, tier_choice=tier_choice_autocomplete)
+async def econ_purchase_new(interaction: discord.Interaction, character: str, tier_choice: str, asset_name: str):
+    await interaction.response.defer(ephemeral=True)
+    asset_name = (asset_name or "").strip()
+    if not asset_name:
+        await interaction.followup.send("Asset name cannot be blank.", ephemeral=True)
         return
 
-    asset_name_clean = (asset_name or "").strip()
-    if not asset_name_clean:
-        await interaction.followup.send("Asset name is required for new purchases.", ephemeral=True)
+    try:
+        asset_type, tier_name = _parse_tier_choice_value(tier_choice)
+    except Exception:
+        await interaction.followup.send("Invalid tier selection.", ephemeral=True)
         return
 
-    row = _row_for_secondary_and_tier_name(property_type, tier_name)
+    row = next((r for r in ASSET_CATALOG if r['asset_type'] == asset_type and r['tier_name'] == tier_name), None)
     if not row:
-        await interaction.followup.send("That property type + tier was not found in the asset table.", ephemeral=True)
+        await interaction.followup.send("That asset tier was not found in the NEW Asset Table.", ephemeral=True)
         return
 
-    # funds check
-    bal = await get_balance_val(guild_id, character)
-    cost = int(row["cost_val"])
-    if bal < cost:
-        delta = cost - bal
-        await interaction.followup.send(
-            f"Insufficient funds.\n\nAvailable: **{format_money(bal)}**\nCost: **{format_money(cost)}**\nShort: **{format_money(delta)}**",
-            ephemeral=True,
-        )
-        return
+    target_tier = int(row['tier'])
+    total_cost = cumulative_tier_cost(asset_type, target_tier)
 
-    # apply: subtract balance, upsert asset record
-    pool = await db_pool()
     async with pool.acquire() as con:
-        async with con.transaction():
-            await set_balance_val(guild_id, character, bal - cost, con=con)
-
-            # Insert owned asset with tier; unique by (guild, character, user_id, asset_name) via table constraints.
-            # Note: We do NOT rename on future upgrades.
-            await upsert_owned_asset(
-                con=con,
-                guild_id=guild_id,
-                character=character,
-                user_id=None,  # we don't require owner to transact
-                asset_type=str(row["asset_type"]),
-                secondary_type=str(row["secondary_type"]),
-                tier=int(row["tier"]),
-                tier_name=str(row["tier_name"]),
-                asset_name=asset_name_clean,
-                income_val=int(row["income_val"]),
-            )
-
-            await log_command(
-                con=con,
-                guild_id=guild_id,
-                user_id=int(interaction.user.id),
-                character=character,
-                action="econ_purchase_new",
-                details={
-                    "property_type": str(row["secondary_type"]),
-                    "tier": int(row["tier"]),
-                    "tier_name": str(row["tier_name"]),
-                    "asset_name": asset_name_clean,
-                    "cost_val": cost,
-                },
-            )
-
-    await interaction.followup.send(
-        f"Purchased **{asset_name_clean}** — **{row['tier_name']}** ({row['secondary_type']}). Cost: **{format_money(cost)}**.",
-        ephemeral=True,
-    )
-    # Keep the dashboard in sync
-    await rebuild_dashboard()
-
-
-@econ_purchase_group.command(name="upgrade", description="Staff: upgrade an existing named asset to a higher tier (cost is summed per spreadsheet).")
-@require_admin()
-@app_commands.describe(
-    character="Pick a character",
-    upgrade_asset_name="Pick the asset you want to upgrade (by its name)",
-    target_tier_name="Pick the target tier name (must be higher)",
-)
-@app_commands.autocomplete(
-    character=character_name_autocomplete,
-    upgrade_asset_name=owned_asset_name_autocomplete,
-    target_tier_name=upgrade_target_tier_autocomplete,
-)
-async def econ_purchase_upgrade(
-    interaction: discord.Interaction,
-    character: str,
-    upgrade_asset_name: str,
-    target_tier_name: str,
-):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    guild_id = int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or interaction.guild_id or 0)
-    if not guild_id:
-        await interaction.followup.send("Bot is not configured with a legacy source guild id.", ephemeral=True)
-        return
-
-    owned = await fetch_assets_owned(guild_id, character)
-    chosen = None
-    for a in owned:
-        if str(a["asset_name"]).strip().lower() == str(upgrade_asset_name).strip().lower():
-            chosen = a
-            break
-    if not chosen:
-        await interaction.followup.send("That asset name was not found on this character.", ephemeral=True)
-        return
-
-    prop = str(chosen["secondary_type"])
-    current_tier = int(chosen["tier"])
-    target_row = _row_for_secondary_and_tier_name(prop, target_tier_name)
-    if not target_row:
-        await interaction.followup.send("Target tier not found for that asset.", ephemeral=True)
-        return
-
-    target_tier = int(target_row["tier"])
-    if target_tier <= current_tier:
-        await interaction.followup.send("Upgrades must be to a higher tier (no downgrades).", ephemeral=True)
-        return
-
-    # cost is the sum of the intermediate tiers' absolute costs (tier+1..target)
-    ladder = _tiers_for_secondary(prop)
-    tier_to_row = {int(r["tier"]): r for r in ladder}
-    total_cost = 0
-    for t in range(current_tier + 1, target_tier + 1):
-        rr = tier_to_row.get(t)
-        if not rr:
-            await interaction.followup.send("Upgrade path is incomplete in the asset table (missing a tier).", ephemeral=True)
+        # Find character (legacy table) to get owner user_id
+        ch = await get_character_by_name(con, character)
+        if not ch:
+            await interaction.followup.send(f"Character not found: {character}", ephemeral=True)
             return
-        total_cost += int(rr["cost_val"])
 
-    bal = await get_balance_val(guild_id, character)
-    if bal < total_cost:
-        delta = total_cost - bal
-        await interaction.followup.send(
-            f"Insufficient funds.\n\nAvailable: **{format_money(bal)}**\nTotal cost: **{format_money(total_cost)}**\nShort: **{format_money(delta)}**",
-            ephemeral=True,
+        owner_user_id = int(ch['user_id'])
+        # Fetch current balance
+        bal = await get_balance(con, owner_user_id, character)
+        current_val = int(bal['balance_val']) if bal else 0
+
+        if current_val < total_cost:
+            delta = total_cost - current_val
+            await interaction.followup.send(
+                f"Insufficient funds.\n"
+                f"Available: **{format_value(current_val)}**\n"
+                f"Total cost: **{format_value(total_cost)}**\n"
+                f"Shortfall: **{format_value(delta)}**",
+                ephemeral=True,
+            )
+            return
+
+        # Enforce unique asset_name per (user_id, character, asset_name)
+        exists = await con.fetchval(
+            "SELECT 1 FROM econ_assets_owned WHERE guild_id=$1 AND user_id=$2 AND character_name=$3 AND asset_name=$4",
+            LEGACY_SOURCE_GUILD_ID, owner_user_id, character, asset_name
         )
-        return
-
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        async with con.transaction():
-            await set_balance_val(guild_id, character, bal - total_cost, con=con)
-
-            # update the owned asset row: replace tier fields, keep asset_name as-is
-            await update_owned_asset_tier(
-                con=con,
-                guild_id=guild_id,
-                character=character,
-                asset_name=str(chosen["asset_name"]),
-                new_tier=int(target_row["tier"]),
-                new_tier_name=str(target_row["tier_name"]),
-                new_income_val=int(target_row["income_val"]),
+        if exists:
+            await interaction.followup.send(
+                "That character already has an asset with that name. Asset names must be unique per character.",
+                ephemeral=True,
             )
+            return
 
-            await log_command(
-                con=con,
-                guild_id=guild_id,
-                user_id=int(interaction.user.id),
-                character=character,
-                action="econ_purchase_upgrade",
-                details={
-                    "property_type": prop,
-                    "from_tier": current_tier,
-                    "to_tier": int(target_row["tier"]),
-                    "asset_name": str(chosen["asset_name"]),
-                    "total_cost_val": total_cost,
-                },
-            )
+        # Debit and insert asset
+        new_balance = current_val - total_cost
+        await set_balance(con, owner_user_id, character, new_balance)
 
+        await con.execute(
+            """INSERT INTO econ_assets_owned
+                (guild_id, user_id, character_name, asset_name, asset_type, secondary_type, tier, tier_name, cost_val, income_val)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+            LEGACY_SOURCE_GUILD_ID, owner_user_id, character, asset_name,
+            asset_type, asset_type, target_tier, tier_name, int(row['cost_val']), int(row['income_val'])
+        )
+
+        details = {
+            "action": "purchase_new",
+            "asset_type": asset_type,
+            "tier_name": tier_name,
+            "target_tier": target_tier,
+            "total_cost": total_cost,
+            "asset_name": asset_name,
+        }
+        await log_ledger(
+            con,
+            user_id=owner_user_id,
+            character_name=character,
+            action="purchase_new",
+            delta_val=-total_cost,
+            by_user_id=int(interaction.user.id),
+            details=details,
+        )
+
+    # Refresh dashboard + confirm
+    await refresh_bank_dashboard()
     await interaction.followup.send(
-        f"Upgraded **{chosen['asset_name']}**: Tier {current_tier} → **{target_row['tier_name']}** ({prop}). Total cost: **{format_money(total_cost)}**.",
+        f"Purchased **{asset_name}** — **{asset_type} / {tier_name}** for **{format_value(total_cost)}**.\n"
+        f"New balance: **{format_value(new_balance)}**",
         ephemeral=True,
     )
-    await rebuild_dashboard()
-
-# Register the group on the tree
-tree.add_command(econ_purchase_group)
 
 @tree.command(name="econ_refresh_bank", description="Staff: force-refresh the Bank of Vilyra dashboard.")
 @require_admin()
