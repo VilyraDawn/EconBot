@@ -5,15 +5,25 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v44"
+APP_VERSION = "EconBot_v46"
 
 # --- Timezone handling (Railway-safe) ---
-# Some deployments may lack zoneinfo/tzdata; do not crash at import time.
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
     CHICAGO_TZ = ZoneInfo("America/Chicago")
 except Exception:
     CHICAGO_TZ = dt.timezone(dt.timedelta(hours=-6))  # fixed UTC-6 fallback (no DST auto-adjust)
+
+# --- Spreadsheet loader (authoritative asset source) ---
+# Per Continuity: the ONLY source of truth for assets is "NEW Asset Table.xlsx"
+# We do NOT introduce env vars. We look for the file in common deploy paths.
+try:
+    import openpyxl  # available in this environment
+except Exception:
+    openpyxl = None
+
+ASSET_XLSX_FILENAME = "NEW Asset Table.xlsx"
+SEP = "|||"
 
 def _get(name, default=None):
     v = os.getenv(name)
@@ -59,8 +69,8 @@ BANK_MESSAGE_IDS = _int_list("BANK_MESSAGE_IDS")
 STAFF_ROLE_IDS = set(_int_list("STAFF_ROLE_IDS"))
 BANK_REFRESH_ROLE_IDS = set(_int_list("BANK_REFRESH_ROLE_IDS"))
 
-
 DENOMS = [("NOVIR", 10000), ("ORIN", 1000), ("ELSH", 100), ("ARCE", 10), ("CINTH", 1)]
+BASE_DAILY_INCOME_VAL = 10
 
 def format_val(total_val):
     total_val = int(total_val)
@@ -80,15 +90,176 @@ def format_val(total_val):
             rem -= c * mult
     return sign + (", ".join(parts) if parts else "0 Cinth")
 
-BASE_DAILY_INCOME_VAL = 10
-SEP = "|||"
-
 @dataclass(frozen=True)
-class AssetDef:
+class AssetRow:
     asset_type: str
     tier: str
     cost_val: int
     add_income_val: int
+
+class AssetCatalog:
+    """
+    Loads asset definitions from the authoritative spreadsheet:
+        NEW Asset Table.xlsx
+    """
+    def __init__(self):
+        self.path = None
+        self.rows = []               # list[AssetRow] in sheet order
+        self.by_type = {}            # asset_type -> list[AssetRow] in sheet order
+        self.by_type_tier = {}       # (asset_type, tier) -> AssetRow
+
+    def _find_xlsx(self):
+        # common paths: current working dir, alongside this file, /app
+        candidates = []
+        try:
+            candidates.append(os.path.join(os.getcwd(), ASSET_XLSX_FILENAME))
+        except Exception:
+            pass
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            candidates.append(os.path.join(here, ASSET_XLSX_FILENAME))
+        except Exception:
+            pass
+        candidates.append(os.path.join("/app", ASSET_XLSX_FILENAME))
+
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+        return None
+
+    def load(self):
+        self.rows = []
+        self.by_type = {}
+        self.by_type_tier = {}
+        self.path = self._find_xlsx()
+
+        if openpyxl is None:
+            print("[warn] openpyxl not available; asset dropdown will be empty.")
+            return
+
+        if not self.path:
+            print(f"[warn] Asset spreadsheet not found: {ASSET_XLSX_FILENAME} (asset dropdown will be empty)")
+            return
+
+        try:
+            wb = openpyxl.load_workbook(self.path, data_only=True)
+            ws = wb.active
+        except Exception as e:
+            print(f"[warn] Failed to load asset spreadsheet ({self.path}): {e}")
+            return
+
+        # Expect header row with these columns:
+        # Asset Type | Tier | Cost to Acquire | Add to Income
+        # We match headers case-insensitively.
+        header = []
+        for cell in ws[1]:
+            header.append(str(cell.value).strip() if cell.value is not None else "")
+
+        def idx_of(name):
+            name = name.strip().lower()
+            for i, h in enumerate(header):
+                if h.strip().lower() == name:
+                    return i
+            return None
+
+        i_type = idx_of("asset type")
+        i_tier = idx_of("tier")
+        i_cost = idx_of("cost to acquire")
+        i_add  = idx_of("add to income")
+
+        if None in (i_type, i_tier, i_cost, i_add):
+            print("[warn] Asset spreadsheet headers not recognized. Expected: Asset Type, Tier, Cost to Acquire, Add to Income")
+            print(f"[warn] Found headers: {header}")
+            return
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            asset_type = (row[i_type] if i_type is not None else "") or ""
+            tier = (row[i_tier] if i_tier is not None else "") or ""
+            cost = row[i_cost] if i_cost is not None else 0
+            add  = row[i_add]  if i_add  is not None else 0
+
+            asset_type = str(asset_type).strip()
+            tier = str(tier).strip()
+
+            if not asset_type or not tier:
+                continue
+
+            try:
+                cost_val = int(cost)
+            except Exception:
+                try:
+                    cost_val = int(float(cost))
+                except Exception:
+                    cost_val = 0
+
+            try:
+                add_income_val = int(add)
+            except Exception:
+                try:
+                    add_income_val = int(float(add))
+                except Exception:
+                    add_income_val = 0
+
+            ar = AssetRow(asset_type=asset_type, tier=tier, cost_val=cost_val, add_income_val=add_income_val)
+            self.rows.append(ar)
+            self.by_type.setdefault(asset_type, []).append(ar)
+            self.by_type_tier[(asset_type, tier)] = ar
+
+        print(f"[test] Asset catalog loaded: {len(self.rows)} row(s) from {self.path}")
+
+    def is_loaded(self):
+        return bool(self.rows)
+
+    def list_asset_types(self):
+        # Unique asset types in sheet order of first appearance.
+        seen = set()
+        out = []
+        for r in self.rows:
+            if r.asset_type in seen:
+                continue
+            seen.add(r.asset_type)
+            out.append(r.asset_type)
+        return out
+
+    def list_tiers_for_type(self, asset_type):
+        tiers = self.by_type.get(asset_type) or []
+        return [r.tier for r in tiers]
+
+    def autocomplete_choices(self, current, limit=25):
+        q = (current or "").strip().lower()
+        out = []
+        if not self.rows:
+            return []
+        # Provide "Asset Type — Tier" choices in sheet order.
+        for ar in self.rows:
+            label = f"{ar.asset_type} — {ar.tier}"
+            if q and q not in label.lower():
+                continue
+            value = f"{ar.asset_type}{SEP}{ar.tier}"
+            out.append(app_commands.Choice(name=label[:100], value=value[:100]))
+            if len(out) >= limit:
+                break
+        return out
+
+    def get_chain_cost(self, asset_type, tier):
+        # Purchase rule: selecting Tier N costs sum of all tiers up to that tier, in sheet order for that asset_type.
+        tiers = self.by_type.get(asset_type) or []
+        if not tiers:
+            return None
+        idx = None
+        for i, ar in enumerate(tiers):
+            if ar.tier == tier:
+                idx = i
+                break
+        if idx is None:
+            return None
+        return sum(int(ar.cost_val) for ar in tiers[:idx+1])
+
+    def get_add_income(self, asset_type, tier):
+        ar = self.by_type_tier.get((asset_type, tier))
+        return int(ar.add_income_val) if ar else 0
+
+assets = AssetCatalog()
 
 class DB:
     def __init__(self, dsn):
@@ -129,6 +300,7 @@ class DB:
               updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
 
+            # Runtime migration checks (existing v38 behavior)
             cols = await con.fetch("""
                 SELECT column_name FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='econ_assets';
@@ -140,6 +312,7 @@ class DB:
                 await con.execute("ALTER TABLE econ_assets ADD COLUMN user_id BIGINT;")
             await con.execute("UPDATE econ_assets SET asset_name = COALESCE(asset_name,'') WHERE asset_name IS NULL;")
             await con.execute("UPDATE econ_assets SET user_id = COALESCE(user_id,0) WHERE user_id IS NULL;")
+
             exists = await con.fetchval("SELECT 1 FROM pg_constraint WHERE conname='econ_assets_unique_assetname' LIMIT 1;")
             if not exists:
                 try:
@@ -151,14 +324,6 @@ class DB:
                 except Exception:
                     pass
 
-            await con.execute("""
-            CREATE TABLE IF NOT EXISTS econ_asset_definitions (
-              asset_type TEXT NOT NULL,
-              tier TEXT NOT NULL,
-              cost_val BIGINT NOT NULL,
-              add_income_val BIGINT NOT NULL,
-              PRIMARY KEY (asset_type, tier)
-            );""")
             await con.execute("""
             CREATE TABLE IF NOT EXISTS econ_audit_log (
               id BIGSERIAL PRIMARY KEY,
@@ -178,6 +343,7 @@ class DB:
             )
 
     async def search_characters(self, legacy_guild_id, query, limit=25):
+        # Character dropdown must pull from Postgres table: characters
         assert self.pool is not None
         like = f"%{(query or '').strip().lower()}%"
         async with self.pool.acquire() as con:
@@ -236,23 +402,6 @@ class DB:
                 VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW());
             """, int(guild_id), str(character_name), int(owner_user_id), str(asset_name), str(asset_type), str(tier))
 
-    async def list_asset_defs(self):
-        assert self.pool is not None
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("SELECT asset_type, tier, cost_val, add_income_val FROM econ_asset_definitions ORDER BY asset_type, tier;")
-        return [AssetDef(r["asset_type"], r["tier"], int(r["cost_val"]), int(r["add_income_val"])) for r in rows]
-
-    async def get_asset_def(self, asset_type, tier):
-        assert self.pool is not None
-        async with self.pool.acquire() as con:
-            row = await con.fetchrow(
-                "SELECT asset_type, tier, cost_val, add_income_val FROM econ_asset_definitions WHERE asset_type=$1 AND tier=$2;",
-                str(asset_type), str(tier)
-            )
-        if not row:
-            return None
-        return AssetDef(row["asset_type"], row["tier"], int(row["cost_val"]), int(row["add_income_val"]))
-
 db = DB(DATABASE_URL)
 
 def is_staff(member):
@@ -288,33 +437,62 @@ async def character_autocomplete(interaction, current):
     except Exception:
         return []
 
-async def asset_tier_autocomplete(interaction, current):
+async def asset_type_autocomplete(interaction, current):
     try:
-        defs = await db.list_asset_defs()
-        if not defs:
-            # Helpful placeholder so users can see why the dropdown is empty.
-            return [app_commands.Choice(name="(No asset definitions loaded)", value="__NONE__")]
-        q = (current or "").lower().strip()
+        if not assets.is_loaded():
+            return [app_commands.Choice(name="(Asset sheet missing: NEW Asset Table.xlsx)", value="__MISSING__")]
+        q = (current or "").strip().lower()
         out = []
-        for a in defs:
-            label = f"{a.asset_type} — {a.tier}"
-            if q and q not in label.lower():
+        for at in assets.list_asset_types():
+            if q and q not in at.lower():
                 continue
-            out.append(app_commands.Choice(name=label[:100], value=f"{a.asset_type}{SEP}{a.tier}"[:100]))
+            out.append(app_commands.Choice(name=at[:100], value=at[:100]))
             if len(out) >= 25:
                 break
         return out
     except Exception:
         return []
 
+async def tier_autocomplete(interaction, current):
+    try:
+        if not assets.is_loaded():
+            return [app_commands.Choice(name="(Asset sheet missing: NEW Asset Table.xlsx)", value="__MISSING__")]
+
+        # Read the selected asset_type from the interaction namespace (Discord supplies filled options here).
+        selected_type = None
+        try:
+            ns = getattr(interaction, "namespace", None)
+            selected_type = getattr(ns, "asset_type", None) if ns else None
+        except Exception:
+            selected_type = None
+
+        if not selected_type or str(selected_type).strip() in ("__MISSING__", ""):
+            return [app_commands.Choice(name="(Select an Asset Type first)", value="__SELECT_TYPE__")]
+
+        selected_type = str(selected_type).strip()
+        q = (current or "").strip().lower()
+        out = []
+        for tr in assets.list_tiers_for_type(selected_type):
+            if q and q not in tr.lower():
+                continue
+            out.append(app_commands.Choice(name=tr[:100], value=tr[:100]))
+            if len(out) >= 25:
+                break
+        if not out:
+            return [app_commands.Choice(name="(No tiers found for that type)", value="__NO_TIERS__")]
+        return out
+    except Exception:
+        return []
+
 async def build_balance_embed(guild, character):
     bal = await db.get_balance(guild.id, character)
-    assets = await db.get_assets(guild.id, character)
+    assets_owned = await db.get_assets(guild.id, character)
     lines = []
-    for a in assets:
+    for a in assets_owned:
         nm = (a.get("asset_name") or "").strip() or "Unnamed"
         tier = (a.get("tier") or "").strip()
-        lines.append(f"{nm} - {tier}")
+        at = (a.get("asset_type") or "").strip()
+        lines.append(f"{tier} — {nm}")
     e = discord.Embed(title=str(character), description=f"**Balance:** {format_val(bal)} *(= {bal} Val)*", color=discord.Color.teal())
     e.set_footer(text="Bank of Vilyra")
     e.add_field(name="__*Assets*__", value=("\n".join(lines)[:1024] if lines else "None"), inline=False)
@@ -375,15 +553,14 @@ def chicago_today():
     return dt.datetime.now(tz=CHICAGO_TZ).date()
 
 async def calc_asset_income(guild_id, character):
-    assets = await db.get_assets(guild_id, character)
+    owned = await db.get_assets(guild_id, character)
     total = 0
-    for a in assets:
-        ad = await db.get_asset_def(a.get("asset_type",""), a.get("tier",""))
-        if ad:
-            total += int(ad.add_income_val)
-    return total
+    # Income adds are pulled from the asset spreadsheet (authoritative).
+    for a in owned:
+        total += assets.get_add_income(str(a.get("asset_type") or ""), str(a.get("tier") or ""))
+    return int(total)
 
-# --- Commands (guild-scoped when possible) ---
+# --- Commands ---
 
 @tree.command(name="balance", description="Show a character’s current money and owned assets.")
 @app_commands.describe(character="Pick a character")
@@ -491,9 +668,9 @@ async def cmd_econ_set_balance(interaction, character: str, new_balance_val: int
         pass
 
 @tree.command(name="purchase_new", description="Staff-only. Purchase a new asset for a character (tiered cost sum).")
-@app_commands.describe(character="Pick a character", asset="Pick an Asset Type — Tier", asset_name="Name this asset (unique per character)")
-@app_commands.autocomplete(character=character_autocomplete, asset=asset_tier_autocomplete)
-async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: str):
+@app_commands.describe(character="Pick a character", asset_type="Pick an Asset Type", tier="Pick a Tier (depends on Asset Type)", asset_name="Name this asset (unique per character)")
+@app_commands.autocomplete(character=character_autocomplete, asset_type=asset_type_autocomplete, tier=tier_autocomplete)
+async def cmd_purchase_new(interaction, character: str, asset_type: str, tier: str, asset_name: str):
     await interaction.response.defer(ephemeral=True)
     g = interaction.guild
     if not g:
@@ -502,44 +679,33 @@ async def cmd_purchase_new(interaction, character: str, asset: str, asset_name: 
     if not is_staff(mem):
         return await interaction.followup.send("You do not have permission.", ephemeral=True)
 
+    if asset_type in ("__MISSING__", "") or tier in ("__MISSING__", ""):
+        return await interaction.followup.send(
+            f"Asset sheet not found. Place **{ASSET_XLSX_FILENAME}** in the bot directory (Railway /app) and redeploy.",
+            ephemeral=True
+        )
+
+    if asset_type in ("__SELECT_TYPE__", "__NO_TIERS__") or tier in ("__SELECT_TYPE__", "__NO_TIERS__", "__SELECT_TYPE__"):
+        return await interaction.followup.send("Select a valid Asset Type and Tier.", ephemeral=True)
+
     asset_name = (asset_name or "").strip()
     if not asset_name:
         return await interaction.followup.send("Asset name is required.", ephemeral=True)
-    if asset == "__NONE__":
-        return await interaction.followup.send("No asset definitions are loaded yet, so there is nothing to select. Load econ_asset_definitions first.", ephemeral=True)
-    if SEP not in asset:
-        return await interaction.followup.send("Invalid asset selection.", ephemeral=True)
-    asset_type, tier = [x.strip() for x in asset.split(SEP, 1)]
-
     owner_user_id = await db.get_character_owner(LEGACY_SOURCE_GUILD_ID, character)
     if owner_user_id is None:
-        return await interaction.followup.send("Character not found in legacy table.", ephemeral=True)
+        return await interaction.followup.send("Character not found in characters table.", ephemeral=True)
 
     existing = await db.get_assets(g.id, character)
     for a in existing:
         if int(a.get("user_id") or 0) == int(owner_user_id) and (a.get("asset_name") or "").strip().lower() == asset_name.lower():
             return await interaction.followup.send("That asset name already exists for this character. Use a unique name.", ephemeral=True)
 
-    defs = [d for d in await db.list_asset_defs() if d.asset_type == asset_type]
-    if not defs:
-        return await interaction.followup.send("No asset definitions found for that Asset Type. (Definitions must be loaded into DB.)", ephemeral=True)
-
-    def tier_key(t):
-        t = (t or "").strip()
-        if t.startswith("("):
-            try:
-                n = int(t.split(")",1)[0].replace("(","").strip())
-                return (n, t)
-            except Exception:
-                pass
-        return (10**9, t)
-
-    defs_sorted = sorted(defs, key=lambda d: tier_key(d.tier))
-    tiers = [d.tier for d in defs_sorted]
-    if tier not in tiers:
-        return await interaction.followup.send("That Tier was not found for the selected Asset Type.", ephemeral=True)
-    idx = tiers.index(tier)
-    total_cost = sum(int(d.cost_val) for d in defs_sorted[:idx+1])
+    total_cost = assets.get_chain_cost(asset_type, tier)
+    if total_cost is None:
+        return await interaction.followup.send(
+            "That Asset Type/Tier is not recognized from the asset spreadsheet. (Did the sheet change?)",
+            ephemeral=True
+        )
 
     bal = await db.get_balance(g.id, character)
     if bal < total_cost:
@@ -590,7 +756,7 @@ async def cmd_econ_commands(interaction):
         "**Staff Commands**\n"
         "/econ_adjust — Add or subtract money from a character (never allows negative balances).\n"
         "/econ_set_balance — Set a character’s balance to an exact Val amount (non-negative).\n"
-        "/purchase_new — Purchase a new asset for a character. Select an Asset Type — Tier and provide a unique asset name. Cost is the sum of all tiers up to the target tier.\n"
+        "/purchase_new — Purchase a new asset for a character. Select an Asset Type — Tier from the spreadsheet, then provide a unique asset name.\n"
         "/econ_refresh_bank — Force-refresh the Bank of Vilyra dashboard messages.\n"
         "/econ_commands — Show this command list.\n"
     )
@@ -601,6 +767,9 @@ async def on_ready():
     print(f"[test] Starting {APP_VERSION}…")
     await db.init()
 
+    # Load asset spreadsheet once at startup (authoritative).
+    assets.load()
+
     if not GUILD_ID:
         print("[warn] GUILD_ID env var is missing; slash commands may register globally and appear slowly.")
         try:
@@ -610,15 +779,16 @@ async def on_ready():
         print(f"[test] Logged in as {client.user} (commands guild: GLOBAL; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
         return
 
-    # Guild-only sync (no global sync). NOTE: Do NOT call tree.clear_commands(guild=...)
-    # because it clears *local* command registrations for that guild and can result in syncing ZERO commands,
-    # which in turn causes 'CommandNotFound' at runtime.
+    # IMPORTANT: Our commands are defined as GLOBAL in-code, but we ONLY sync them to the guild.
+    # To do that reliably, we must copy the global command definitions into the guild command list first.
     guild_obj = discord.Object(id=int(GUILD_ID))
     try:
+        tree.copy_global_to(guild=guild_obj)
         synced = await tree.sync(guild=guild_obj)
         print(f"[test] Synced {len(synced)} guild command(s).")
     except Exception as e:
         print(f"[warn] Guild sync failed: {e}")
+
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
 
     try:
