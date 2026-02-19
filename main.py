@@ -1,249 +1,170 @@
-import os
-import json
-import asyncio
 import datetime as dt
+import os
+import re
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
-
-import discord
-from discord import app_commands
+from typing import Dict, List, Optional, Tuple
 
 import asyncpg
+import discord
+from discord import app_commands
+from zoneinfo import ZoneInfo
 
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # type: ignore
-
-
-# -------------------------
-# Version / Config
-# -------------------------
-VERSION = "EconBot_v36"
-
-TZ_NAME = "America/Chicago"
-TZ = ZoneInfo(TZ_NAME) if ZoneInfo else dt.timezone.utc
-
-BASE_DAILY_INCOME_VAL = 10  # 10 Cinths == 10 Val == 1 Arce
-
-# Denominations (in Val)
-DENOMS: List[Tuple[str, int]] = [
-    ("NOVIR", 10_000),
-    ("ORIN", 1_000),
-    ("ELSH", 100),
-    ("ARCE", 10),
-    ("CINTH", 1),
-]
+CHICAGO_TZ = ZoneInfo("America/Chicago")
 
 
-def _get(name: str, default: str | None = None) -> str | None:
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
     if v is None:
         return default
-    v = str(v).strip()
+    v = v.strip()
     return v if v else default
 
 
-def _req_token() -> str:
-    v = _get("DISCORD_TOKEN")
-    if not v:
-        raise RuntimeError("Missing required env var: DISCORD_TOKEN")
-    return v
-
-
-def _parse_int(v: str | None) -> int | None:
-    try:
-        return int(v) if v is not None and str(v).strip() != "" else None
-    except Exception:
-        return None
-
-
-def _parse_int_list(v: str | None) -> list[int]:
-    if not v:
+def _parse_int_list(csv: Optional[str]) -> List[int]:
+    if not csv:
         return []
-    out: list[int] = []
-    for part in v.split(","):
+    out: List[int] = []
+    for part in csv.split(","):
         part = part.strip()
         if part.isdigit():
             out.append(int(part))
     return out
 
 
-def _parse_int_set(v: str | None) -> set[int]:
-    return set(_parse_int_list(v))
+DISCORD_TOKEN = _env("DISCORD_TOKEN") or _env("BOT_TOKEN")  # allow either name
+DATABASE_URL = _env("DATABASE_URL")
 
+# Commands run in this guild (recommended). If omitted, commands are global and may take longer to appear.
+COMMANDS_GUILD_ID = int(_env("COMMANDS_GUILD_ID", "") or 0) or None
 
-DISCORD_TOKEN = _req_token()
-DATABASE_URL = _get("DATABASE_URL")
+# Where to read characters from (Legacy bot database). This is the guild_id stored in the legacy `characters` table.
+LEGACY_SOURCE_GUILD_ID = int(_env("LEGACY_SOURCE_GUILD_ID", "") or 0) or None
 
-GUILD_ID = _parse_int(_get("GUILD_ID"))
-LEGACY_SOURCE_GUILD_ID = _parse_int(_get("LEGACY_SOURCE_GUILD_ID")) or GUILD_ID
+BANK_CHANNEL_ID = int(_env("BANK_CHANNEL_ID", "") or 0) or None
+ECON_LOG_CHANNEL_ID = int(_env("ECON_LOG_CHANNEL_ID", "") or 0) or None
 
-BANK_CHANNEL_ID = _parse_int(_get("BANK_CHANNEL_ID"))
-ECON_LOG_CHANNEL_ID = _parse_int(_get("ECON_LOG_CHANNEL_ID"))
+# Staff role IDs are a comma-separated env var.
+STAFF_ROLE_IDS = set(_parse_int_list(_env("STAFF_ROLE_IDS", "")))
 
-BANK_MESSAGE_IDS = _parse_int_list(_get("BANK_MESSAGE_IDS"))
+# Base daily income (10 Val == 10 Cinth == 1 Arce)
+BASE_DAILY_INCOME_VAL = 10
 
-STAFF_ROLE_IDS = _parse_int_set(
-    _get("STAFF_ROLE_IDS")
-    or _get("Staff_Role_IDs")
-    or _get("STAFF_ROLE_IDs")
-    or _get("STAFF_ROLE_IDS")
-)
+if not DISCORD_TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN (or BOT_TOKEN) env var")
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL env var")
+if not LEGACY_SOURCE_GUILD_ID:
+    raise RuntimeError("Missing LEGACY_SOURCE_GUILD_ID env var")
+if not BANK_CHANNEL_ID:
+    raise RuntimeError("Missing BANK_CHANNEL_ID env var")
+if not ECON_LOG_CHANNEL_ID:
+    raise RuntimeError("Missing ECON_LOG_CHANNEL_ID env var")
+
+GUILD_OBJ = discord.Object(id=COMMANDS_GUILD_ID) if COMMANDS_GUILD_ID else None
 
 
 # -------------------------
-# Asset Catalog (embedded from NEW Asset Table.xlsx)
+# Currency helpers
 # -------------------------
-ASSET_CATALOG = [
-    {'asset_type': 'Guild Trade Workshop', 'tier_name': '(1) Guild Apprentice', 'tier_num': 1, 'cost_val': 300, 'income_val': 50, 'secondary_type': ''},
-    {'asset_type': 'Guild Trade Workshop', 'tier_name': '(2) Guild Journeyman', 'tier_num': 2, 'cost_val': 600, 'income_val': 100, 'secondary_type': ''},
-    {'asset_type': 'Guild Trade Workshop', 'tier_name': '(3) Leased Workshop', 'tier_num': 3, 'cost_val': 1200, 'income_val': 150, 'secondary_type': ''},
-    {'asset_type': 'Guild Trade Workshop', 'tier_name': '(4) Small Workshop', 'tier_num': 4, 'cost_val': 2000, 'income_val': 200, 'secondary_type': ''},
-    {'asset_type': 'Guild Trade Workshop', 'tier_name': '(5) Large Workshop', 'tier_num': 5, 'cost_val': 3000, 'income_val': 250, 'secondary_type': ''},
-    {'asset_type': 'Market Stall', 'tier_name': '(1) Consignment Arrangement', 'tier_num': 1, 'cost_val': 300, 'income_val': 50, 'secondary_type': ''},
-    {'asset_type': 'Market Stall', 'tier_name': '(2) Small Alley Stand', 'tier_num': 2, 'cost_val': 600, 'income_val': 100, 'secondary_type': ''},
-    {'asset_type': 'Market Stall', 'tier_name': '(3) Market Stall', 'tier_num': 3, 'cost_val': 1200, 'income_val': 150, 'secondary_type': ''},
-    {'asset_type': 'Market Stall', 'tier_name': '(4) Small Shop', 'tier_num': 4, 'cost_val': 2000, 'income_val': 200, 'secondary_type': ''},
-    {'asset_type': 'Market Stall', 'tier_name': '(5) Large Shop', 'tier_num': 5, 'cost_val': 3000, 'income_val': 250, 'secondary_type': ''},
-    {'asset_type': 'Farm/Ranch', 'tier_name': '(1) Subsistence Surplus', 'tier_num': 1, 'cost_val': 300, 'income_val': 50, 'secondary_type': ''},
-    {'asset_type': 'Farm/Ranch', 'tier_name': '(2) Leased Fields', 'tier_num': 2, 'cost_val': 600, 'income_val': 100, 'secondary_type': ''},
-    {'asset_type': 'Farm/Ranch', 'tier_name': '(3) Owned Acre', 'tier_num': 3, 'cost_val': 1200, 'income_val': 150, 'secondary_type': ''},
-    {'asset_type': 'Farm/Ranch', 'tier_name': '(4) Small Fields and Barn', 'tier_num': 4, 'cost_val': 2000, 'income_val': 200, 'secondary_type': ''},
-    {'asset_type': 'Farm/Ranch', 'tier_name': '(5) Large Fields and Barn', 'tier_num': 5, 'cost_val': 3000, 'income_val': 250, 'secondary_type': ''},
-    {'asset_type': 'Tavern/Inn', 'tier_name': '(1) One-Room Flophouse', 'tier_num': 1, 'cost_val': 300, 'income_val': 50, 'secondary_type': ''},
-    {'asset_type': 'Tavern/Inn', 'tier_name': '(2) Leased Establishment', 'tier_num': 2, 'cost_val': 600, 'income_val': 100, 'secondary_type': ''},
-    {'asset_type': 'Tavern/Inn', 'tier_name': '(3) Small Tavern', 'tier_num': 3, 'cost_val': 1200, 'income_val': 150, 'secondary_type': ''},
-    {'asset_type': 'Tavern/Inn', 'tier_name': '(4) Large Tavern', 'tier_num': 4, 'cost_val': 2000, 'income_val': 200, 'secondary_type': ''},
-    {'asset_type': 'Tavern/Inn', 'tier_name': '(5) Large Tavern and Inn', 'tier_num': 5, 'cost_val': 3000, 'income_val': 250, 'secondary_type': ''},
-    {'asset_type': 'Warehouse/Trade House', 'tier_name': '(1) Small Storage Shed', 'tier_num': 1, 'cost_val': 300, 'income_val': 50, 'secondary_type': ''},
-    {'asset_type': 'Warehouse/Trade House', 'tier_name': '(2) Large Storage Shed', 'tier_num': 2, 'cost_val': 600, 'income_val': 100, 'secondary_type': ''},
-    {'asset_type': 'Warehouse/Trade House', 'tier_name': '(3) Small Trading Post', 'tier_num': 3, 'cost_val': 1200, 'income_val': 150, 'secondary_type': ''},
-    {'asset_type': 'Warehouse/Trade House', 'tier_name': '(4) Large Trading Post', 'tier_num': 4, 'cost_val': 2000, 'income_val': 200, 'secondary_type': ''},
-    {'asset_type': 'Warehouse/Trade House', 'tier_name': '(5) Large Warehouse and Trading Post', 'tier_num': 5, 'cost_val': 3000, 'income_val': 250, 'secondary_type': ''},
-    {'asset_type': 'House', 'tier_name': '(1) Shack', 'tier_num': 1, 'cost_val': 600, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'House', 'tier_name': '(2) Hut', 'tier_num': 2, 'cost_val': 1200, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'House', 'tier_name': '(3) House', 'tier_num': 3, 'cost_val': 2000, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'House', 'tier_name': '(4) Lodge', 'tier_num': 4, 'cost_val': 3000, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'House', 'tier_name': '(5) Mansion', 'tier_num': 5, 'cost_val': 5000, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Village', 'tier_name': '(1) Chartered Assembly', 'tier_num': 1, 'cost_val': 1200, 'income_val': 100, 'secondary_type': ''},
-    {'asset_type': 'Village', 'tier_name': '(2) Hamlet', 'tier_num': 2, 'cost_val': 2400, 'income_val': 200, 'secondary_type': ''},
-    {'asset_type': 'Village', 'tier_name': '(3) Village', 'tier_num': 3, 'cost_val': 4800, 'income_val': 300, 'secondary_type': ''},
-    {'asset_type': 'Village', 'tier_name': '(4) Town', 'tier_num': 4, 'cost_val': 9600, 'income_val': 400, 'secondary_type': ''},
-    {'asset_type': 'Village', 'tier_name': '(5) Small City', 'tier_num': 5, 'cost_val': 15000, 'income_val': 500, 'secondary_type': ''},
-    {'asset_type': 'Weapons', 'tier_name': '(1) Hit +1 / Dmg +1d4', 'tier_num': 1, 'cost_val': 300, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Weapons', 'tier_name': '(2) Hit +1 / Dmg +1d6', 'tier_num': 2, 'cost_val': 600, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Weapons', 'tier_name': '(3) Hit +2 / Dmg +1d8', 'tier_num': 3, 'cost_val': 1200, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Weapons', 'tier_name': '(4) Hit +2 / Dmg +1d10', 'tier_num': 4, 'cost_val': 2400, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Weapons', 'tier_name': '(5) Hit +2 / Dmg +1d12', 'tier_num': 5, 'cost_val': 4800, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Armor', 'tier_name': '(1) AC +1', 'tier_num': 1, 'cost_val': 300, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Armor', 'tier_name': '(2) AC +2', 'tier_num': 2, 'cost_val': 600, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Armor', 'tier_name': '(3) AC +2 / Adv Magic Atk', 'tier_num': 3, 'cost_val': 1200, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Armor', 'tier_name': '(4) AC +2 / Adv Magic and Melee Atk', 'tier_num': 4, 'cost_val': 2400, 'income_val': 0, 'secondary_type': ''},
-    {'asset_type': 'Armor', 'tier_name': '(5) AC +3 / Adv Magic and Melee Atk', 'tier_num': 5, 'cost_val': 4800, 'income_val': 0, 'secondary_type': ''},
+
+DENOMS: List[Tuple[str, int]] = [
+    ("Novir", 10_000),
+    ("Orin", 1_000),
+    ("Elsh", 100),
+    ("Arce", 10),
+    ("Cinth", 1),
 ]
 
 
-def _catalog_key(a: Dict[str, object]) -> Tuple[str, str, str]:
-    return (str(a["asset_type"]), str(a["secondary_type"]), str(a["tier_name"]))
-
-
-CATALOG_BY_KEY: Dict[Tuple[str, str, str], Dict[str, object]] = { _catalog_key(a): a for a in ASSET_CATALOG }
-
-
-# -------------------------
-# DB
-# -------------------------
-_pool: asyncpg.Pool | None = None
-
-
-async def db_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is not set; database features are disabled.")
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    return _pool
-
-
-async def init_db() -> None:
-    if not DATABASE_URL:
-        print(f"[{VERSION}] DATABASE_URL missing; running without DB.")
-        return
-
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        await con.execute("CREATE SCHEMA IF NOT EXISTS economy")
-
-        # Balances (stored in Val)
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.balances (
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                balance_val BIGINT NOT NULL DEFAULT 0,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, character_name)
-            )
-            """
-        )
-
-        # Income claims (daily, per character)
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.income_claims (
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                claim_date DATE NOT NULL,
-                claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, character_name, claim_date)
-            )
-            """
-        )
-
-        # Owned assets (named by player; upgrades replace tier fields but keep asset_name)
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.assets_owned (
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                character_user_id BIGINT NOT NULL,
-                asset_name TEXT NOT NULL,
-                asset_type TEXT NOT NULL,
-                secondary_type TEXT NOT NULL,
-                tier_name TEXT NOT NULL,
-                tier INTEGER NOT NULL,
-                cost_val BIGINT NOT NULL,
-                income_val BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (guild_id, character_name, character_user_id, asset_name)
-            )
-            """
-        )
-
-        # Action log
-        await con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS economy.ledger (
-                id BIGSERIAL PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                guild_id BIGINT NOT NULL,
-                character_name TEXT NOT NULL,
-                character_user_id BIGINT NOT NULL,
-                actor_user_id BIGINT NOT NULL,
-                kind TEXT NOT NULL,
-                delta_val BIGINT NOT NULL,
-                reason TEXT NOT NULL,
-                details_json TEXT NOT NULL
-            )
-            """
-        )
+def format_val(val: int) -> str:
+    val = int(val)
+    if val < 0:
+        return f"-{format_val(abs(val))}"
+    if val == 0:
+        return "0 Cinth"
+    parts: List[str] = []
+    remaining = val
+    for name, size in DENOMS:
+        if remaining >= size:
+            qty, remaining = divmod(remaining, size)
+            parts.append(f"{qty} {name}")
+    if remaining > 0:
+        parts.append(f"{remaining} Cinth")
+    return ", ".join(parts)
 
 
 # -------------------------
-# Legacy characters table helpers
+# Asset definitions (from NEW Asset Table.xlsx)
+# Only these rows exist. Do not add others without updating the sheet.
 # -------------------------
+
+ASSET_DEFS: List[Dict[str, object]] = [{"asset_type": "Guild Trade Workshop", "tier": "(1) Guild Apprentice", "cost_val": 300, "income_val": 50}, {"asset_type": "Guild Trade Workshop", "tier": "(2) Guild Journeyman", "cost_val": 600, "income_val": 100}, {"asset_type": "Guild Trade Workshop", "tier": "(3) Leased Workshop", "cost_val": 1200, "income_val": 150}, {"asset_type": "Guild Trade Workshop", "tier": "(4) Small Workshop", "cost_val": 2000, "income_val": 200}, {"asset_type": "Guild Trade Workshop", "tier": "(5) Large Workshop", "cost_val": 3000, "income_val": 250}, {"asset_type": "Market Stall", "tier": "(1) Consignment Arrangement", "cost_val": 300, "income_val": 50}, {"asset_type": "Market Stall", "tier": "(2) Small Alley Stand", "cost_val": 600, "income_val": 100}, {"asset_type": "Market Stall", "tier": "(3) Market Stall", "cost_val": 1200, "income_val": 150}, {"asset_type": "Market Stall", "tier": "(4) Small Shop", "cost_val": 2000, "income_val": 200}, {"asset_type": "Market Stall", "tier": "(5) Large Shop", "cost_val": 3000, "income_val": 250}, {"asset_type": "Farm/Ranch", "tier": "(1) Subsistence Surplus", "cost_val": 300, "income_val": 50}, {"asset_type": "Farm/Ranch", "tier": "(2) Leased Fields", "cost_val": 600, "income_val": 100}, {"asset_type": "Farm/Ranch", "tier": "(3) Owned Acre", "cost_val": 1200, "income_val": 150}, {"asset_type": "Farm/Ranch", "tier": "(4) Small Fields and Barn", "cost_val": 2000, "income_val": 200}, {"asset_type": "Farm/Ranch", "tier": "(5) Large Fields and Barn", "cost_val": 3000, "income_val": 250}, {"asset_type": "Tavern/Inn", "tier": "(1) One-Room Flophouse", "cost_val": 300, "income_val": 50}, {"asset_type": "Tavern/Inn", "tier": "(2) Leased Establishment", "cost_val": 600, "income_val": 100}, {"asset_type": "Tavern/Inn", "tier": "(3) Small Tavern", "cost_val": 1200, "income_val": 150}, {"asset_type": "Tavern/Inn", "tier": "(4) Large Tavern", "cost_val": 2000, "income_val": 200}, {"asset_type": "Tavern/Inn", "tier": "(5) Large Tavern and Inn", "cost_val": 3000, "income_val": 250}, {"asset_type": "Warehouse/Trade House", "tier": "(1) Small Storage Shed", "cost_val": 300, "income_val": 50}, {"asset_type": "Warehouse/Trade House", "tier": "(2) Large Storage Shed", "cost_val": 600, "income_val": 100}, {"asset_type": "Warehouse/Trade House", "tier": "(3) Small Trading Post", "cost_val": 1200, "income_val": 150}, {"asset_type": "Warehouse/Trade House", "tier": "(4) Large Trading Post", "cost_val": 2000, "income_val": 200}, {"asset_type": "Warehouse/Trade House", "tier": "(5) Large Warehouse and Trading Post", "cost_val": 3000, "income_val": 250}, {"asset_type": "House", "tier": "(1) Shack", "cost_val": 600, "income_val": 0}, {"asset_type": "House", "tier": "(2) Hut", "cost_val": 1200, "income_val": 0}, {"asset_type": "House", "tier": "(3) House", "cost_val": 2000, "income_val": 0}, {"asset_type": "House", "tier": "(4) Lodge", "cost_val": 3000, "income_val": 0}, {"asset_type": "House", "tier": "(5) Mansion", "cost_val": 5000, "income_val": 0}, {"asset_type": "Village", "tier": "(1) Chartered Assembly", "cost_val": 1200, "income_val": 100}, {"asset_type": "Village", "tier": "(2) Hamlet", "cost_val": 2400, "income_val": 200}, {"asset_type": "Village", "tier": "(3) Village", "cost_val": 4800, "income_val": 300}, {"asset_type": "Village", "tier": "(4) Town", "cost_val": 9600, "income_val": 400}, {"asset_type": "Village", "tier": "(5) Small City", "cost_val": 15000, "income_val": 500}, {"asset_type": "Weapons", "tier": "(1) Hit +1 / Dmg +1d4", "cost_val": 300, "income_val": 0}, {"asset_type": "Weapons", "tier": "(2) Hit +1 / Dmg +1d6", "cost_val": 600, "income_val": 0}, {"asset_type": "Weapons", "tier": "(3) Hit +2 / Dmg +1d8", "cost_val": 1200, "income_val": 0}, {"asset_type": "Weapons", "tier": "(4) Hit +2 / Dmg +1d10", "cost_val": 2400, "income_val": 0}, {"asset_type": "Weapons", "tier": "(5) Hit +2 / Dmg +1d12", "cost_val": 4800, "income_val": 0}, {"asset_type": "Armor", "tier": "(1) AC +1", "cost_val": 300, "income_val": 0}, {"asset_type": "Armor", "tier": "(2) AC +2", "cost_val": 600, "income_val": 0}, {"asset_type": "Armor", "tier": "(3) AC +2 / Adv Magic Atk", "cost_val": 1200, "income_val": 0}, {"asset_type": "Armor", "tier": "(4) AC +2 / Adv Magic and Melee Atk", "cost_val": 2400, "income_val": 0}, {"asset_type": "Armor", "tier": "(5) AC +3 / Adv Magic and Melee Atk", "cost_val": 4800, "income_val": 0}]
+
+_TIER_NUM_RE = re.compile(r"^\((\d+)\)\s*")
+
+
+def tier_number(tier_name: str) -> int:
+    m = _TIER_NUM_RE.match(tier_name.strip())
+    if not m:
+        return 10_000
+    return int(m.group(1))
+
+
+_ASSET_TYPE_TO_TIERS: Dict[str, List[Dict[str, object]]] = {}
+_ASSET_KEY_TO_DEF: Dict[Tuple[str, str], Dict[str, object]] = {}
+
+for row in ASSET_DEFS:
+    at = str(row["asset_type"]).strip()
+    tn = str(row["tier"]).strip()
+    _ASSET_KEY_TO_DEF[(at, tn)] = row
+    _ASSET_TYPE_TO_TIERS.setdefault(at, []).append(row)
+
+for at, rows in _ASSET_TYPE_TO_TIERS.items():
+    rows.sort(key=lambda r: tier_number(str(r["tier"])))
+
+
+def asset_display(asset_type: str, tier: str) -> str:
+    return f"{asset_type} — {tier}"
+
+
+def all_asset_display_strings() -> List[str]:
+    out: List[str] = []
+    for at, rows in sorted(_ASSET_TYPE_TO_TIERS.items(), key=lambda x: x[0].lower()):
+        for r in rows:
+            out.append(asset_display(at, str(r["tier"])))
+    return out
+
+
+def parse_asset_display(s: str) -> Optional[Tuple[str, str]]:
+    if "—" in s:
+        parts = [p.strip() for p in s.split("—", 1)]
+    elif "-" in s:
+        parts = [p.strip() for p in s.split("-", 1)]
+    else:
+        return None
+    if len(parts) != 2:
+        return None
+    asset_type, tier = parts[0], parts[1]
+    if (asset_type, tier) in _ASSET_KEY_TO_DEF:
+        return (asset_type, tier)
+    return None
+
+
+def total_cost_for_new_purchase(asset_type: str, target_tier: str) -> int:
+    rows = _ASSET_TYPE_TO_TIERS.get(asset_type, [])
+    tgt_n = tier_number(target_tier)
+    total = 0
+    for r in rows:
+        n = tier_number(str(r["tier"]))
+        if n <= tgt_n:
+            total += int(r["cost_val"])
+    return total
+
+
+# -------------------------
+# Database
+# -------------------------
+
 @dataclass
 class Character:
     guild_id: int
@@ -252,863 +173,664 @@ class Character:
     archived: bool
 
 
-async def fetch_character_by_name(legacy_guild_id: int, name: str) -> Character | None:
-    """Legacy source: public.characters. Character ID is name (unique per guild)."""
-    if not DATABASE_URL:
-        return None
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        row = await con.fetchrow(
-            """
-            SELECT guild_id, user_id, name, archived
-            FROM characters
-            WHERE guild_id=$1 AND name=$2
-            LIMIT 1
-            """,
-            int(legacy_guild_id),
-            str(name),
-        )
-        if not row:
-            return None
-        return Character(
-            guild_id=int(row["guild_id"]),
-            user_id=int(row["user_id"]),
-            name=str(row["name"]),
-            archived=bool(row["archived"]),
-        )
+class DB:
+    def __init__(self, dsn: str):
+        self._dsn = dsn
+        self.pool: Optional[asyncpg.Pool] = None
 
-
-async def search_characters(legacy_guild_id: int, query: str, limit: int = 25) -> List[str]:
-    if not DATABASE_URL:
-        return []
-    q = (query or "").strip()
-    if not q:
-        q = ""
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
-            SELECT name
-            FROM characters
-            WHERE guild_id=$1
-              AND archived=FALSE
-              AND name ILIKE $2
-            ORDER BY name ASC
-            LIMIT $3
-            """,
-            int(legacy_guild_id),
-            f"%{q}%",
-            int(limit),
-        )
-        return [str(r["name"]) for r in rows]
-
-
-# -------------------------
-# Economy helpers
-# -------------------------
-async def get_balance_val(guild_id: int, character_name: str) -> int:
-    if not DATABASE_URL:
-        return 0
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        row = await con.fetchrow(
-            "SELECT balance_val FROM economy.balances WHERE guild_id=$1 AND character_name=$2",
-            int(guild_id),
-            str(character_name),
-        )
-        return int(row["balance_val"]) if row else 0
-
-
-async def set_balance_val(guild_id: int, character_name: str, new_val: int) -> None:
-    if not DATABASE_URL:
-        return
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            INSERT INTO economy.balances (guild_id, character_name, balance_val, updated_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (guild_id, character_name)
-            DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW()
-            """,
-            int(guild_id),
-            str(character_name),
-            int(new_val),
-        )
-
-
-async def add_balance_val(guild_id: int, character_name: str, delta: int) -> int:
-    """Adds delta, never below 0. Returns updated balance."""
-    if not DATABASE_URL:
-        return 0
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        async with con.transaction():
-            cur = await con.fetchrow(
-                "SELECT balance_val FROM economy.balances WHERE guild_id=$1 AND character_name=$2 FOR UPDATE",
-                int(guild_id),
-                str(character_name),
-            )
-            cur_val = int(cur["balance_val"]) if cur else 0
-            new_val = cur_val + int(delta)
-            if new_val < 0:
-                new_val = 0
+    async def start(self) -> None:
+        self.pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5, command_timeout=30)
+        async with self.pool.acquire() as con:
+            await con.execute("CREATE SCHEMA IF NOT EXISTS economy")
             await con.execute(
                 """
-                INSERT INTO economy.balances (guild_id, character_name, balance_val, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (guild_id, character_name)
-                DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW()
+                CREATE TABLE IF NOT EXISTS economy.balances (
+                    guild_id BIGINT NOT NULL,
+                    character_name TEXT NOT NULL,
+                    balance_val BIGINT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, character_name)
+                );
+                """
+            )
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS economy.income_claims (
+                    guild_id BIGINT NOT NULL,
+                    character_name TEXT NOT NULL,
+                    last_claim_date DATE NOT NULL,
+                    PRIMARY KEY (guild_id, character_name)
+                );
+                """
+            )
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS economy.assets (
+                    guild_id BIGINT NOT NULL,
+                    character_name TEXT NOT NULL,
+                    owner_user_id BIGINT NOT NULL,
+                    asset_name TEXT NOT NULL,
+                    asset_type TEXT NOT NULL,
+                    tier TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, character_name, asset_name)
+                );
+                """
+            )
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS economy.asset_defs (
+                    asset_type TEXT NOT NULL,
+                    tier TEXT NOT NULL,
+                    cost_val BIGINT NOT NULL,
+                    income_val BIGINT NOT NULL,
+                    PRIMARY KEY (asset_type, tier)
+                );
+                """
+            )
+            await con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS economy.bank_messages (
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
+                );
+                """
+            )
+
+            # Seed defs (idempotent)
+            await con.executemany(
+                """
+                INSERT INTO economy.asset_defs (asset_type, tier, cost_val, income_val)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (asset_type, tier) DO UPDATE
+                SET cost_val=EXCLUDED.cost_val, income_val=EXCLUDED.income_val
+                """,
+                [
+                    (a["asset_type"], a["tier"], int(a["cost_val"]), int(a["income_val"]))
+                    for a in ASSET_DEFS
+                ],
+            )
+
+    async def fetch_character(self, name: str) -> Optional[Character]:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                """
+                SELECT guild_id, user_id, name, archived
+                FROM public.characters
+                WHERE guild_id=$1 AND name=$2
+                LIMIT 1
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                name,
+            )
+            if not row:
+                return None
+            return Character(int(row["guild_id"]), int(row["user_id"]), str(row["name"]), bool(row["archived"]))
+
+    async def search_characters(self, query: str, limit: int = 25) -> List[str]:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT name
+                FROM public.characters
+                WHERE guild_id=$1 AND archived=false AND name ILIKE $2
+                ORDER BY name ASC
+                LIMIT $3
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                f"%{query}%",
+                limit,
+            )
+            return [str(r["name"]) for r in rows]
+
+    async def get_balance(self, character_name: str) -> int:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "SELECT balance_val FROM economy.balances WHERE guild_id=$1 AND character_name=$2",
+                int(LEGACY_SOURCE_GUILD_ID),
+                character_name,
+            )
+            return int(row["balance_val"]) if row else 0
+
+    async def set_balance(self, character_name: str, new_balance: int) -> None:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO economy.balances (guild_id, character_name, balance_val)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, character_name) DO UPDATE
+                SET balance_val=EXCLUDED.balance_val, updated_at=NOW()
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                character_name,
+                int(new_balance),
+            )
+
+    async def add_balance(self, character_name: str, delta: int) -> int:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                """
+                INSERT INTO economy.balances (guild_id, character_name, balance_val)
+                VALUES ($1, $2, GREATEST(0, $3))
+                ON CONFLICT (guild_id, character_name) DO UPDATE
+                SET balance_val = GREATEST(0, economy.balances.balance_val + $3),
+                    updated_at = NOW()
+                RETURNING balance_val
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                character_name,
+                int(delta),
+            )
+            return int(row["balance_val"])
+
+    async def get_assets(self, character_name: str) -> List[Dict[str, str]]:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT asset_name, asset_type, tier
+                FROM economy.assets
+                WHERE guild_id=$1 AND character_name=$2
+                ORDER BY asset_type ASC, tier ASC, asset_name ASC
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                character_name,
+            )
+            return [
+                {"asset_name": str(r["asset_name"]), "asset_type": str(r["asset_type"]), "tier": str(r["tier"])}
+                for r in rows
+            ]
+
+    async def insert_asset(self, character_name: str, owner_user_id: int, asset_name: str, asset_type: str, tier: str) -> None:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO economy.assets (guild_id, character_name, owner_user_id, asset_name, asset_type, tier)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (guild_id, character_name, asset_name) DO UPDATE
+                SET asset_type=EXCLUDED.asset_type,
+                    tier=EXCLUDED.tier,
+                    owner_user_id=EXCLUDED.owner_user_id,
+                    updated_at=NOW()
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                character_name,
+                int(owner_user_id),
+                asset_name,
+                asset_type,
+                tier,
+            )
+
+    async def sum_asset_income(self, character_name: str) -> int:
+        assert self.pool
+        assets = await self.get_assets(character_name)
+        total = 0
+        for a in assets:
+            d = _ASSET_KEY_TO_DEF.get((a["asset_type"], a["tier"]))
+            if d:
+                total += int(d["income_val"])
+        return total
+
+    async def last_income_date(self, character_name: str) -> Optional[dt.date]:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "SELECT last_claim_date FROM economy.income_claims WHERE guild_id=$1 AND character_name=$2",
+                int(LEGACY_SOURCE_GUILD_ID),
+                character_name,
+            )
+            return row["last_claim_date"] if row else None
+
+    async def set_income_date(self, character_name: str, d: dt.date) -> None:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO economy.income_claims (guild_id, character_name, last_claim_date)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, character_name) DO UPDATE
+                SET last_claim_date=EXCLUDED.last_claim_date
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                character_name,
+                d,
+            )
+
+    async def list_users_with_characters(self) -> List[int]:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT DISTINCT user_id
+                FROM public.characters
+                WHERE guild_id=$1 AND archived=false
+                ORDER BY user_id ASC
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+            )
+            return [int(r["user_id"]) for r in rows]
+
+    async def list_characters_for_user(self, user_id: int) -> List[str]:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            rows = await con.fetch(
+                """
+                SELECT name
+                FROM public.characters
+                WHERE guild_id=$1 AND user_id=$2 AND archived=false
+                ORDER BY name ASC
+                """,
+                int(LEGACY_SOURCE_GUILD_ID),
+                int(user_id),
+            )
+            return [str(r["name"]) for r in rows]
+
+    async def get_bank_message_id(self, guild_id: int, user_id: int) -> Optional[int]:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow(
+                "SELECT message_id FROM economy.bank_messages WHERE guild_id=$1 AND user_id=$2",
+                int(guild_id),
+                int(user_id),
+            )
+            return int(row["message_id"]) if row else None
+
+    async def set_bank_message_id(self, guild_id: int, user_id: int, message_id: int) -> None:
+        assert self.pool
+        async with self.pool.acquire() as con:
+            await con.execute(
+                """
+                INSERT INTO economy.bank_messages (guild_id, user_id, message_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, user_id) DO UPDATE
+                SET message_id=EXCLUDED.message_id
                 """,
                 int(guild_id),
-                str(character_name),
-                int(new_val),
+                int(user_id),
+                int(message_id),
             )
-            return int(new_val)
-
-
-async def sum_asset_income_val(guild_id: int, character_name: str) -> int:
-    if not DATABASE_URL:
-        return 0
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        row = await con.fetchrow(
-            """
-            SELECT COALESCE(SUM(income_val), 0) AS s
-            FROM economy.assets_owned
-            WHERE guild_id=$1 AND character_name=$2
-            """,
-            int(guild_id),
-            str(character_name),
-        )
-        return int(row["s"]) if row else 0
-
-
-async def fetch_assets_owned(guild_id: int, character_name: str) -> List[Dict[str, object]]:
-    if not DATABASE_URL:
-        return []
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
-            SELECT asset_name, asset_type, secondary_type, tier_name, tier, cost_val, income_val, character_user_id
-            FROM economy.assets_owned
-            WHERE guild_id=$1 AND character_name=$2
-            ORDER BY asset_type, secondary_type, tier DESC, asset_name
-            """,
-            int(guild_id),
-            str(character_name),
-        )
-        return [dict(r) for r in rows]
-
-
-async def ledger_write(
-    guild_id: int,
-    character_name: str,
-    character_user_id: int,
-    actor_user_id: int,
-    kind: str,
-    delta_val: int,
-    reason: str,
-    details: Dict[str, object] | None = None,
-) -> None:
-    if not DATABASE_URL:
-        return
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        await con.execute(
-            """
-            INSERT INTO economy.ledger (guild_id, character_name, character_user_id, actor_user_id, kind, delta_val, reason, details_json)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            """,
-            int(guild_id),
-            str(character_name),
-            int(character_user_id),
-            int(actor_user_id),
-            str(kind),
-            int(delta_val),
-            str(reason),
-            json.dumps(details or {}, ensure_ascii=False),
-        )
 
 
 # -------------------------
-# Formatting
+# Discord
 # -------------------------
-UNIT_LABELS = {
-    "CINTH": "Cinth",
-    "ARCE": "Arce",
-    "ELSH": "Elsh",
-    "ORIN": "Orin",
-    "NOVIR": "Novir",
-}
 
-
-def breakdown_denoms(val: int) -> List[Tuple[str, int]]:
-    remaining = int(max(0, val))
-    parts: List[Tuple[str, int]] = []
-    for unit, unit_val in DENOMS:
-        if remaining <= 0:
-            break
-        count = remaining // unit_val
-        if count:
-            parts.append((unit, int(count)))
-            remaining -= count * unit_val
-    if not parts:
-        parts = [("CINTH", 0)]
-    return parts
-
-
-def format_money(val: int) -> str:
-    parts = breakdown_denoms(val)
-    out = []
-    for unit, count in parts:
-        label = UNIT_LABELS.get(unit, unit.title())
-        plural = "" if count == 1 else "s"
-        out.append(f"{count} {label}{plural}")
-    return ", ".join(out)
-
-
-def format_assets_lines(assets: List[Dict[str, object]]) -> str:
-    if not assets:
-        return "*(None)*"
-    lines = []
-    for a in assets:
-        asset_name = str(a.get("asset_name", "")).strip()
-        tier_name = str(a.get("tier_name", "")).strip()
-        lines.append(f"{asset_name} — {tier_name}")
-    return "\n".join(lines)
-
-
-# -------------------------
-# Discord setup
-# -------------------------
 intents = discord.Intents.none()
 intents.guilds = True
 
-client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
+client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-
-# Register commands as *guild* commands when GUILD_ID is set (instant availability).
-GUILD_OBJ = discord.Object(id=GUILD_ID) if GUILD_ID else None
+db = DB(DATABASE_URL)
 
 
-@tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    msg: str
-    if isinstance(error, app_commands.CheckFailure):
-        msg = str(error) or "You don’t have permission to use that command."
-    elif isinstance(error, app_commands.CommandInvokeError) and getattr(error, "original", None) is not None:
-        orig = error.original
-        msg = f"Command error: {type(orig).__name__}: {orig}"
+def is_staff(member: Optional[discord.Member]) -> bool:
+    if not member:
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    if not STAFF_ROLE_IDS:
+        return False
+    return any(r.id in STAFF_ROLE_IDS for r in member.roles)
+
+
+async def log_econ(guild: discord.Guild, text: str) -> None:
+    ch = guild.get_channel(ECON_LOG_CHANNEL_ID)
+    if isinstance(ch, discord.TextChannel):
+        await ch.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def make_balance_embed(character_name: str) -> discord.Embed:
+    bal = await db.get_balance(character_name)
+    assets = await db.get_assets(character_name)
+    e = discord.Embed(title=f"{character_name} — Balance", description=f"**Money:** {format_val(bal)}")
+    if assets:
+        lines = [f"{a['asset_name']} — {a['asset_type']} / {a['tier']}" for a in assets]
+        e.add_field(name="_*Assets*_", value="\n".join(lines), inline=False)
     else:
-        msg = f"Command error: {type(error).__name__}: {error}"
+        e.add_field(name="_*Assets*_", value="(none)", inline=False)
+    return e
 
+
+async def refresh_bank_for_user(guild: discord.Guild, user_id: int) -> None:
+    ch = guild.get_channel(BANK_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        return
+
+    display_name = f"User {user_id}"
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        else:
-            await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+        if member:
+            display_name = member.display_name
     except Exception:
         pass
 
+    char_names = await db.list_characters_for_user(user_id)
+    if not char_names:
+        return
 
-def require_admin():
-    """Staff check using STAFF_ROLE_IDS; if not configured, fall back to admin perms."""
+    e = discord.Embed(title=f"Bank of Vilyra — {display_name}")
+    blocks: List[str] = []
+    for cn in char_names:
+        bal = await db.get_balance(cn)
+        assets = await db.get_assets(cn)
+        assets_lines = [f"{a['asset_name']} — {a['asset_type']} / {a['tier']}" for a in assets]
+        assets_text = "(none)" if not assets_lines else "\n".join(assets_lines)
+        blocks.append(f"**{cn}**\nMoney: {format_val(bal)}\n_*Assets*_\n{assets_text}")
+    e.description = "\n\n".join(blocks)
 
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            raise app_commands.CheckFailure("This command can only be used in a server.")
+    msg_id = await db.get_bank_message_id(guild.id, user_id)
+    if msg_id:
+        try:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(embed=e, allowed_mentions=discord.AllowedMentions.none())
+            return
+        except Exception:
+            pass
 
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        if member is None:
-            member = interaction.guild.get_member(interaction.user.id)
+    msg = await ch.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+    await db.set_bank_message_id(guild.id, user_id, msg.id)
 
-        if member is None:
-            raise app_commands.CheckFailure("I couldn't verify your roles/permissions. Try again in a moment.")
 
-        if STAFF_ROLE_IDS:
-            if any(r.id in STAFF_ROLE_IDS for r in getattr(member, "roles", [])):
-                return True
-            raise app_commands.CheckFailure("You don’t have permission to use that command.")
+async def refresh_bank_for_character(guild: discord.Guild, character_name: str) -> None:
+    c = await db.fetch_character(character_name)
+    if not c:
+        return
+    await refresh_bank_for_user(guild, c.user_id)
 
-        perms = getattr(member, "guild_permissions", None)
-        if perms and (perms.administrator or perms.manage_guild):
-            return True
 
-        raise app_commands.CheckFailure(
-            "Staff roles are not configured (STAFF_ROLE_IDS). Ask an admin to set STAFF_ROLE_IDS in Railway Variables."
-        )
-
-    return app_commands.check(predicate)
+async def refresh_bank_all(guild: discord.Guild) -> None:
+    for uid in await db.list_users_with_characters():
+        await refresh_bank_for_user(guild, uid)
 
 
 # -------------------------
-# Autocomplete
+# Autocomplete helpers
 # -------------------------
-async def character_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    if not LEGACY_SOURCE_GUILD_ID:
+
+async def character_autocomplete(_: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    try:
+        names = await db.search_characters(current or "")
+        return [app_commands.Choice(name=n, value=n) for n in names[:25]]
+    except Exception:
         return []
-    names = await search_characters(int(LEGACY_SOURCE_GUILD_ID), current or "", limit=25)
-    return [app_commands.Choice(name=n, value=n) for n in names[:25]]
 
 
-async def owned_asset_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    # expects "character" to be in namespace
-    char = str(getattr(interaction.namespace, "character", "") or "").strip()
-    if not char or not LEGACY_SOURCE_GUILD_ID:
-        return []
-    assets = await fetch_assets_owned(int(LEGACY_SOURCE_GUILD_ID), char)
-    cur = (current or "").lower().strip()
-    names = []
-    for a in assets:
-        nm = str(a.get("asset_name", "")).strip()
-        if not nm:
-            continue
-        if not cur or cur in nm.lower():
-            names.append(nm)
-    names = sorted(set(names))[:25]
-    return [app_commands.Choice(name=n, value=n) for n in names]
+async def asset_autocomplete(_: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    current_l = (current or "").lower()
+    all_disp = all_asset_display_strings()
+    filtered = [s for s in all_disp if current_l in s.lower()] if current_l else all_disp
+    return [app_commands.Choice(name=s, value=s) for s in filtered[:25]]
 
 
 # -------------------------
 # Commands
 # -------------------------
-COMMAND_HELP_LINES = [
-    ('/balance', 'Show a character’s current money and owned assets. Anyone can use this; it matches the public bank dashboard.'),
-    ('/income', 'Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets.'),
-    ('/econ_adjust', 'Staff-only. Add or subtract money from a character. The bot will not allow balances to go negative.'),
-    ('/econ_set_balance', 'Staff-only. Set a character’s balance to an exact amount (non-negative). Useful for corrections.'),
-    ('/purchase_new', 'Staff-only. Buy a NEW asset for a character. Charges the cumulative cost of Tier 1 up to the selected Tier (no negative balances).'),
-    ('/econ_refresh_bank', 'Staff-only. Force-refresh the Bank of Vilyra dashboard now (use if it looks out of sync).'),
-    ('/econ_commands', 'Staff-only. Shows this command list with short descriptions (kept updated as we add features).'),
-]
 
-
-
-@tree.command(guild=GUILD_OBJ, name="econ_commands", description="Staff: show EconBot command list and what each command does.")
-@require_admin()
-async def econ_commands_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    em = discord.Embed(title="EconBot Commands", description="Quick reference (kept updated as we build).")
-    public = []
-    staff = []
-    for name, desc in COMMAND_HELP_LINES:
-        line = f"**/{name}** — {desc}"
-        if name in {"balance", "income"}:
-            public.append(line)
-        else:
-            staff.append(line)
-
-    if public:
-        em.add_field(name="Player Commands", value="\n".join(public), inline=False)
-    if staff:
-        em.add_field(name="Staff Commands", value="\n".join(staff), inline=False)
-
-    em.set_footer(text=VERSION)
-    await interaction.followup.send(embed=em, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-
-
-@tree.command(guild=GUILD_OBJ, name="balance", description="Show a character’s money + assets.")
-@app_commands.describe(character="Pick a character")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def balance_cmd(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    if not LEGACY_SOURCE_GUILD_ID:
-        await interaction.followup.send("LEGACY_SOURCE_GUILD_ID is not set.", ephemeral=True)
+@tree.command(name="balance", description="Show a character’s current money and owned assets.", guild=GUILD_OBJ)
+@app_commands.describe(character_name="Select a character")
+@app_commands.autocomplete(character_name=character_autocomplete)
+async def cmd_balance(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
         return
-
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
+    c = await db.fetch_character(character_name)
+    if not c or c.archived:
         await interaction.followup.send("Character not found.", ephemeral=True)
         return
-
-    bal = await get_balance_val(ch.guild_id, ch.name)
-    assets = await fetch_assets_owned(ch.guild_id, ch.name)
-
-    em = discord.Embed(title=f"{ch.name}", description=f"**Balance:** {format_money(bal)}")
-    em.add_field(name="__*Assets*__", value=format_assets_lines(assets), inline=False)
-    em.set_footer(text=VERSION)
-    await interaction.followup.send(embed=em, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    e = await make_balance_embed(character_name)
+    await interaction.followup.send(embed=e, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-@tree.command(guild=GUILD_OBJ, name="income", description="Owner-only: claim daily income for your character (Chicago time).")
-@app_commands.describe(character="Pick one of your characters")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def income_cmd(interaction: discord.Interaction, character: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    if not (DATABASE_URL and LEGACY_SOURCE_GUILD_ID):
-        await interaction.followup.send("Database is not configured.", ephemeral=True)
+@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).", guild=GUILD_OBJ)
+@app_commands.describe(character_name="Select one of your characters")
+@app_commands.autocomplete(character_name=character_autocomplete)
+async def cmd_income(interaction: discord.Interaction, character_name: str):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
         return
 
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
+    c = await db.fetch_character(character_name)
+    if not c or c.archived:
         await interaction.followup.send("Character not found.", ephemeral=True)
         return
-
-    if interaction.user.id != ch.user_id:
+    if interaction.user.id != c.user_id:
         await interaction.followup.send("You can only claim income for characters you own.", ephemeral=True)
         return
 
-    today = dt.datetime.now(TZ).date()
+    today = dt.datetime.now(CHICAGO_TZ).date()
+    last = await db.last_income_date(character_name)
+    if last == today:
+        await interaction.followup.send("Income already claimed for this character today (Chicago time).", ephemeral=True)
+        return
 
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        async with con.transaction():
-            exists = await con.fetchrow(
-                "SELECT 1 FROM economy.income_claims WHERE guild_id=$1 AND character_name=$2 AND claim_date=$3",
-                int(ch.guild_id),
-                str(ch.name),
-                today,
-            )
-            if exists:
-                await interaction.followup.send("Income already claimed for today.", ephemeral=True)
-                return
+    asset_income = await db.sum_asset_income(character_name)
+    total = BASE_DAILY_INCOME_VAL + asset_income
+    new_bal = await db.add_balance(character_name, total)
+    await db.set_income_date(character_name, today)
 
-            asset_income = await sum_asset_income_val(ch.guild_id, ch.name)
-            total_income = int(BASE_DAILY_INCOME_VAL + asset_income)
-
-            # Apply
-            cur = await con.fetchrow(
-                "SELECT balance_val FROM economy.balances WHERE guild_id=$1 AND character_name=$2 FOR UPDATE",
-                int(ch.guild_id),
-                str(ch.name),
-            )
-            cur_val = int(cur["balance_val"]) if cur else 0
-            new_val = cur_val + total_income
-
-            await con.execute(
-                """
-                INSERT INTO economy.balances (guild_id, character_name, balance_val, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (guild_id, character_name)
-                DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW()
-                """,
-                int(ch.guild_id),
-                str(ch.name),
-                int(new_val),
-            )
-
-            await con.execute(
-                "INSERT INTO economy.income_claims (guild_id, character_name, claim_date) VALUES ($1,$2,$3)",
-                int(ch.guild_id),
-                str(ch.name),
-                today,
-            )
-
-            await con.execute(
-                """
-                INSERT INTO economy.ledger (guild_id, character_name, character_user_id, actor_user_id, kind, delta_val, reason, details_json)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                """,
-                int(ch.guild_id),
-                str(ch.name),
-                int(ch.user_id),
-                int(interaction.user.id),
-                "INCOME",
-                int(total_income),
-                "Daily income",
-                json.dumps({"base": BASE_DAILY_INCOME_VAL, "assets": asset_income}, ensure_ascii=False),
-            )
+    await refresh_bank_for_character(guild, character_name)
 
     await interaction.followup.send(
-        f"Income claimed: **{format_money(total_income)}**. New balance: **{format_money(new_val)}**.",
+        f"Income claimed for **{character_name}**. +{format_val(total)} (base {format_val(BASE_DAILY_INCOME_VAL)} + assets {format_val(asset_income)}). New balance: {format_val(new_bal)}",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+    await log_econ(guild, f"[income] {interaction.user.id} claimed income for {character_name}: +{total} Val")
 
-    asyncio.create_task(rebuild_dashboard())
 
-
-@tree.command(guild=GUILD_OBJ, name="econ_adjust", description="Staff: add/subtract currency (never negative).")
-@require_admin()
-@app_commands.describe(character="Pick a character", delta_val="Delta in Val (negative subtracts)", reason="Why")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def econ_adjust_cmd(interaction: discord.Interaction, character: str, delta_val: int, reason: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    if not (DATABASE_URL and LEGACY_SOURCE_GUILD_ID):
-        await interaction.followup.send("Database is not configured.", ephemeral=True)
+@tree.command(name="econ_adjust", description="Staff: add or subtract money from a character (no negative balances).", guild=GUILD_OBJ)
+@app_commands.describe(character_name="Select a character", delta_val="Positive to add, negative to subtract (in Val)")
+@app_commands.autocomplete(character_name=character_autocomplete)
+async def cmd_econ_adjust(interaction: discord.Interaction, character_name: str, delta_val: int):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+        return
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not is_staff(member):
+        await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
         return
 
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
+    c = await db.fetch_character(character_name)
+    if not c or c.archived:
         await interaction.followup.send("Character not found.", ephemeral=True)
         return
 
-    cur = await get_balance_val(ch.guild_id, ch.name)
-    if cur + int(delta_val) < 0:
-        await interaction.followup.send("Insufficient funds (this action would make the balance negative).", ephemeral=True)
+    before = await db.get_balance(character_name)
+    after = before + int(delta_val)
+    if after < 0:
+        await interaction.followup.send(
+            f"Insufficient funds. Available: {format_val(before)}. Requested change: {format_val(delta_val)}.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
 
-    new_val = await add_balance_val(ch.guild_id, ch.name, int(delta_val))
-    await ledger_write(ch.guild_id, ch.name, ch.user_id, interaction.user.id, "ADJUST", int(delta_val), reason, {})
-
+    new_bal = await db.add_balance(character_name, int(delta_val))
+    await refresh_bank_for_character(guild, character_name)
     await interaction.followup.send(
-        f"Updated **{ch.name}**: {format_money(cur)} → **{format_money(new_val)}**.",
+        f"Adjusted **{character_name}** by {format_val(delta_val)}. New balance: {format_val(new_bal)}",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+    await log_econ(guild, f"[econ_adjust] {interaction.user.id} adjusted {character_name} by {delta_val} Val")
 
-    asyncio.create_task(rebuild_dashboard())
 
-
-@tree.command(guild=GUILD_OBJ, name="econ_set_balance", description="Staff: set exact balance (non-negative).")
-@require_admin()
-@app_commands.describe(character="Pick a character", balance_val="Exact balance in Val", reason="Why")
-@app_commands.autocomplete(character=character_name_autocomplete)
-async def econ_set_balance_cmd(interaction: discord.Interaction, character: str, balance_val: int, reason: str):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-
-    if not (DATABASE_URL and LEGACY_SOURCE_GUILD_ID):
-        await interaction.followup.send("Database is not configured.", ephemeral=True)
+@tree.command(name="econ_set_balance", description="Staff: set a character balance to an exact amount (non-negative).", guild=GUILD_OBJ)
+@app_commands.describe(character_name="Select a character", new_balance_val="New balance in Val (>= 0)")
+@app_commands.autocomplete(character_name=character_autocomplete)
+async def cmd_econ_set_balance(interaction: discord.Interaction, character_name: str, new_balance_val: int):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
         return
-
-    if int(balance_val) < 0:
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not is_staff(member):
+        await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+        return
+    if new_balance_val < 0:
         await interaction.followup.send("Balance cannot be negative.", ephemeral=True)
         return
 
-    ch = await fetch_character_by_name(int(LEGACY_SOURCE_GUILD_ID), character)
-    if not ch or ch.archived:
+    c = await db.fetch_character(character_name)
+    if not c or c.archived:
         await interaction.followup.send("Character not found.", ephemeral=True)
         return
 
-    cur = await get_balance_val(ch.guild_id, ch.name)
-    await set_balance_val(ch.guild_id, ch.name, int(balance_val))
-    await ledger_write(ch.guild_id, ch.name, ch.user_id, interaction.user.id, "SET_BALANCE", int(balance_val) - cur, reason, {"set_to": int(balance_val)})
-
+    await db.set_balance(character_name, int(new_balance_val))
+    await refresh_bank_for_character(guild, character_name)
     await interaction.followup.send(
-        f"Set **{ch.name}** balance: {format_money(cur)} → **{format_money(int(balance_val))}**.",
+        f"Set **{character_name}** balance to {format_val(int(new_balance_val))}.",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+    await log_econ(guild, f"[econ_set_balance] {interaction.user.id} set {character_name} to {new_balance_val} Val")
 
-    asyncio.create_task(rebuild_dashboard())
 
-
-# Helper: build tier choices from the NEW Asset Table catalog
-def _tier_choice_value(asset_type: str, tier_name: str) -> str:
-    return f"{asset_type}||{tier_name}"
-
-def _parse_tier_choice_value(val: str) -> tuple[str, str]:
-    if "||" not in val:
-        raise ValueError("Invalid tier selection")
-    a, t = val.split("||", 1)
-    return a.strip(), t.strip()
-
-async def tier_choice_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    q = (current or "").lower().strip()
-    out: list[app_commands.Choice[str]] = []
-    try:
-        for row in ASSET_CATALOG:
-            label = f"{row['asset_type']} — {row['tier_name']}"
-            if q and q not in label.lower():
-                continue
-            out.append(app_commands.Choice(name=label[:100], value=_tier_choice_value(row['asset_type'], row['tier_name'])[:100]))
-            if len(out) >= 25:
-                break
-        return out
-    except Exception:
-        return []
-
-def cumulative_tier_cost(asset_type: str, target_tier: int) -> int:
-    # Sum cost to acquire for tiers 1..target_tier of the given asset_type.
-    costs = [r['cost_val'] for r in ASSET_CATALOG if r['asset_type'] == asset_type and int(r['tier_num']) <= int(target_tier)]
-    return int(sum(costs))
-
-@tree.command(guild=GUILD_OBJ, name="purchase_new", description="Staff: buy a new asset for a character (tier 1..target tier cost, no negative balances).")
-@require_admin()
-@app_commands.describe(character="Character name", tier_choice="Asset Type + Tier (from NEW Asset Table)", asset_name="Custom name for this asset (unique per character)")
-@app_commands.autocomplete(character=character_name_autocomplete, tier_choice=tier_choice_autocomplete)
-async def purchase_new(interaction: discord.Interaction, character: str, tier_choice: str, asset_name: str):
+@tree.command(name="econ_refresh_bank", description="Staff: manually refresh the Bank of Vilyra dashboard.", guild=GUILD_OBJ)
+async def cmd_refresh_bank(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+        return
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not is_staff(member):
+        await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    await refresh_bank_all(guild)
+    await interaction.followup.send("Bank of Vilyra refreshed.", ephemeral=True)
+
+
+@tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.", guild=GUILD_OBJ)
+async def cmd_econ_commands(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not is_staff(member):
+        await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    lines = [
+        "**Player Commands**",
+        "/balance — Show a character’s current money and owned assets. Anyone can use this; it matches the public bank dashboard.",
+        "/income — Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets.",
+        "",
+        "**Staff Commands**",
+        "/econ_adjust — Add or subtract money from a character. The bot will not allow balances to go negative.",
+        "/econ_set_balance — Set a character’s balance to an exact amount (non-negative). Useful for corrections.",
+        "/purchase_new — NEW purchase: choose a character, choose an Asset Type + Tier from the official sheet, name the asset. Cost is Tier1..Target summed; must have sufficient funds.",
+        "/econ_refresh_bank — Manually rebuild / resync the Bank of Vilyra dashboard.",
+        "/econ_commands — Shows this command list (kept updated as we add features).",
+    ]
+    await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="purchase_new", description="Staff: purchase a new asset for a character (Asset Type + Tier).", guild=GUILD_OBJ)
+@app_commands.describe(
+    character_name="Select a character",
+    asset="Select an Asset Type + Tier (from NEW Asset Table)",
+    asset_name="Name this asset (unique per character)",
+)
+@app_commands.autocomplete(character_name=character_autocomplete, asset=asset_autocomplete)
+async def cmd_purchase_new(interaction: discord.Interaction, character_name: str, asset: str, asset_name: str):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+        return
+    member = interaction.user if isinstance(interaction.user, discord.Member) else None
+    if not is_staff(member):
+        await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+        return
+
+    c = await db.fetch_character(character_name)
+    if not c or c.archived:
+        await interaction.followup.send("Character not found.", ephemeral=True)
+        return
+
     asset_name = (asset_name or "").strip()
     if not asset_name:
-        await interaction.followup.send("Asset name cannot be blank.", ephemeral=True)
+        await interaction.followup.send("Asset name cannot be empty.", ephemeral=True)
         return
 
-    try:
-        asset_type, tier_name = _parse_tier_choice_value(tier_choice)
-    except Exception:
-        await interaction.followup.send("Invalid tier selection.", ephemeral=True)
+    parsed = parse_asset_display(asset)
+    if not parsed:
+        await interaction.followup.send("Invalid asset selection. Please choose from the dropdown.", ephemeral=True)
+        return
+    asset_type, tier = parsed
+
+    existing = await db.get_assets(character_name)
+    if any(a["asset_name"].lower() == asset_name.lower() for a in existing):
+        await interaction.followup.send("That asset name is already used for this character. Choose a unique name.", ephemeral=True)
         return
 
-    row = next((r for r in ASSET_CATALOG if r['asset_type'] == asset_type and r['tier_name'] == tier_name), None)
-    if not row:
-        await interaction.followup.send("That asset tier was not found in the NEW Asset Table.", ephemeral=True)
+    total_cost = total_cost_for_new_purchase(asset_type, tier)
+    available = await db.get_balance(character_name)
+
+    if available < total_cost:
+        delta = total_cost - available
+        await interaction.followup.send(
+            f"**Insufficient funds.**\nAvailable: {format_val(available)}\nTotal cost: {format_val(total_cost)}\nShort by: {format_val(delta)}",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         return
 
-    tier_num = int(row['tier_num'])
-    total_cost = cumulative_tier_cost(asset_type, tier_num)
+    await db.add_balance(character_name, -total_cost)
+    await db.insert_asset(character_name, c.user_id, asset_name, asset_type, tier)
 
-    async with pool.acquire() as con:
-        # Find character (legacy table) to get owner user_id
-        ch = await get_character_by_name(con, character)
-        if not ch:
-            await interaction.followup.send(f"Character not found: {character}", ephemeral=True)
-            return
+    await refresh_bank_for_character(guild, character_name)
 
-        owner_user_id = int(ch['user_id'])
-        # Fetch current balance
-        bal = await get_balance(con, owner_user_id, character)
-        current_val = int(bal['balance_val']) if bal else 0
-
-        if current_val < total_cost:
-            delta = total_cost - current_val
-            await interaction.followup.send(
-                f"Insufficient funds.\n"
-                f"Available: **{format_value(current_val)}**\n"
-                f"Total cost: **{format_value(total_cost)}**\n"
-                f"Shortfall: **{format_value(delta)}**",
-                ephemeral=True,
-            )
-            return
-
-        # Enforce unique asset_name per (user_id, character, asset_name)
-        exists = await con.fetchval(
-            "SELECT 1 FROM econ_assets_owned WHERE guild_id=$1 AND user_id=$2 AND character_name=$3 AND asset_name=$4",
-            LEGACY_SOURCE_GUILD_ID, owner_user_id, character, asset_name
-        )
-        if exists:
-            await interaction.followup.send(
-                "That character already has an asset with that name. Asset names must be unique per character.",
-                ephemeral=True,
-            )
-            return
-
-        # Debit and insert asset
-        new_balance = current_val - total_cost
-        await set_balance(con, owner_user_id, character, new_balance)
-
-        await con.execute(
-            """INSERT INTO econ_assets_owned
-                (guild_id, user_id, character_name, asset_name, asset_type, secondary_type, tier, tier_name, cost_val, income_val)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
-            LEGACY_SOURCE_GUILD_ID, owner_user_id, character, asset_name,
-            asset_type, asset_type, target_tier, tier_name, int(row['cost_val']), int(row['income_val'])
-        )
-
-        details = {
-            "action": "purchase_new",
-            "asset_type": asset_type,
-            "tier_name": tier_name,
-            "target_tier": target_tier,
-            "total_cost": total_cost,
-            "asset_name": asset_name,
-        }
-        await log_ledger(
-            con,
-            user_id=owner_user_id,
-            character_name=character,
-            action="purchase_new",
-            delta_val=-total_cost,
-            by_user_id=int(interaction.user.id),
-            details=details,
-        )
-
-    # Refresh dashboard + confirm
-    await refresh_bank_dashboard()
+    new_bal = await db.get_balance(character_name)
     await interaction.followup.send(
-        f"Purchased **{asset_name}** — **{asset_type} / {tier_name}** for **{format_value(total_cost)}**.\n"
-        f"New balance: **{format_value(new_balance)}**",
+        f"Purchased **{asset_name}** for **{character_name}**: {asset_display(asset_type, tier)}\nCost: {format_val(total_cost)}\nNew balance: {format_val(new_bal)}",
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
-
-@tree.command(guild=GUILD_OBJ, name="econ_refresh_bank", description="Staff: force-refresh the Bank of Vilyra dashboard.")
-@require_admin()
-async def econ_refresh_bank(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=False, ephemeral=True)
-    await rebuild_dashboard()
-    await interaction.followup.send("Bank of Vilyra dashboard refreshed.", ephemeral=True)
-
+    await log_econ(guild, f"[purchase_new] {interaction.user.id} purchased {asset_type} / {tier} for {character_name} name={asset_name} cost={total_cost} Val")
 
 
 # -------------------------
-# Dashboard
+# Lifecycle
 # -------------------------
 
-async def rebuild_dashboard():
-    """Rebuild the Bank of Vilyra dashboard by editing existing messages (no pings)."""
-    if not BANK_CHANNEL_ID or not BANK_MESSAGE_IDS:
-        return
-
-    guild = client.get_guild(int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0))
-    if guild is None:
-        try:
-            guild = await client.fetch_guild(int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0))
-        except Exception:
-            guild = None
-
-    bank_channel = None
-    if guild:
-        bank_channel = guild.get_channel(int(BANK_CHANNEL_ID))
-    if bank_channel is None:
-        try:
-            bank_channel = await client.fetch_channel(int(BANK_CHANNEL_ID))
-        except Exception:
-            return
-
-    # Fetch characters and balances/assets
-    pool = await db_pool()
-    async with pool.acquire() as con:
-        chars = await con.fetch(
-            """
-            SELECT name, user_id
-            FROM characters
-            WHERE guild_id=$1 AND COALESCE(archived, FALSE)=FALSE
-            ORDER BY user_id NULLS LAST, name ASC
-            """,
-            int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0),
-        )
-
-        # balances
-        bals = await con.fetch(
-            "SELECT character_name, balance_val FROM econ_balances WHERE guild_id=$1",
-            int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0),
-        )
-        bal_map = {str(r["character_name"]): int(r["balance_val"]) for r in bals}
-
-        # assets
-        assets_rows = await con.fetch(
-            """
-            SELECT character_name, asset_name, tier_name, secondary_type
-            FROM econ_assets
-            WHERE guild_id=$1
-            ORDER BY character_name ASC, asset_name ASC
-            """,
-            int(LEGACY_SOURCE_GUILD_ID or COMMANDS_GUILD_ID or 0),
-        )
-        assets_by_char: Dict[str, List[Dict[str, str]]] = {}
-        for r in assets_rows:
-            cn = str(r["character_name"])
-            assets_by_char.setdefault(cn, []).append(
-                {
-                    "asset_name": str(r["asset_name"]),
-                    "tier_name": str(r["tier_name"]),
-                    "secondary_type": str(r["secondary_type"]),
-                }
-            )
-
-    # Resolve display names (NO mentions)
-    display_cache: Dict[Optional[int], str] = {None: "Unassigned"}
-    async def get_display_name(uid: Optional[int]) -> str:
-        if uid in display_cache:
-            return display_cache[uid]
-        if not guild or uid is None:
-            display_cache[uid] = f"User {uid}" if uid is not None else "Unassigned"
-            return display_cache[uid]
-        try:
-            member = guild.get_member(int(uid))
-            if member is None:
-                member = await guild.fetch_member(int(uid))
-            display_cache[uid] = member.display_name
-        except Exception:
-            display_cache[uid] = f"User {uid}"
-        return display_cache[uid]
-
-    # Build grouped blocks by user
-    grouped: Dict[Optional[int], List[str]] = {}
-    for row in chars:
-        name = str(row["name"])
-        uid = row["user_id"]
-        bal = bal_map.get(name, 0)
-        lines: List[str] = []
-        lines.append(f"• **{name}** — {format_money(bal)}")
-
-        arows = assets_by_char.get(name, [])
-        if arows:
-            lines.append("  *__Assets__*")
-            for a in arows[:25]:
-                # requested format: [Name] - [Tier Name]
-                lines.append(f"  {a['asset_name']} - {a['tier_name']}")
-
-        grouped.setdefault(uid, []).extend(lines)
-        grouped.setdefault(uid, []).append("")  # spacer
-
-    # Turn grouped blocks into pages
-    blocks: List[str] = []
-    for uid, lines in grouped.items():
-        disp = await get_display_name(uid)
-        header = f"__**{disp}**__"
-        body = "\n".join([ln for ln in lines if ln is not None]).rstrip()
-        blocks.append(f"{header}\n{body}".rstrip())
-
-    pages: List[str] = []
-    cur = ""
-    for b in blocks:
-        if not b.strip():
-            continue
-        if len(cur) + len(b) + 2 > 3500:
-            pages.append(cur.rstrip())
-            cur = b + "\n\n"
-        else:
-            cur += b + "\n\n"
-    if cur.strip():
-        pages.append(cur.rstrip())
-
-    # Pad/truncate to available bank message ids
-    pages = pages[: len(BANK_MESSAGE_IDS)]
-    while len(pages) < len(BANK_MESSAGE_IDS):
-        pages.append("")
-
-    # Edit each existing message
-    for i, mid in enumerate(BANK_MESSAGE_IDS):
-        content = pages[i] or " "
-        try:
-            msg = await bank_channel.fetch_message(int(mid))
-            await msg.edit(content=content, allowed_mentions=discord.AllowedMentions.none())
-        except Exception:
-            # if we can't fetch/edit, just skip
-            continue
-
+@client.event
 async def on_ready():
+    await db.start()
+
+    # Remove stale/ghost commands and sync fresh.
     try:
-        await init_db()
+        if COMMANDS_GUILD_ID:
+            # Clear globals to prevent "shows in list but can't run" confusion.
+            tree.clear_commands(guild=None)
+            await tree.sync()
+
+            # Clear & resync guild commands.
+            tree.clear_commands(guild=GUILD_OBJ)
+            await tree.sync(guild=GUILD_OBJ)
+        else:
+            await tree.sync()
     except Exception as e:
-        print(f"[{VERSION}] DB init failed: {e}")
-        raise
+        print(f"[boot] command sync issue: {e}")
 
-    # Sync commands (guild-scoped for fast iteration)
-    #
-    # IMPORTANT:
-    # - We do NOT "copy_global_to" because that can re-introduce stale/legacy global commands.
-    # - We proactively clear GLOBAL commands to avoid ghost commands like /econ_purchase lingering.
-    # - Then we clear GUILD commands and sync the current definitions.
-    try:
-        tree.clear_commands(guild=None)
-        cleared = await tree.sync()  # empty global sync -> deletes global commands for this app
-        print(f"[{VERSION}] Cleared global commands: {len(cleared)}")
-    except Exception as e:
-        print(f"[{VERSION}] Global command clear failed (continuing): {e}")
-
-    if GUILD_ID:
-        guild_obj = discord.Object(id=int(GUILD_ID))
-        try:
-            tree.clear_commands(guild=guild_obj)
-            await tree.sync(guild=guild_obj)  # empty guild sync -> deletes old guild commands
-            print(f"[{VERSION}] Cleared guild commands for {GUILD_ID}")
-        except Exception as e:
-            print(f"[{VERSION}] Guild command clear failed (continuing): {e}")
-
-        try:
-            synced = await tree.sync(guild=guild_obj)
-            print(f"[{VERSION}] Synced guild commands: {len(synced)}")
-        except Exception as e:
-            print(f"[{VERSION}] Command sync failed: {e}")
-    else:
-        try:
-            synced = await tree.sync()
-            print(f"[{VERSION}] Synced global commands: {len(synced)}")
-        except Exception as e:
-            print(f"[{VERSION}] Global command sync failed: {e}")
-
-    print(f"[test] Starting {VERSION}…")
-    print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID or 'GLOBAL'}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
-
-    asyncio.create_task(rebuild_dashboard())
+    print("[test] Starting EconBot_v37…")
+    print(f"[test] Logged in as {client.user} (commands guild: {COMMANDS_GUILD_ID or 'GLOBAL'}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
 
 
 def main():
