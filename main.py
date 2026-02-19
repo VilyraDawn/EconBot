@@ -93,56 +93,369 @@ STAFF_ROLE_IDS = _parse_int_set(
 
 
 # -------------------------
-# Asset Catalog (from uploaded Asset Table.xlsx)
-# Keys: (asset_type, secondary_type, tier_name)
-# Costs are absolute (exact to spreadsheet) in Val.
+# Asset Catalog (embedded from NEW Asset Table.xlsx)
 # -------------------------
-ASSET_CATALOG: List[Dict[str, object]] = [
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 1, "tier_name": 'Apprentice', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 2, "tier_name": 'Journeyman', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 3, "tier_name": 'Leased Workshop', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 4, "tier_name": 'Small Workshop', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Guild Trade Workshop', "tier": 5, "tier_name": 'Large Workshop', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 1, "tier_name": 'Consignment Arrangement', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 2, "tier_name": 'Small Alley Stand', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 3, "tier_name": 'Market Stall', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 4, "tier_name": 'Small Shop', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Market Stall', "tier": 5, "tier_name": 'Large Shop', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 1, "tier_name": 'Subsistence Surplus', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 2, "tier_name": 'Leased Fields', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 3, "tier_name": 'Owned Acre', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 4, "tier_name": 'Small Fields and Barn', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Farm/Ranch', "tier": 5, "tier_name": 'Large Fields and Barn', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 1, "tier_name": 'One-Room Flophouse', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 2, "tier_name": 'Leased Establishment', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 3, "tier_name": 'Small Tavern', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 4, "tier_name": 'Large Tavern', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Tavern/Inn', "tier": 5, "tier_name": 'Large Tavern and Inn', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 1, "tier_name": 'Small Storage Shed', "cost_val": 300, "income_val": 50},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 2, "tier_name": 'Large Storage Shed', "cost_val": 600, "income_val": 100},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 3, "tier_name": 'Small Trading Post', "cost_val": 1200, "income_val": 150},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 4, "tier_name": 'Large Trading Post', "cost_val": 2000, "income_val": 200},
-    {"asset_type": 'Business', "secondary_type": 'Warehouse/Trade House', "tier": 5, "tier_name": 'Large Warehouse and Trading Post', "cost_val": 3000, "income_val": 250},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 1, "tier_name": 'Shack', "cost_val": 600, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 2, "tier_name": 'Hut', "cost_val": 1200, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 3, "tier_name": 'House', "cost_val": 2000, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 4, "tier_name": 'Lodge', "cost_val": 3000, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'House', "tier": 5, "tier_name": 'Mansion', "cost_val": 5000, "income_val": 0},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 1, "tier_name": 'Chartered Assembly', "cost_val": 1200, "income_val": 100},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 2, "tier_name": 'Hamlet', "cost_val": 2400, "income_val": 200},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 3, "tier_name": 'Village', "cost_val": 4800, "income_val": 300},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 4, "tier_name": 'Town', "cost_val": 9600, "income_val": 400},
-    {"asset_type": 'Holdings', "secondary_type": 'Village', "tier": 5, "tier_name": 'Small City', "cost_val": 15000, "income_val": 500},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 1, "tier_name": 'Hit +1 / Dmg +1d4', "cost_val": 300, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 2, "tier_name": 'Hit +1 / Dmg +1d6', "cost_val": 600, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 3, "tier_name": 'Hit +2 / Dmg +1d8', "cost_val": 1200, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 4, "tier_name": 'Hit +2 / Dmg +1d10', "cost_val": 2400, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Weapons', "tier": 5, "tier_name": 'Hit +2 / Dmg +1d12', "cost_val": 4800, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 1, "tier_name": 'AC +1', "cost_val": 300, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 2, "tier_name": 'AC +2', "cost_val": 600, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 3, "tier_name": 'AC +2 / Adv Magic Atk', "cost_val": 1200, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 4, "tier_name": 'AC +2 / Adv Magic and Melee Atk', "cost_val": 2400, "income_val": 0},
-    {"asset_type": 'Enchantments', "secondary_type": 'Armor', "tier": 5, "tier_name": 'AC +3 / Adv Magic and Melee Atk', "cost_val": 4800, "income_val": 0},
+ASSET_CATALOG = [
+    {
+        'asset_type': 'Guild Trade Workshop',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) Guild Apprentice',
+        'tier_num': 1,
+        'cost_val': 300,  # Val
+        'income_val': 50,  # Val/day
+    },
+    {
+        'asset_type': 'Guild Trade Workshop',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Guild Journeyman',
+        'tier_num': 2,
+        'cost_val': 600,  # Val
+        'income_val': 100,  # Val/day
+    },
+    {
+        'asset_type': 'Guild Trade Workshop',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) Leased Workshop',
+        'tier_num': 3,
+        'cost_val': 1200,  # Val
+        'income_val': 150,  # Val/day
+    },
+    {
+        'asset_type': 'Guild Trade Workshop',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Small Workshop',
+        'tier_num': 4,
+        'cost_val': 2000,  # Val
+        'income_val': 200,  # Val/day
+    },
+    {
+        'asset_type': 'Guild Trade Workshop',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Large Workshop',
+        'tier_num': 5,
+        'cost_val': 3000,  # Val
+        'income_val': 250,  # Val/day
+    },
+    {
+        'asset_type': 'Market Stall',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) Consignment Arrangement',
+        'tier_num': 1,
+        'cost_val': 300,  # Val
+        'income_val': 50,  # Val/day
+    },
+    {
+        'asset_type': 'Market Stall',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Small Alley Stand',
+        'tier_num': 2,
+        'cost_val': 600,  # Val
+        'income_val': 100,  # Val/day
+    },
+    {
+        'asset_type': 'Market Stall',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) Market Stall',
+        'tier_num': 3,
+        'cost_val': 1200,  # Val
+        'income_val': 150,  # Val/day
+    },
+    {
+        'asset_type': 'Market Stall',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Small Shop',
+        'tier_num': 4,
+        'cost_val': 2000,  # Val
+        'income_val': 200,  # Val/day
+    },
+    {
+        'asset_type': 'Market Stall',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Large Shop',
+        'tier_num': 5,
+        'cost_val': 3000,  # Val
+        'income_val': 250,  # Val/day
+    },
+    {
+        'asset_type': 'Farm/Ranch',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) Subsistence Surplus',
+        'tier_num': 1,
+        'cost_val': 300,  # Val
+        'income_val': 50,  # Val/day
+    },
+    {
+        'asset_type': 'Farm/Ranch',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Leased Fields',
+        'tier_num': 2,
+        'cost_val': 600,  # Val
+        'income_val': 100,  # Val/day
+    },
+    {
+        'asset_type': 'Farm/Ranch',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) Owned Acre',
+        'tier_num': 3,
+        'cost_val': 1200,  # Val
+        'income_val': 150,  # Val/day
+    },
+    {
+        'asset_type': 'Farm/Ranch',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Small Fields and Barn',
+        'tier_num': 4,
+        'cost_val': 2000,  # Val
+        'income_val': 200,  # Val/day
+    },
+    {
+        'asset_type': 'Farm/Ranch',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Large Fields and Barn',
+        'tier_num': 5,
+        'cost_val': 3000,  # Val
+        'income_val': 250,  # Val/day
+    },
+    {
+        'asset_type': 'Tavern/Inn',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) One-Room Flophouse',
+        'tier_num': 1,
+        'cost_val': 300,  # Val
+        'income_val': 50,  # Val/day
+    },
+    {
+        'asset_type': 'Tavern/Inn',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Leased Establishment',
+        'tier_num': 2,
+        'cost_val': 600,  # Val
+        'income_val': 100,  # Val/day
+    },
+    {
+        'asset_type': 'Tavern/Inn',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) Small Tavern',
+        'tier_num': 3,
+        'cost_val': 1200,  # Val
+        'income_val': 150,  # Val/day
+    },
+    {
+        'asset_type': 'Tavern/Inn',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Large Tavern',
+        'tier_num': 4,
+        'cost_val': 2000,  # Val
+        'income_val': 200,  # Val/day
+    },
+    {
+        'asset_type': 'Tavern/Inn',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Large Tavern and Inn',
+        'tier_num': 5,
+        'cost_val': 3000,  # Val
+        'income_val': 250,  # Val/day
+    },
+    {
+        'asset_type': 'Warehouse/Trade House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) Small Storage Shed',
+        'tier_num': 1,
+        'cost_val': 300,  # Val
+        'income_val': 50,  # Val/day
+    },
+    {
+        'asset_type': 'Warehouse/Trade House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Large Storage Shed',
+        'tier_num': 2,
+        'cost_val': 600,  # Val
+        'income_val': 100,  # Val/day
+    },
+    {
+        'asset_type': 'Warehouse/Trade House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) Small Trading Post',
+        'tier_num': 3,
+        'cost_val': 1200,  # Val
+        'income_val': 150,  # Val/day
+    },
+    {
+        'asset_type': 'Warehouse/Trade House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Large Trading Post',
+        'tier_num': 4,
+        'cost_val': 2000,  # Val
+        'income_val': 200,  # Val/day
+    },
+    {
+        'asset_type': 'Warehouse/Trade House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Large Warehouse and Trading Post',
+        'tier_num': 5,
+        'cost_val': 3000,  # Val
+        'income_val': 250,  # Val/day
+    },
+    {
+        'asset_type': 'House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) Shack',
+        'tier_num': 1,
+        'cost_val': 600,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Hut',
+        'tier_num': 2,
+        'cost_val': 1200,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) House',
+        'tier_num': 3,
+        'cost_val': 2000,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Lodge',
+        'tier_num': 4,
+        'cost_val': 3000,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'House',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Mansion',
+        'tier_num': 5,
+        'cost_val': 5000,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Village',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) Chartered Assembly',
+        'tier_num': 1,
+        'cost_val': 1200,  # Val
+        'income_val': 100,  # Val/day
+    },
+    {
+        'asset_type': 'Village',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Hamlet',
+        'tier_num': 2,
+        'cost_val': 2400,  # Val
+        'income_val': 200,  # Val/day
+    },
+    {
+        'asset_type': 'Village',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) Village',
+        'tier_num': 3,
+        'cost_val': 4800,  # Val
+        'income_val': 300,  # Val/day
+    },
+    {
+        'asset_type': 'Village',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Town',
+        'tier_num': 4,
+        'cost_val': 9600,  # Val
+        'income_val': 400,  # Val/day
+    },
+    {
+        'asset_type': 'Village',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Small City',
+        'tier_num': 5,
+        'cost_val': 15000,  # Val
+        'income_val': 500,  # Val/day
+    },
+    {
+        'asset_type': 'Weapons',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) Hit +1 / Dmg +1d4',
+        'tier_num': 1,
+        'cost_val': 300,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Weapons',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) Hit +1 / Dmg +1d6',
+        'tier_num': 2,
+        'cost_val': 600,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Weapons',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) Hit +2 / Dmg +1d8',
+        'tier_num': 3,
+        'cost_val': 1200,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Weapons',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) Hit +2 / Dmg +1d10',
+        'tier_num': 4,
+        'cost_val': 2400,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Weapons',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) Hit +2 / Dmg +1d12',
+        'tier_num': 5,
+        'cost_val': 4800,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Armor',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(1) AC +1',
+        'tier_num': 1,
+        'cost_val': 300,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Armor',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(2) AC +2',
+        'tier_num': 2,
+        'cost_val': 600,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Armor',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(3) AC +2 / Adv Magic Atk',
+        'tier_num': 3,
+        'cost_val': 1200,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Armor',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(4) AC +2 / Adv Magic and Melee Atk',
+        'tier_num': 4,
+        'cost_val': 2400,  # Val
+        'income_val': 0,  # Val/day
+    },
+    {
+        'asset_type': 'Armor',
+        'secondary_type': '',  # not used for display/selection; kept for DB compatibility
+        'tier_name': '(5) AC +3 / Adv Magic and Melee Atk',
+        'tier_num': 5,
+        'cost_val': 4800,  # Val
+        'income_val': 0,  # Val/day
+    },
 ]
 
 
@@ -574,16 +887,14 @@ async def owned_asset_name_autocomplete(interaction: discord.Interaction, curren
 # Commands
 # -------------------------
 COMMAND_HELP_LINES = [
-    "Player Commands",
-    "/balance — Show a character’s current money and owned assets. Anyone can use this; it matches the public bank dashboard.",
-    "/income — Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets.",
-    "",
-    "Staff Commands",
-    "/econ_adjust — Staff-only. Add or subtract money from a character. The bot will not allow balances to go negative.",
-    "/econ_set_balance — Staff-only. Set a character’s balance to an exact amount (non-negative). Useful for corrections.",
-    "/econ_purchase_new — Staff-only. Buy a new asset at a chosen tier (cost is tier 1 + ... + target tier, per NEW Asset Table).",
-    "/econ_refresh_bank — Staff-only. Force-refresh the Bank of Vilyra dashboard.",
-    "/econ_commands — Staff-only. Shows this command list with short descriptions (kept updated as we add features).",
+    ('/balance', 'Show a character’s current money and owned assets. Anyone can use this; it matches the public bank dashboard.'),
+    ('/income', 'Claim daily income for one of YOUR characters (once per day, Chicago time). Adds base income plus income from owned assets.'),
+    ('/econ_adjust', 'Staff-only. Add or subtract money from a character. The bot will not allow balances to go negative.'),
+    ('/econ_set_balance', 'Staff-only. Set a character’s balance to an exact amount (non-negative). Useful for corrections.'),
+    ('/econ_purchase_new', 'Staff-only. Buy a NEW asset for a character. Charges the cumulative cost of Tier 1 up to the selected Tier (no negative balances).'),
+    ('/econ_purchase_upgrade', 'Staff-only. Upgrade an EXISTING named asset to a higher tier (no downgrades). Charges the sum of the missing tiers’ costs.'),
+    ('/econ_refresh_bank', 'Staff-only. Force-refresh the Bank of Vilyra dashboard now (use if it looks out of sync).'),
+    ('/econ_commands', 'Staff-only. Shows this command list with short descriptions (kept updated as we add features).'),
 ]
 
 
@@ -818,7 +1129,7 @@ async def tier_choice_autocomplete(interaction: discord.Interaction, current: st
 
 def cumulative_tier_cost(asset_type: str, target_tier: int) -> int:
     # Sum cost to acquire for tiers 1..target_tier of the given asset_type.
-    costs = [r['cost_val'] for r in ASSET_CATALOG if r['asset_type'] == asset_type and int(r['tier']) <= int(target_tier)]
+    costs = [r['cost_val'] for r in ASSET_CATALOG if r['asset_type'] == asset_type and int(r['tier_num']) <= int(target_tier)]
     return int(sum(costs))
 
 @tree.command(name="econ_purchase_new", description="Staff: buy a new asset for a character (tier 1..target tier cost, no negative balances).")
@@ -833,18 +1144,17 @@ async def econ_purchase_new(interaction: discord.Interaction, character: str, ti
         return
 
     try:
-        asset_type, tier_name = _parse_tier_choice_value(tier_choice)
+        asset_type, tier_name, tier_num = _parse_tier_choice_value(tier_choice)
     except Exception:
         await interaction.followup.send("Invalid tier selection.", ephemeral=True)
         return
 
-    row = next((r for r in ASSET_CATALOG if r['asset_type'] == asset_type and r['tier_name'] == tier_name), None)
+    row = next((r for r in ASSET_CATALOG if r['asset_type'] == asset_type and r['tier_name'] == tier_name and int(r['tier_num']) == int(tier_num)), None)
     if not row:
         await interaction.followup.send("That asset tier was not found in the NEW Asset Table.", ephemeral=True)
         return
 
-    target_tier = int(row['tier'])
-    total_cost = cumulative_tier_cost(asset_type, target_tier)
+    total_cost = cumulative_tier_cost(asset_type, int(tier_num))
 
     async with pool.acquire() as con:
         # Find character (legacy table) to get owner user_id
