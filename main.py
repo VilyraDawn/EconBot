@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v50"
+APP_VERSION = "EconBot_v51"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -272,6 +272,15 @@ class AssetCatalog:
         return None
 
     def load(self):
+        # Startup diagnostics so Railway logs clearly show where the bot is looking.
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            here = '(unknown)'
+        print(f"[debug] cwd: {os.getcwd()}")
+        print(f"[debug] script dir: {here}")
+        self._debug_listdir('/app')
+        self._debug_listdir(os.getcwd())
         self.rows = []
         self.by_type = {}
         self.by_type_tier = {}
@@ -871,6 +880,8 @@ async def on_ready():
     await db.init()
 
     assets.load()
+    if not assets.is_loaded():
+        print(f"[FATAL] Asset spreadsheet missing. You must deploy '{ASSET_XLSX_FILENAME}' into /app. Purchase commands will not function.")
 
     guild_obj = discord.Object(id=int(GUILD_ID))
 
