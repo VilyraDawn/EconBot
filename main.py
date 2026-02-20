@@ -7,7 +7,7 @@ from discord import app_commands
 import asyncpg
 import re
 
-APP_VERSION = "EconBot_v63"
+APP_VERSION = "EconBot_v64"
 LAST_MEMBER_FETCH_ERROR = ""
 
 # --- Timezone handling (Railway-safe) ---
@@ -206,6 +206,39 @@ class DB:
               action TEXT NOT NULL,
               details JSONB NOT NULL DEFAULT '{}'::jsonb
             );""")
+
+            # --- Data continuity: migrate econ tables from LEGACY_SOURCE_GUILD_ID to GUILD_ID (one-time, non-destructive) ---
+            try:
+                if int(LEGACY_SOURCE_GUILD_ID) != int(GUILD_ID):
+                    # only migrate if target guild has no balances yet but legacy does
+                    legacy_bal = await con.fetchval("SELECT COUNT(*) FROM econ_balances WHERE guild_id=$1;", int(LEGACY_SOURCE_GUILD_ID))
+                    target_bal = await con.fetchval("SELECT COUNT(*) FROM econ_balances WHERE guild_id=$1;", int(GUILD_ID))
+                    if int(legacy_bal or 0) > 0 and int(target_bal or 0) == 0:
+                        await con.execute("""
+                            INSERT INTO econ_balances (guild_id, character_name, balance_val, updated_at)
+                            SELECT $2, character_name, balance_val, updated_at
+                            FROM econ_balances WHERE guild_id=$1
+                            ON CONFLICT (guild_id, character_name) DO NOTHING;
+                        """, int(LEGACY_SOURCE_GUILD_ID), int(GUILD_ID))
+                        await con.execute("""
+                            INSERT INTO econ_income_claims (guild_id, character_name, last_claim_date)
+                            SELECT $2, character_name, last_claim_date
+                            FROM econ_income_claims WHERE guild_id=$1
+                            ON CONFLICT (guild_id, character_name) DO NOTHING;
+                        """, int(LEGACY_SOURCE_GUILD_ID), int(GUILD_ID))
+                        # econ_assets has no PK in this build; dedupe by natural key (guild,user,character,asset_name,type,tier)
+                        await con.execute("""
+                            INSERT INTO econ_assets (guild_id, character_name, asset_type, tier, created_at, updated_at, asset_name, user_id)
+                            SELECT $2, character_name, asset_type, tier, created_at, updated_at, COALESCE(asset_name,''), COALESCE(user_id,0)
+                            FROM econ_assets WHERE guild_id=$1
+                        """, int(LEGACY_SOURCE_GUILD_ID), int(GUILD_ID))
+                        await con.execute("""
+                            INSERT INTO econ_audit_log (guild_id, actor_user_id, action, details)
+                            VALUES ($1, 0, 'auto_migrate_legacy_guild', jsonb_build_object('from', $2, 'to', $1));
+                        """, int(GUILD_ID), int(LEGACY_SOURCE_GUILD_ID))
+            except Exception:
+                pass
+
 
             # NEW: Asset catalog table (requested)
             await con.execute("""
@@ -533,9 +566,7 @@ def can_refresh_bank(member: Optional[discord.Member]) -> bool:
 
     # User-ID allowlist fallback
     try:
-        if int(getattr(member, "id", 0)) in STAFF_USER_IDS_ALLOWLIST:
-            return True
-    except Exception:
+            except Exception:
         pass
     try:
         if member.guild_permissions.administrator:
@@ -556,7 +587,7 @@ GUILD_OBJ = discord.Object(id=int(GUILD_ID))
 
 async def character_autocomplete(interaction: discord.Interaction, current: str):
     try:
-        res = await db.search_characters(LEGACY_SOURCE_GUILD_ID, current or "", 25)
+        res = await db.search_characters(GUILD_ID, current or "", 25)
         return [app_commands.Choice(name=n, value=n) for n, _uid in res]
     except Exception:
         return []
@@ -898,41 +929,12 @@ async def on_ready():
 
     guild_obj = discord.Object(id=int(GUILD_ID))
 
-    # --- HARD cleanup of duplicates (requested) ---
-    # Delete ALL 'purchase_new' commands registered globally and in this guild, then re-sync guild-only.
+    # --- Command sync (guild-only) ---
+synced = await tree.sync(guild=guild_obj)
     try:
-        # Global commands
-        try:
-            global_cmds = await tree.fetch_commands()  # global
-            for c in global_cmds:
-                if getattr(c, "name", "") == "purchase_new":
-                    try:
-                        await c.delete()
-                        print("[test] Deleted GLOBAL /purchase_new (cleanup).")
-                    except Exception as e:
-                        print(f"[warn] Failed to delete GLOBAL /purchase_new: {e}")
-        except Exception as e:
-            print(f"[warn] Global command fetch skipped: {e}")
-
-        # Guild commands
-        try:
-            guild_cmds = await tree.fetch_commands(guild=guild_obj)
-            for c in guild_cmds:
-                if getattr(c, "name", "") == "purchase_new":
-                    try:
-                        await c.delete()
-                        print("[test] Deleted GUILD /purchase_new (cleanup).")
-                    except Exception as e:
-                        print(f"[warn] Failed to delete GUILD /purchase_new: {e}")
-        except Exception as e:
-            print(f"[warn] Guild command fetch skipped: {e}")
-
-    except Exception as e:
-        print(f"[warn] Duplicate cleanup step failed: {e}")
-
-    # Sync guild-only command set
-    try:
-        synced = await tree.sync(guild=guild_obj)
+        print('[test] Synced commands: ' + ', '.join([c.name for c in synced]))
+    except Exception:
+        pass
         print(f"[test] Synced {len(synced)} guild command(s).")
     except Exception as e:
         print(f"[warn] Guild sync failed: {e}")
