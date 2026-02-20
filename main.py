@@ -7,7 +7,7 @@ from discord import app_commands
 import asyncpg
 import re
 
-APP_VERSION = "EconBot_v66"
+APP_VERSION = "EconBot_v68"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -72,6 +72,9 @@ DATABASE_URL = _req("DATABASE_URL")
 GUILD_ID = _int("GUILD_ID")
 if not GUILD_ID:
     raise RuntimeError("Missing required env var: GUILD_ID")
+# Econ data is stored under the legacy source guild partition in Postgres.
+DATA_GUILD_ID = int(LEGACY_SOURCE_GUILD_ID)
+
 
 # Characters source (already in your DB)
 LEGACY_SOURCE_GUILD_ID = _int("LEGACY_SOURCE_GUILD_ID") or 0
@@ -514,10 +517,11 @@ def can_refresh_bank(member: Optional[discord.Member]) -> bool:
         return True
     return is_staff_member(member)
 
-intents = discord.Intents.none()
+intents = discord.Intents.default()
+intents.members = True  # needed to read member roles for staff checks
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-GUILD_OBJ = discord.Object(id=int(GUILD_ID))
+GUILD_OBJ = discord.Object(id=int(DATA_GUILD_ID))
 
 # ---------------------- Autocomplete callbacks ----------------------
 
@@ -634,7 +638,7 @@ async def cmd_balance(interaction: discord.Interaction, character: str):
     embed = await build_balance_embed(interaction.guild, character)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).", guild=GUILD_OBJ)
+@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time, guild=GUILD_OBJ).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick one of your characters")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_income(interaction: discord.Interaction, character: str):
@@ -654,7 +658,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     async with db.pool.acquire() as con:
         row = await con.fetchrow(
             "SELECT last_claim_date FROM econ_income_claims WHERE guild_id=$1 AND character_name=$2;",
-            int(g.id), str(character)
+            int(DATA_GUILD_ID), str(character)
         )
         if row and row["last_claim_date"] == today:
             return await interaction.followup.send("You already claimed income for this character today (Chicago time).", ephemeral=True)
@@ -670,14 +674,14 @@ async def cmd_income(interaction: discord.Interaction, character: str):
             VALUES ($1,$2,$3,NOW())
             ON CONFLICT (guild_id, character_name)
             DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW();
-        """, int(g.id), str(character), int(new_bal))
+        """, int(DATA_GUILD_ID), str(character), int(new_bal))
 
         await con.execute("""
             INSERT INTO econ_income_claims (guild_id, character_name, last_claim_date)
             VALUES ($1,$2,$3)
             ON CONFLICT (guild_id, character_name)
             DO UPDATE SET last_claim_date=EXCLUDED.last_claim_date;
-        """, int(g.id), str(character), today)
+        """, int(DATA_GUILD_ID), str(character), today)
 
     await db.log(g.id, interaction.user.id, "income", {
         "character": character,
@@ -695,7 +699,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     except Exception:
         pass
 
-@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).", guild=GUILD_OBJ)
+@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced, guild=GUILD_OBJ).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", delta_val="Positive or negative Val", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delta_val: int, reason: Optional[str] = None):
@@ -721,7 +725,7 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
     except Exception:
         pass
 
-@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).", guild=GUILD_OBJ)
+@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative, guild=GUILD_OBJ).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", new_balance_val="New balance in Val (>=0)", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction: discord.Interaction, character: str, new_balance_val: int, reason: Optional[str] = None):
@@ -855,6 +859,34 @@ async def cmd_econ_commands(interaction: discord.Interaction):
     )
     await interaction.followup.send(text, ephemeral=True)
 
+
+async def _cleanup_global_commands(tree: app_commands.CommandTree) -> None:
+    """One-time cleanup: remove lingering GLOBAL commands so only guild-scoped commands remain.
+
+    Strategy:
+    - If any global commands exist, delete them individually.
+    - We do NOT register any global commands in this bot; all commands are guild-scoped.
+    """
+    try:
+        global_cmds = await tree.fetch_commands()  # global
+    except Exception as e:
+        print(f"[warn] Global command fetch failed: {e}")
+        return
+
+    if not global_cmds:
+        return
+
+    deleted = 0
+    for c in global_cmds:
+        try:
+            await c.delete()
+            deleted += 1
+        except Exception as e:
+            print(f"[warn] Failed to delete GLOBAL /{getattr(c,'name','?')}: {e}")
+
+    print(f"[test] Deleted {deleted} GLOBAL command(s) (dedupe cleanup).")
+
+
 @client.event
 async def on_ready():
     print(f"[test] Starting {APP_VERSION}…")
@@ -865,37 +897,8 @@ async def on_ready():
 
     guild_obj = discord.Object(id=int(GUILD_ID))
 
-    # --- HARD cleanup of duplicates (requested) ---
-    # Delete ALL 'purchase_new' commands registered globally and in this guild, then re-sync guild-only.
-    try:
-        # Global commands
-        try:
-            global_cmds = await tree.fetch_commands()  # global
-            for c in global_cmds:
-                if getattr(c, "name", "") == "purchase_new":
-                    try:
-                        await c.delete()
-                        print("[test] Deleted GLOBAL /purchase_new (cleanup).")
-                    except Exception as e:
-                        print(f"[warn] Failed to delete GLOBAL /purchase_new: {e}")
-        except Exception as e:
-            print(f"[warn] Global command fetch skipped: {e}")
-
-        # Guild commands
-        try:
-            guild_cmds = await tree.fetch_commands(guild=guild_obj)
-            for c in guild_cmds:
-                if getattr(c, "name", "") == "purchase_new":
-                    try:
-                        await c.delete()
-                        print("[test] Deleted GUILD /purchase_new (cleanup).")
-                    except Exception as e:
-                        print(f"[warn] Failed to delete GUILD /purchase_new: {e}")
-        except Exception as e:
-            print(f"[warn] Guild command fetch skipped: {e}")
-
-    except Exception as e:
-        print(f"[warn] Duplicate cleanup step failed: {e}")
+    # Global dedupe cleanup: remove lingering GLOBAL commands so only guild-scoped remain
+    await _cleanup_global_commands(tree)
 
     # Sync guild-only command set
     try:
@@ -907,7 +910,7 @@ async def on_ready():
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
 
     try:
-        g = client.get_guild(int(GUILD_ID))
+        g = client.get_guild(int(DATA_GUILD_ID))
         if g:
             await refresh_bank_dashboard(g)
     except Exception as e:
