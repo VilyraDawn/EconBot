@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v58"
+APP_VERSION = "EconBot_v59"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -38,24 +38,21 @@ def _int(name: str, default: Optional[int] = None) -> Optional[int]:
         return default
 
 def _int_list(name: str) -> List[int]:
-    """Parse IDs from an env var.
-
-    Accepts raw IDs or Discord role mention formats like <@&123>.
-    Allows comma/space/newline-separated values.
-    """
+    """Parse IDs from an env var (robust + syntax-safe)."""
     raw = _get(name, "") or ""
-    if not str(raw).strip():
+    raw = str(raw)
+    if not raw.strip():
         return []
-    chunks = str(raw).replace("
-", ",").replace("	", ",").replace(" ", ",").split(",")
+    cleaned = raw.replace("
+", ",").replace("	", ",").replace(" ", ",")
+    parts = cleaned.split(",")
     out: List[int] = []
     seen: set[int] = set()
-    for c in chunks:
-        c = c.strip()
-        if not c:
+    for p in parts:
+        p = p.strip()
+        if not p:
             continue
-        # Strip non-digits (handles <@&123>, etc.)
-        digits = re.sub(r"[^0-9]", "", c)
+        digits = re.sub(r"[^0-9]", "", p)
         if not digits:
             continue
         try:
