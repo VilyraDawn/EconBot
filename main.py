@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v79"
+APP_VERSION = "EconBot_v81"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -144,7 +144,7 @@ async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional
 
 
 def format_currency(total_cinth: int) -> str:
-    """Compact currency string with roll-up to highest denominations, dropping zeros, plus raw total."""
+    """Compact currency with roll-up to highest denominations, dropping zeros, plus raw total."""
     try:
         total = int(total_cinth)
     except Exception:
@@ -154,15 +154,15 @@ def format_currency(total_cinth: int) -> str:
     n = abs(total)
 
     denominations = [
-        (10000, "Mythic Crystal Novir", "Novir"),
-        (1000, "Platinum Oril", "Oril"),
-        (100, "Gold Elsh", "Elsh"),
-        (10, "Silver Arce", "Arce"),
-        (1, "Copper Cinth", "Cinth"),
+        (10000, "Novir"),
+        (1000, "Oril"),
+        (100, "Elsh"),
+        (10, "Arce"),
+        (1, "Cinth"),
     ]
 
-    parts = []
-    for value, _full, short in denominations:
+    parts: List[str] = []
+    for value, short in denominations:
         if n <= 0:
             break
         qty, n = divmod(n, value)
@@ -175,23 +175,109 @@ def format_currency(total_cinth: int) -> str:
     compact = " • ".join(parts)
     return f"{sign}{compact} (Total: {total:,} Copper Cinth)"
 
-    if target_rank is not None:
-        total = 0
-        found_any = False
-        for r in rows:
-            tr = _tier_rank(str(r["tier"]))
-            if tr is None:
-                continue
-            if tr <= target_rank:
-                found_any = True
-                total += int(r["cost_val"])
-        if found_any:
-            return int(total)
 
-    for r in rows:
-        if str(r["tier"]) == str(target_tier):
-            return int(r["cost_val"])
-    return None
+async def get_assets_for_character(character_name: str) -> List[Dict[str, Any]]:
+    """Return full asset rows for a character."""
+    rows = await db_fetch(
+        '''
+        SELECT asset_type, tier, asset_name
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2
+        ''',
+        DATA_GUILD_ID,
+        character_name,
+    )
+    # sort by asset_type, then tier rank, then name
+    def _key(r: Dict[str, Any]) -> Tuple[str, int, str]:
+        t = str(r.get("tier", ""))
+        rk = _tier_rank(t)
+        if rk is None:
+            rk = 9999
+        return (str(r.get("asset_type", "")), rk, str(r.get("asset_name", "")))
+    return sorted(rows, key=_key)
+
+
+async def render_character_card(
+    guild: discord.Guild,
+    character_name: str,
+    owner_id: Optional[int] = None,
+) -> List[str]:
+    """Render a single character card (no pings). Returns list of lines."""
+    if owner_id is None:
+        owner_id = await get_character_owner(character_name)
+
+    owner_display = "Unknown"
+    if owner_id is not None:
+        m = guild.get_member(int(owner_id))
+        if m is None:
+            try:
+                m = await guild.fetch_member(int(owner_id))
+            except Exception:
+                m = None
+        owner_display = m.display_name if m else f"User {owner_id}"
+
+    bal = await get_balance(character_name)
+    inc = await recompute_daily_income(character_name)
+    assets = await get_assets_for_character(character_name)
+
+    out: List[str] = []
+    out.append("━━━━━━━━━━━━━━━━━━")
+    out.append(f"**{character_name}**  ·  *{owner_display}*")
+    out.append(f"💰 **Balance:** {format_currency(bal)}")
+    out.append(f"🌙 **Daily Income:** {format_currency(inc)}")
+
+    if assets:
+        out.append(f"🏷️ **Assets ({len(assets)}):**")
+        for a in assets:
+            out.append(f"- {a['asset_type']} | {a['tier']} | {a['asset_name']}")
+    else:
+        out.append("🏷️ **Assets:** (none)")
+
+    out.append("")  # spacer
+    return out
+
+
+async def render_leaderboard_lines(
+    guild: discord.Guild,
+    rows: List[Tuple[str, int, int, int]],
+) -> List[str]:
+    """rows: [(character_name, owner_id, balance, income)]"""
+    # Top balances
+    top_bal = sorted(rows, key=lambda r: int(r[2]), reverse=True)[:10]
+    top_inc = sorted(rows, key=lambda r: int(r[3]), reverse=True)[:10]
+
+    # resolve owner display names (no pings)
+    cache: Dict[int, str] = {}
+    async def dn(uid: int) -> str:
+        if uid in cache:
+            return cache[uid]
+        m = guild.get_member(uid)
+        if m is None:
+            try:
+                m = await guild.fetch_member(uid)
+            except Exception:
+                m = None
+        cache[uid] = m.display_name if m else f"User {uid}"
+        return cache[uid]
+
+    out: List[str] = []
+    out.append("🏆 **Leaderboards**")
+    out.append("━━━━━━━━━━━━━━━━━━")
+    out.append("**Top Balances**")
+    if not top_bal:
+        out.append("- (none)")
+    else:
+        for i, (c, uid, bal, inc) in enumerate(top_bal, start=1):
+            out.append(f"{i}. **{c}** — *{await dn(uid)}* — {format_currency(bal)}")
+    out.append("")
+    out.append("**Top Daily Income**")
+    if not top_inc:
+        out.append("- (none)")
+    else:
+        for i, (c, uid, bal, inc) in enumerate(top_inc, start=1):
+            out.append(f"{i}. **{c}** — *{await dn(uid)}* — {format_currency(inc)}")
+    out.append("")
+    return out
 
 
 # Approved env vars (per continuity doc)
@@ -725,58 +811,65 @@ async def save_bank_message_ids(message_ids: List[int]) -> None:
 
 
 async def render_bank_lines(guild: discord.Guild) -> List[str]:
-    # Bank shows balances grouped by character owner, WITHOUT pings/mentions.
-    # We render display names (server nicknames) for visual appeal.
+    # Bank shows balances grouped as:
+    # 1) Leaderboards (top balance + top income)
+    # 2) Full character "card rows" including full asset list (no pings)
+
     chars = await db_fetch(
-        """
+        '''
         SELECT user_id, name
         FROM characters
         WHERE guild_id=$1 AND archived=FALSE
-        ORDER BY user_id, name;
-        """,
+        ORDER BY name ASC;
+        ''',
         DATA_GUILD_ID,
     )
-    by_user: Dict[int, List[str]] = {}
+
+    now = datetime.now(CHICAGO_TZ)
+    out: List[str] = [
+        f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    if not chars:
+        return out + ["No characters found in DB."]
+
+    # Precompute balance+income for leaderboards
+    rows: List[Tuple[str, int, int, int]] = []
     for r in chars:
+        cname = str(r["name"])
         uid = int(r["user_id"])
-        by_user.setdefault(uid, []).append(str(r["name"]))
+        bal = await get_balance(cname)
+        inc = await recompute_daily_income(cname)
+        rows.append((cname, uid, bal, inc))
 
-    # Resolve display names
-    name_cache: Dict[int, str] = {}
+    out += await render_leaderboard_lines(guild, rows)
 
-    async def display_name(uid: int) -> str:
-        if uid in name_cache:
-            return name_cache[uid]
+    out.append("📜 **Ledger Entries**")
+    out.append("━━━━━━━━━━━━━━━━━━")
+    out.append("")
+
+    # Render full character cards (sorted by owner then name for readability)
+    # build owner display cache
+    cache: Dict[int, str] = {}
+    async def dn(uid: int) -> str:
+        if uid in cache:
+            return cache[uid]
         m = guild.get_member(uid)
         if m is None:
             try:
                 m = await guild.fetch_member(uid)
             except Exception:
                 m = None
-        if m is None:
-            name_cache[uid] = f"User {uid}"
-        else:
-            name_cache[uid] = m.display_name
-        return name_cache[uid]
+        cache[uid] = m.display_name if m else f"User {uid}"
+        return cache[uid]
 
-    # Build pretty markdown
-    now = datetime.now(CHICAGO_TZ)
-    header = f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)"
-    lines: List[str] = [header, "━━━━━━━━━━━━━━━━━━", ""]
+    rows_sorted = sorted(rows, key=lambda r: (int(r[1]), str(r[0]).lower()))
+    for cname, uid, bal, inc in rows_sorted:
+        out += await render_character_card(guild, cname, owner_id=uid)
 
-    if not by_user:
-        return lines + ["No characters found in DB."]
-
-    for uid in sorted(by_user.keys(), key=lambda x: (str(x))):
-        dn = await display_name(uid)
-        lines.append(f"**{dn}**")
-        # Render characters in a neat table-like style
-        for cname in by_user[uid]:
-            bal = await get_balance(cname)
-            lines.append(f"`{cname:<24}`  **{bal:>10,}**")
-        lines.append("")  # spacer
-
-    return lines
+    return out
 
 
 async def refresh_bank_dashboard(create_missing: bool = True) -> None:
@@ -846,8 +939,23 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_balance(interaction: discord.Interaction, character: str):
     await interaction.response.defer(ephemeral=True)
-    bal = await get_balance(character)
-    await interaction.followup.send(f"**{character}** balance: **{format_currency(bal)}**", ephemeral=True)
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("This command must be used in a server.", ephemeral=True)
+        return
+    card_lines = await render_character_card(guild, character)
+    # render as a single message if possible
+    txt = "\n".join(card_lines).strip()
+    if len(txt) > 1900:
+        # truncate assets if too long for ephemeral message
+        trimmed: List[str] = []
+        for ln in card_lines:
+            if len("\n".join(trimmed + [ln])) > 1800:
+                trimmed.append("… (truncated)")
+                break
+            trimmed.append(ln)
+        txt = "\n".join(trimmed).strip()
+    await interaction.followup.send(txt, ephemeral=True)
 
 
 @tree.command(name="income", description="Claim daily income for a character.", guild=discord.Object(id=GUILD_ID))
@@ -1062,7 +1170,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
 
     await interaction.followup.send(
         f"Recorded purchase for **{character}**:\n"
-        f"• **{asset_type}** — Tier **{tier}** — **{asset_name}**\n"
+        f"• **{asset_type}** | **{tier}** | **{asset_name}**\n"
         f"Cost: **{format_currency(cost_val)}** (new balance **{format_currency(new_bal)}**)\n"
         f"Daily income now: **{format_currency(new_daily_income)}**",
         ephemeral=True,
