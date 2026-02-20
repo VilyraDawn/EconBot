@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v78"
+APP_VERSION = "EconBot_v79"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -92,8 +92,13 @@ def _tier_rank(tier: str) -> Optional[int]:
 
 
 async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional[int]:
-    """Cost is the sum of all tier costs crossed to reach target tier for that asset_type."""
+    """Cumulative cost: sum of all tier costs up to and including target tier for an asset type.
+
+    Requires tiers to be ordered by a numeric rank embedded in the tier label, e.g. '(1) ...', '(2) ...'.
+    Falls back to the target tier's own cost if ranks are not parseable.
+    """
     target_rank = _tier_rank(target_tier)
+
     rows = await db_fetch(
         '''
         SELECT tier, cost_val
@@ -104,6 +109,38 @@ async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional
     )
     if not rows:
         return None
+
+    # Normalize tier strings once
+    norm_rows = []
+    for r in rows:
+        t = str(r["tier"]).strip()
+        try:
+            c = int(r["cost_val"])
+        except Exception:
+            continue
+        norm_rows.append((t, c, _tier_rank(t)))
+
+    # If the selected tier has a rank, sum all rows with rank <= target_rank
+    if target_rank is not None:
+        total = 0
+        found = False
+        for t, c, rk in norm_rows:
+            if rk is None:
+                continue
+            if rk <= target_rank:
+                total += c
+                found = True
+        if found:
+            return total
+
+    # Fallback: just use the selected tier's own cost
+    target_norm = str(target_tier).strip()
+    for t, c, rk in norm_rows:
+        if t == target_norm:
+            return c
+
+    return None
+
 
 
 def format_currency(total_cinth: int) -> str:
