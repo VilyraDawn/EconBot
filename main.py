@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v55"
+APP_VERSION = "EconBot_v57"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -38,12 +38,34 @@ def _int(name: str, default: Optional[int] = None) -> Optional[int]:
         return default
 
 def _int_list(name: str) -> List[int]:
-    v = _get(name, "") or ""
+    """Parse IDs from an env var.
+
+    Accepts raw IDs or Discord role mention formats like <@&123>.
+    Allows comma/space/newline-separated values.
+    """
+    raw = _get(name, "") or ""
+    if not str(raw).strip():
+        return []
+    chunks = str(raw).replace("
+", ",").replace("	", ",").replace(" ", ",").split(",")
     out: List[int] = []
-    for p in v.split(","):
-        p = p.strip()
-        if p.isdigit():
-            out.append(int(p))
+    seen: set[int] = set()
+    for c in chunks:
+        c = c.strip()
+        if not c:
+            continue
+        # Strip non-digits (handles <@&123>, etc.)
+        digits = re.sub(r"[^0-9]", "", c)
+        if not digits:
+            continue
+        try:
+            val = int(digits)
+        except Exception:
+            continue
+        if val in seen:
+            continue
+        seen.add(val)
+        out.append(val)
     return out
 
 DISCORD_TOKEN = _req("DISCORD_TOKEN")
@@ -62,6 +84,12 @@ ECON_LOG_CHANNEL_ID = _int("ECON_LOG_CHANNEL_ID") or 0
 BANK_MESSAGE_IDS = _int_list("BANK_MESSAGE_IDS")
 
 STAFF_ROLE_IDS = set(_int_list("STAFF_ROLE_IDS"))
+# Fallback default STAFF role IDs (used only if STAFF_ROLE_IDS env is missing/empty).
+# Provided by you (role IDs):
+STAFF_ROLE_IDS_DEFAULT = {1473523681132019824, 1473523738891784232}
+if not STAFF_ROLE_IDS:
+    STAFF_ROLE_IDS = set(STAFF_ROLE_IDS_DEFAULT)
+
 BANK_REFRESH_ROLE_IDS = set(_int_list("BANK_REFRESH_ROLE_IDS"))
 
 # Currency
@@ -430,6 +458,7 @@ def is_staff_member(member: discord.Member | None) -> bool:
     """Pure staff predicate once we have a Member."""
     if member is None:
         return False
+
     try:
         gp = getattr(member, "guild_permissions", None)
         if gp and gp.administrator:
@@ -460,7 +489,8 @@ async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
     dbg = (
         f"Your user_id: {interaction.user.id}\n"
         f"Detected role IDs: {role_ids}\n"
-        f"Configured STAFF_ROLE_IDS: {sorted(list(STAFF_ROLE_IDS))}\n"
+        f"Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}\n"
+        f"Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}\n"
         f"Admin: {bool(getattr(gp,'administrator', False))}\n"
         f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}\n"
         f"Manage Messages: {bool(getattr(gp,'manage_messages', False))}"
@@ -471,6 +501,13 @@ async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
 def can_refresh_bank(member: Optional[discord.Member]) -> bool:
     if member is None:
         return False
+
+    # User-ID allowlist fallback
+    try:
+        if int(getattr(member, "id", 0)) in STAFF_USER_IDS_ALLOWLIST:
+            return True
+    except Exception:
+        pass
     try:
         if member.guild_permissions.administrator:
             return True
@@ -824,6 +861,9 @@ async def cmd_econ_commands(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     print(f"[test] Starting {APP_VERSION}…")
+    print(f"[debug] raw STAFF_ROLE_IDS env: {os.getenv('STAFF_ROLE_IDS', '')!r}")
+    print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
+    print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
     await db.init()
 
     guild_obj = discord.Object(id=int(GUILD_ID))
