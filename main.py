@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v75"
+APP_VERSION = "EconBot_v76"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -73,6 +73,55 @@ def _int_list(name: str) -> List[int]:
                 pass
     # de-dupe stable
     return sorted(list(dict.fromkeys(out)))
+
+
+def _tier_rank(tier: str) -> Optional[int]:
+    """Extract numeric rank from tier labels like '(3) Small Tavern'."""
+    if tier is None:
+        return None
+    s = str(tier).strip()
+    m = re.match(r"^\(\s*(\d+)\s*\)", s)
+    if not m:
+        m = re.match(r"^(\d+)", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional[int]:
+    """Cost is the sum of all tier costs crossed to reach target tier for that asset_type."""
+    target_rank = _tier_rank(target_tier)
+    rows = await db_fetch(
+        '''
+        SELECT tier, cost_val
+        FROM econ_asset_definitions
+        WHERE asset_type=$1;
+        ''',
+        asset_type,
+    )
+    if not rows:
+        return None
+
+    if target_rank is not None:
+        total = 0
+        found_any = False
+        for r in rows:
+            tr = _tier_rank(str(r["tier"]))
+            if tr is None:
+                continue
+            if tr <= target_rank:
+                found_any = True
+                total += int(r["cost_val"])
+        if found_any:
+            return int(total)
+
+    for r in rows:
+        if str(r["tier"]) == str(target_tier):
+            return int(r["cost_val"])
+    return None
 
 
 # Approved env vars (per continuity doc)
@@ -218,6 +267,46 @@ async def ensure_schema() -> None:
         );
         """
     )
+
+
+    # Adjust econ_assets unique constraint so the same asset_name can be reused across different asset_type/tier.
+    # Desired uniqueness: (guild_id, user_id, character_name, asset_type, tier, asset_name)
+    try:
+        rows = await db_fetch(
+            '''
+            SELECT conname, pg_get_constraintdef(c.oid) AS def
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            WHERE t.relname = 'econ_assets' AND c.contype = 'u';
+            '''
+        )
+        for r in rows:
+            conname = str(r["conname"])
+            cdef = str(r["def"]).replace('"', "")
+            if "UNIQUE" in cdef and "(guild_id, user_id, character_name, asset_name)" in cdef:
+                await db_exec(f'ALTER TABLE econ_assets DROP CONSTRAINT IF EXISTS "{conname}";')
+                print(f"[test] Dropped old econ_assets unique constraint: {conname}")
+
+        exists = await db_fetchrow(
+            '''
+            SELECT 1
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            WHERE t.relname='econ_assets' AND c.contype='u' AND c.conname='econ_assets_unique_name_per_type_tier'
+            LIMIT 1;
+            '''
+        )
+        if not exists:
+            await db_exec(
+                '''
+                ALTER TABLE econ_assets
+                ADD CONSTRAINT econ_assets_unique_name_per_type_tier
+                UNIQUE (guild_id, user_id, character_name, asset_type, tier, asset_name);
+                '''
+            )
+            print("[test] Added unique constraint econ_assets_unique_name_per_type_tier")
+    except Exception as e:
+        print(f"[warn] econ_assets unique-constraint adjustment skipped/failed: {e}")
 
 
 # -------------------------
@@ -815,20 +904,44 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
 
     # Validate asset definition exists
     adef = await get_asset_def(asset_type, tier)
-    if not adef:
-        await interaction.followup.send("Invalid asset type/tier (not found in asset definitions).", ephemeral=True)
-        return
-    cost_val, add_income_val = adef
+if not adef:
+    await interaction.followup.send("Invalid asset type/tier (not found in asset definitions).", ephemeral=True)
+    return
+_tier_cost_val, add_income_val = adef
 
-    # Deduct cost (cumulative tier crossing not supported without tier order logic in definitions).
-    # v38 doctrine says cumulative cost across tiers; if tier order is encoded in sheet as increasing tiers,
-    # that logic should be in definitions. Here we treat cost_val as total-to-tier cost.
-    cur_bal = await get_balance(character)
+# Cost is cumulative across tiers up to the selected target tier.
+cost_val = await cumulative_cost_to_tier(asset_type, tier)
+if cost_val is None:
+    await interaction.followup.send("Unable to compute cumulative cost for this asset type/tier.", ephemeral=True)
+    return
+
+cur_bal = await get_balance(character)
     if cur_bal < cost_val:
         await interaction.followup.send(f"Insufficient funds. Balance **{cur_bal:,}**, cost **{cost_val:,}**.", ephemeral=True)
         return
 
-    # Record asset
+# Allow same asset_name across different asset_type/tier, but not duplicates within the same type+tier.
+exists = await db_fetchrow(
+    '''
+    SELECT 1
+    FROM econ_assets
+    WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+    LIMIT 1;
+    ''',
+    DATA_GUILD_ID,
+    character,
+    asset_type,
+    tier,
+    asset_name,
+)
+if exists:
+    await interaction.followup.send(
+        "That character already has an asset with the same **type, tier, and name**. Choose a different name or tier.",
+        ephemeral=True,
+    )
+    return
+
+# Record asset
     try:
         await db_exec(
             """
@@ -844,7 +957,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
         )
     except Exception as e:
         # uniqueness: (guild_id, user_id, character_name, asset_name)
-        await interaction.followup.send(f"Failed to add asset (possibly duplicate asset name): {e}", ephemeral=True)
+        await interaction.followup.send(f"Failed to add asset (see logs for details): {e}", ephemeral=True)
         return
 
     # Deduct cost
