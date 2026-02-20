@@ -5,8 +5,9 @@ from typing import Optional, List, Tuple
 import discord
 from discord import app_commands
 import asyncpg
+import re
 
-APP_VERSION = "EconBot_v65"
+APP_VERSION = "EconBot_v66"
 
 # --- Timezone handling (Railway-safe) ---
 try:
