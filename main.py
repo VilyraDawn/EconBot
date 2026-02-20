@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v87"
+APP_VERSION = "EconBot_v88"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1164,7 +1164,30 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
 async def cmd_econ_set_balance(interaction: discord.Interaction, character: str, value: int):
     await interaction.response.defer(ephemeral=True)
 
-@tree.command(name="upgrade_asset", description="Upgrade an existing asset to a higher tier (deducts upgrade cost).")
+    value = int(value)
+    if value < 0:
+        cur_bal = await get_balance(character)
+        await interaction.followup.send(
+            f"Denied: balance cannot be set to a negative value.
+"
+            f"Current balance: **{format_currency(cur_bal)}**
+"
+            f"Attempted set value: **{format_currency(value)}**",
+            ephemeral=True,
+        )
+        return
+
+    await set_balance(character, value)
+    await log_audit(interaction, "set_balance", {"character": character, "value": value})
+    try:
+        await refresh_bank_messages()
+    except Exception:
+        pass
+    await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
+
+
+@tree.command(name="upgrade_asset", description="Upgrade an existing asset to a higher tier (deducts upgrade cost).", guild=discord.Object(id=GUILD_ID))
+@staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character, target_tier=ac_target_tier)
 async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, asset: str, target_tier: str):
     await interaction.response.defer(ephemeral=True)
@@ -1263,16 +1286,13 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
     )
 
 
-@tree.command(name="sell_asset", description="Sell/remove an asset (optional refund).")
+@tree.command(name="sell_asset", description="Sell/remove an asset (optional refund).", guild=discord.Object(id=GUILD_ID))
+@staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
 @app_commands.describe(refund_percent="Optional refund percent of the asset's cumulative cost (0-100). Default 0.")
 async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str, refund_percent: Optional[int] = 0):
     await interaction.response.defer(ephemeral=True)
 
-    ok, dbg = await staff_check(interaction)
-    if not ok:
-        await interaction.followup.send(dbg, ephemeral=True)
-        return
 
     refund_percent = int(refund_percent or 0)
     if refund_percent < 0:
