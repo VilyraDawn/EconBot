@@ -7,7 +7,7 @@ from discord import app_commands
 import asyncpg
 import re
 
-APP_VERSION = "EconBot_v69"
+APP_VERSION = "EconBot_v70"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -72,14 +72,10 @@ DATABASE_URL = _req("DATABASE_URL")
 GUILD_ID = _int("GUILD_ID")
 if not GUILD_ID:
     raise RuntimeError("Missing required env var: GUILD_ID")
-# Econ data is stored under the legacy source guild partition in Postgres.
+
 # Characters source (already in your DB)
-LE
-# Legacy data guild (the Postgres data is populated under the legacy source guild partition)
-LEGACY_SOURCE_GUILD_ID_ID = int(_get("LEGACY_SOURCE_GUILD_ID_ID", str(GUILD_ID)) or str(GUILD_ID))
-# All DB reads/writes should use DATA_GUILD_ID to avoid "missing balances" due to guild partition drift.
-DATA_GUILD_ID = LEGACY_SOURCE_GUILD_ID_ID
-GACY_SOURCE_GUILD_ID = _int("LEGACY_SOURCE_GUILD_ID_ID") or 0
+LEGACY_SOURCE_GUILD_ID = _int("LEGACY_SOURCE_GUILD_ID") or 0
+DATA_GUILD_ID = LEGACY_SOURCE_GUILD_ID or GUILD_ID
 
 BANK_CHANNEL_ID = _int("BANK_CHANNEL_ID") or 0
 ECON_LOG_CHANNEL_ID = _int("ECON_LOG_CHANNEL_ID") or 0
@@ -426,13 +422,22 @@ class DB:
 db = DB(DATABASE_URL)
 
 async def _ensure_member(interaction: discord.Interaction) -> discord.Member | None:
-    """Ensure we have a discord.Member (with roles/permissions) for a guild interaction.
-
-    With Intents.none(), interaction.user is usually a Member, but can sometimes be a User-like object
-    without roles. We fetch the Member from the API as a fallback (does not require members intent).
-    """
+    """Return a discord.Member for guild interactions (needed for roles/permissions)."""
     g = interaction.guild
     if not g:
+        return None
+    u = interaction.user
+    if isinstance(u, discord.Member):
+        return u
+    try:
+        m = g.get_member(u.id)
+        if m:
+            return m
+    except Exception:
+        pass
+    try:
+        return await g.fetch_member(u.id)
+    except Exception:
         return None
     u = interaction.user
     if isinstance(u, discord.Member):
@@ -483,20 +488,18 @@ def is_staff_member(member: discord.Member | None) -> bool:
     return False
 
 async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
-    """Returns (allowed, debug_string)."""
     member = await _ensure_member(interaction)
     allowed = is_staff_member(member)
     role_ids = _member_role_ids(member)
     gp = getattr(member, "guild_permissions", None) if member else None
-    dbg = (
-        f"Your user_id: {interaction.user.id}\n"
-        f"Detected role IDs: {role_ids}\n"
-        f"Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}\n"
-        f"Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}\n"
-        f"Admin: {bool(getattr(gp,'administrator', False))}\n"
-        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}\n"
-        f"Manage Messages: {bool(getattr(gp,'manage_messages', False))}"
-    )
+    dbg = f"""Bot version: {APP_VERSION}
+User_id: {getattr(interaction.user,'id',None)}
+Detected role IDs: {role_ids}
+Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}
+Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}
+Admin: {bool(getattr(gp,'administrator', False))}
+Manage Guild: {bool(getattr(gp,'manage_guild', False))}
+Manage Messages: {bool(getattr(gp,'manage_messages', False))}"""
     return allowed, dbg
 
 
@@ -520,16 +523,16 @@ def can_refresh_bank(member: Optional[discord.Member]) -> bool:
     return is_staff_member(member)
 
 intents = discord.Intents.default()
-intents.members = True  # needed to read member roles for staff checks
+intents.members = True  # required for staff role detection
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-GUILD_OBJ = discord.Object(id=int(DATA_GUILD_ID))
+GUILD_OBJ = discord.Object(id=int(GUILD_ID))
 
 # ---------------------- Autocomplete callbacks ----------------------
 
 async def character_autocomplete(interaction: discord.Interaction, current: str):
     try:
-        res = await db.search_characters(LEGACY_SOURCE_GUILD_ID_ID, current or "", 25)
+        res = await db.search_characters(LEGACY_SOURCE_GUILD_ID, current or "", 25)
         return [app_commands.Choice(name=n, value=n) for n, _uid in res]
     except Exception:
         return []
@@ -558,8 +561,8 @@ async def tier_autocomplete(interaction: discord.Interaction, current: str):
 # ---------------------- UI helpers ----------------------
 
 async def build_balance_embed(guild: discord.Guild, character: str) -> discord.Embed:
-    bal = await db.get_balance(guild.id, character)
-    owned = await db.get_assets(guild.id, character)
+    bal = await db.get_balance(DATA_GUILD_ID, character)
+    owned = await db.get_assets(DATA_GUILD_ID, character)
     lines = []
     for a in owned:
         nm = (a.get("asset_name") or "").strip() or "Unnamed"
@@ -596,7 +599,7 @@ async def refresh_bank_dashboard(guild: discord.Guild):
             SELECT user_id, name FROM characters
             WHERE guild_id=$1 AND archived=FALSE
             ORDER BY user_id, name;
-        """, int(LEGACY_SOURCE_GUILD_ID_ID))
+        """, int(LEGACY_SOURCE_GUILD_ID))
     by_user = {}
     for r in rows:
         by_user.setdefault(int(r["user_id"]), []).append(r["name"])
@@ -619,7 +622,7 @@ async def refresh_bank_dashboard(guild: discord.Guild):
         display = await get_display_name_no_ping(guild, uid)
         lines = []
         for cname in by_user[uid]:
-            bal = await db.get_balance(guild.id, cname)
+            bal = await db.get_balance(DATA_GUILD_ID, cname)
             lines.append(f"**{cname}** — {format_val(bal)}")
         embed = discord.Embed(title=display, description="\n".join(lines)[:4096] if lines else "No characters.", color=discord.Color.blurple())
         embed.set_footer(text="Bank of Vilyra • Public ledger")
@@ -640,7 +643,7 @@ async def cmd_balance(interaction: discord.Interaction, character: str):
     embed = await build_balance_embed(interaction.guild, character)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time, guild=GUILD_OBJ).", guild=GUILD_OBJ)
+@tree.command(name="income", description="Claim daily income for one of YOUR characters (once per day, Chicago time).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick one of your characters")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_income(interaction: discord.Interaction, character: str):
@@ -649,7 +652,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     if not g:
         return await interaction.followup.send("Use this in a server.", ephemeral=True)
 
-    owner = await db.get_character_owner(LEGACY_SOURCE_GUILD_ID_ID, character)
+    owner = await db.get_character_owner(LEGACY_SOURCE_GUILD_ID, character)
     if owner is None:
         return await interaction.followup.send("Character not found.", ephemeral=True)
     if owner != interaction.user.id:
@@ -660,15 +663,15 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     async with db.pool.acquire() as con:
         row = await con.fetchrow(
             "SELECT last_claim_date FROM econ_income_claims WHERE guild_id=$1 AND character_name=$2;",
-            int(DATA_GUILD_ID), str(character)
+            int(g.id), str(character)
         )
         if row and row["last_claim_date"] == today:
             return await interaction.followup.send("You already claimed income for this character today (Chicago time).", ephemeral=True)
 
-        asset_income = await db.calc_asset_income(g.id, character)
+        asset_income = await db.calc_asset_income(DATA_GUILD_ID, character)
         delta = int(BASE_DAILY_INCOME_VAL) + int(asset_income)
 
-        bal = await db.get_balance(g.id, character)
+        bal = await db.get_balance(DATA_GUILD_ID, character)
         new_bal = bal + delta
 
         await con.execute("""
@@ -676,14 +679,14 @@ async def cmd_income(interaction: discord.Interaction, character: str):
             VALUES ($1,$2,$3,NOW())
             ON CONFLICT (guild_id, character_name)
             DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW();
-        """, int(DATA_GUILD_ID), str(character), int(new_bal))
+        """, int(g.id), str(character), int(new_bal))
 
         await con.execute("""
             INSERT INTO econ_income_claims (guild_id, character_name, last_claim_date)
             VALUES ($1,$2,$3)
             ON CONFLICT (guild_id, character_name)
             DO UPDATE SET last_claim_date=EXCLUDED.last_claim_date;
-        """, int(DATA_GUILD_ID), str(character), today)
+        """, int(g.id), str(character), today)
 
     await db.log(g.id, interaction.user.id, "income", {
         "character": character,
@@ -701,7 +704,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     except Exception:
         pass
 
-@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced, guild=GUILD_OBJ).", guild=GUILD_OBJ)
+@tree.command(name="econ_adjust", description="Staff-only. Add or subtract money from a character (non-negative enforced).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", delta_val="Positive or negative Val", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delta_val: int, reason: Optional[str] = None):
@@ -714,12 +717,12 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
     if not allowed:
         return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
 
-    bal = await db.get_balance(g.id, character)
+    bal = await db.get_balance(DATA_GUILD_ID, character)
     new_bal = bal + int(delta_val)
     if new_bal < 0:
         return await interaction.followup.send(f"Insufficient funds. Current: {format_val(bal)} (= {bal} Val).", ephemeral=True)
 
-    await db.set_balance(g.id, character, new_bal)
+    await db.set_balance(DATA_GUILD_ID, character, new_bal)
     await db.log(g.id, interaction.user.id, "econ_adjust", {"character": character, "delta_val": int(delta_val), "reason": reason or ""})
     await interaction.followup.send(f"Adjusted **{character}** by {int(delta_val)} Val. New balance: {format_val(new_bal)}.", ephemeral=True)
     try:
@@ -727,7 +730,7 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
     except Exception:
         pass
 
-@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative, guild=GUILD_OBJ).", guild=GUILD_OBJ)
+@tree.command(name="econ_set_balance", description="Staff-only. Set a character’s balance to an exact amount (non-negative).", guild=GUILD_OBJ)
 @app_commands.describe(character="Pick a character", new_balance_val="New balance in Val (>=0)", reason="Optional reason")
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction: discord.Interaction, character: str, new_balance_val: int, reason: Optional[str] = None):
@@ -742,7 +745,7 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     if int(new_balance_val) < 0:
         return await interaction.followup.send("Balance cannot be negative.", ephemeral=True)
 
-    await db.set_balance(g.id, character, int(new_balance_val))
+    await db.set_balance(DATA_GUILD_ID, character, int(new_balance_val))
     await db.log(g.id, interaction.user.id, "econ_set_balance", {"character": character, "new_balance_val": int(new_balance_val), "reason": reason or ""})
     await interaction.followup.send(f"Set **{character}** balance to {format_val(int(new_balance_val))}.", ephemeral=True)
     try:
@@ -779,11 +782,11 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     if not asset_name:
         return await interaction.followup.send("asset_name is required.", ephemeral=True)
 
-    owner_user_id = await db.get_character_owner(LEGACY_SOURCE_GUILD_ID_ID, character)
+    owner_user_id = await db.get_character_owner(LEGACY_SOURCE_GUILD_ID, character)
     if owner_user_id is None:
         return await interaction.followup.send("Character not found in characters table.", ephemeral=True)
 
-    existing = await db.get_assets(g.id, character)
+    existing = await db.get_assets(DATA_GUILD_ID, character)
     for a in existing:
         if int(a.get("user_id") or 0) == int(owner_user_id) and (a.get("asset_name") or "").strip().lower() == asset_name.lower():
             return await interaction.followup.send("That asset name already exists for this character. Use a unique name.", ephemeral=True)
@@ -792,7 +795,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     if total_cost is None:
         return await interaction.followup.send("That Asset Type/Tier is not recognized in asset_catalog.", ephemeral=True)
 
-    bal = await db.get_balance(g.id, character)
+    bal = await db.get_balance(DATA_GUILD_ID, character)
     if bal < total_cost:
         short = total_cost - bal
         return await interaction.followup.send(
@@ -803,8 +806,8 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
             ephemeral=True
         )
 
-    await db.set_balance(g.id, character, bal - total_cost)
-    await db.add_asset(g.id, character, owner_user_id, asset_type, tier, asset_name)
+    await db.set_balance(DATA_GUILD_ID, character, bal - total_cost)
+    await db.add_asset(DATA_GUILD_ID, character, owner_user_id, asset_type, tier, asset_name)
 
     add_income = await db.add_income_for(asset_type, tier)
 
@@ -861,46 +864,49 @@ async def cmd_econ_commands(interaction: discord.Interaction):
     )
     await interaction.followup.send(text, ephemeral=True)
 
-
-async def _cleanup_global_commands(tree: app_commands.CommandTree) -> None:
-    """One-time cleanup: remove lingering GLOBAL commands so only guild-scoped commands remain.
-
-    Strategy:
-    - If any global commands exist, delete them individually.
-    - We do NOT register any global commands in this bot; all commands are guild-scoped.
-    """
-    try:
-        global_cmds = await tree.fetch_commands()  # global
-    except Exception as e:
-        print(f"[warn] Global command fetch failed: {e}")
-        return
-
-    if not global_cmds:
-        return
-
-    deleted = 0
-    for c in global_cmds:
-        try:
-            await c.delete()
-            deleted += 1
-        except Exception as e:
-            print(f"[warn] Failed to delete GLOBAL /{getattr(c,'name','?')}: {e}")
-
-    print(f"[test] Deleted {deleted} GLOBAL command(s) (dedupe cleanup).")
-
-
 @client.event
 async def on_ready():
     print(f"[test] Starting {APP_VERSION}…")
     print(f"[debug] raw STAFF_ROLE_IDS env: {os.getenv('STAFF_ROLE_IDS', '')!r}")
+
+    # One-time cleanup: delete ALL GLOBAL application commands to prevent duplicate (global+guild) commands.
+    try:
+        global_cmds = await tree.fetch_commands()
+        if global_cmds:
+            for c in global_cmds:
+                try:
+                    await c.delete()
+                except Exception as e:
+                    print(f"[warn] Failed to delete GLOBAL /{getattr(c,'name','?')}: {e}")
+            print(f"[test] Deleted {len(global_cmds)} GLOBAL command(s) (dedupe cleanup).")
+        else:
+            print("[test] No GLOBAL commands found (dedupe cleanup).")
+    except Exception as e:
+        print(f"[warn] Global command cleanup skipped: {e}")
     print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
     print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
     await db.init()
 
     guild_obj = discord.Object(id=int(GUILD_ID))
 
-    # Global dedupe cleanup: remove lingering GLOBAL commands so only guild-scoped remain
-    await _cleanup_global_commands(tree)
+    # --- HARD cleanup of duplicates (requested) ---
+    # Delete ALL 'purchase_new' commands registered globally and in this guild, then re-sync guild-only.
+    try:
+        # Global commands
+        try:
+            global_cmds = await tree.fetch_commands()  # global
+            for c in global_cmds:
+                if getattr(c, "name", "") == "purchase_new":
+                    try:
+                        await c.delete()
+                        print("[test] Deleted GLOBAL /purchase_new (cleanup).")
+                    except Exception as e:
+                        print(f"[warn] Failed to delete GLOBAL /purchase_new: {e}")
+        except Exception as e:
+            print(f"[warn] Global command fetch skipped: {e}")
+
+    except Exception as e:
+        print(f"[warn] Duplicate cleanup step failed: {e}")
 
     # Sync guild-only command set
     try:
@@ -909,10 +915,10 @@ async def on_ready():
     except Exception as e:
         print(f"[warn] Guild sync failed: {e}")
 
-    print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID_ID})")
+    print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; legacy source guild: {LEGACY_SOURCE_GUILD_ID})")
 
     try:
-        g = client.get_guild(int(DATA_GUILD_ID))
+        g = client.get_guild(int(GUILD_ID))
         if g:
             await refresh_bank_dashboard(g)
     except Exception as e:
