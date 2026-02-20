@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v97"
+APP_VERSION = "EconBot_v98"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1303,14 +1303,10 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     )
 
 @tree.command(name="upgrade_asset", description="(Staff) Upgrade an existing asset to a higher tier.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character, target_tier=ac_target_tier)
 async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, asset: str, target_tier: str):
     await interaction.response.defer(ephemeral=True)
-
-    ok, dbg = await staff_check(interaction)
-    if not ok:
-        await interaction.followup.send(dbg, ephemeral=True)
-        return
 
     parts = [p.strip() for p in str(asset).split("|")]
     if len(parts) < 3:
@@ -1402,15 +1398,11 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
 
 
 @tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (optional refund).", guild=discord.Object(id=GUILD_ID))
+@staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
 @app_commands.describe(refund_percent="Optional refund percent of cumulative cost (0-100). Default 0.")
 async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str, refund_percent: Optional[int] = 0):
     await interaction.response.defer(ephemeral=True)
-
-    ok, dbg = await staff_check(interaction)
-    if not ok:
-        await interaction.followup.send(dbg, ephemeral=True)
-        return
 
     refund_percent = int(refund_percent or 0)
     refund_percent = max(0, min(100, refund_percent))
