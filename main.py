@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v59"
+APP_VERSION = "EconBot_v60"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -38,20 +38,19 @@ def _int(name: str, default: Optional[int] = None) -> Optional[int]:
         return default
 
 def _int_list(name: str) -> List[int]:
-    """Parse IDs from an env var (robust + syntax-safe)."""
+    """Parse comma-separated integer IDs from env var (syntax-safe)."""
     raw = _get(name, "") or ""
-    raw = str(raw)
-    if not raw.strip():
+    raw = str(raw).strip()
+    if not raw:
         return []
-    cleaned = raw.replace("
-", ",").replace("	", ",").replace(" ", ",")
-    parts = cleaned.split(",")
+    parts = raw.split(",")
     out: List[int] = []
     seen: set[int] = set()
     for p in parts:
         p = p.strip()
         if not p:
             continue
+        # Strip non-digits (allows role mention formats like <@&123>)
         digits = re.sub(r"[^0-9]", "", p)
         if not digits:
             continue
@@ -479,33 +478,17 @@ def is_staff_member(member: discord.Member | None) -> bool:
 
 async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
     """Returns (allowed, debug_string)."""
-    # Ensure we can tell exactly which build is running
     member = await _ensure_member(interaction)
     allowed = is_staff_member(member)
     role_ids = _member_role_ids(member)
     gp = getattr(member, "guild_permissions", None) if member else None
-
     dbg = (
-        f"Bot version: {APP_VERSION}
-"
-        f"Guild ID (interaction): {getattr(interaction, 'guild_id', None)}
-"
-        f"User ID: {getattr(interaction.user, 'id', None)}
-"
-        f"Member fetched: {member is not None}
-"
-        f"Detected role IDs: {role_ids}
-"
-        f"raw STAFF_ROLE_IDS env: {os.getenv('STAFF_ROLE_IDS','')!r}
-"
-        f"STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}
-"
-        f"STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}
-"
-        f"Admin: {bool(getattr(gp,'administrator', False))}
-"
-        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}
-"
+        f"Your user_id: {interaction.user.id}\n"
+        f"Detected role IDs: {role_ids}\n"
+        f"Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}\n"
+        f"Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}\n"
+        f"Admin: {bool(getattr(gp,'administrator', False))}\n"
+        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}\n"
         f"Manage Messages: {bool(getattr(gp,'manage_messages', False))}"
     )
     return allowed, dbg
