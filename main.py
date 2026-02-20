@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v91"
+APP_VERSION = "EconBot_v92"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1533,10 +1533,23 @@ async def on_ready():
     # Delete global commands to remove duplicates
     await delete_all_global_commands()
 
+    # Ensure any globally-registered commands in the local tree are also present in the guild tree
+    # before syncing (prevents "exists in code but not in guild scope").
+    try:
+        tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
+    except Exception as e:
+        print(f"[warn] copy_global_to failed/skipped: {e}")
+
     # Sync to guild only
     try:
         synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
         print(f"[test] Synced {len(synced)} guild command(s).")
+        # Post-sync visibility check (what the server currently has)
+        try:
+            post = sorted([c.name for c in await tree.fetch_commands(guild=discord.Object(id=GUILD_ID))])
+            print(f"[debug] Post-sync guild commands (server): {post}")
+        except Exception as e:
+            print(f"[warn] Could not fetch post-sync guild commands: {e}")
     except Exception as e:
         print(f"[warn] Guild sync failed: {e}")
 
