@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v84"
+APP_VERSION = "EconBot_v85"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1058,6 +1058,10 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
     )
 
 
+@tree.command(name="econ_set_balance", description="(Staff) Set a character balance to an exact value.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.describe(character="Character name", value="New balance (must be >= 0)")
+@app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction: discord.Interaction, character: str, value: int):
     await interaction.response.defer(ephemeral=True)
 
@@ -1077,6 +1081,8 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
 
 
+@tree.command(name="econ_refresh_bank", description="(Staff) Refresh the bank dashboard messages.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
 async def cmd_refresh_bank(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     # Optionally allow BANK_REFRESH_ROLE_IDS to run refresh too, but staff_only already gates role-based access.
