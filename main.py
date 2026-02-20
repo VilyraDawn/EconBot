@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v76"
+APP_VERSION = "EconBot_v77"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -895,6 +895,7 @@ async def cmd_refresh_bank(interaction: discord.Interaction):
 )
 @app_commands.autocomplete(character=character_autocomplete, asset_type=asset_type_autocomplete, tier=tier_autocomplete)
 async def cmd_purchase_new(interaction: discord.Interaction, character: str, asset_type: str, tier: str, asset_name: str):
+    # Always defer quickly to avoid Discord timeouts
     await interaction.response.defer(ephemeral=True)
 
     owner = await get_character_owner(character)
@@ -902,46 +903,54 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
         await interaction.followup.send("Character not found in DB.", ephemeral=True)
         return
 
-    # Validate asset definition exists
+    # Validate asset definition exists (and get add_income for audit)
     adef = await get_asset_def(asset_type, tier)
-if not adef:
-    await interaction.followup.send("Invalid asset type/tier (not found in asset definitions).", ephemeral=True)
-    return
-_tier_cost_val, add_income_val = adef
+    if not adef:
+        await interaction.followup.send("Invalid asset type/tier (not found in asset definitions).", ephemeral=True)
+        return
+    _tier_cost_val, add_income_val = adef
 
-# Cost is cumulative across tiers up to the selected target tier.
-cost_val = await cumulative_cost_to_tier(asset_type, tier)
-if cost_val is None:
-    await interaction.followup.send("Unable to compute cumulative cost for this asset type/tier.", ephemeral=True)
-    return
-
-cur_bal = await get_balance(character)
-    if cur_bal < cost_val:
-        await interaction.followup.send(f"Insufficient funds. Balance **{cur_bal:,}**, cost **{cost_val:,}**.", ephemeral=True)
+    # Cost is cumulative across tiers up to the selected target tier.
+    cost_val = await cumulative_cost_to_tier(asset_type, tier)
+    if cost_val is None:
+        await interaction.followup.send("Unable to compute cumulative cost for this asset type/tier.", ephemeral=True)
         return
 
-# Allow same asset_name across different asset_type/tier, but not duplicates within the same type+tier.
-exists = await db_fetchrow(
-    '''
-    SELECT 1
-    FROM econ_assets
-    WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
-    LIMIT 1;
-    ''',
-    DATA_GUILD_ID,
-    character,
-    asset_type,
-    tier,
-    asset_name,
-)
-if exists:
-    await interaction.followup.send(
-        "That character already has an asset with the same **type, tier, and name**. Choose a different name or tier.",
-        ephemeral=True,
-    )
-    return
+    cur_bal = await get_balance(character)
+    if cur_bal < cost_val:
+        await interaction.followup.send(
+            f"Insufficient funds. Balance **{cur_bal:,}**, cost **{cost_val:,}**.",
+            ephemeral=True,
+        )
+        return
 
-# Record asset
+    asset_name = (asset_name or "").strip()
+    if not asset_name:
+        await interaction.followup.send("Asset name cannot be empty.", ephemeral=True)
+        return
+
+    # Allow same asset_name across different asset_type/tier, but not duplicates within the same type+tier.
+    exists = await db_fetchrow(
+        """
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        """,
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        tier,
+        asset_name,
+    )
+    if exists:
+        await interaction.followup.send(
+            "That character already has an asset with the same **type, tier, and name**. Choose a different name or tier.",
+            ephemeral=True,
+        )
+        return
+
+    # Record asset
     try:
         await db_exec(
             """
@@ -956,7 +965,6 @@ if exists:
             tier,
         )
     except Exception as e:
-        # uniqueness: (guild_id, user_id, character_name, asset_name)
         await interaction.followup.send(f"Failed to add asset (see logs for details): {e}", ephemeral=True)
         return
 
@@ -989,7 +997,6 @@ if exists:
         f"Daily income now: **{new_daily_income:,}**",
         ephemeral=True,
     )
-
 
 # -------------------------
 # Startup / sync
