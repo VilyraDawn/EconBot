@@ -20,7 +20,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v72"
+APP_VERSION = "EconBot_v73"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -71,7 +71,10 @@ GUILD_ID = _int("GUILD_ID")
 LEGACY_SOURCE_GUILD_ID = _int("LEGACY_SOURCE_GUILD_ID", GUILD_ID)
 BANK_CHANNEL_ID = _int("BANK_CHANNEL_ID")
 ECON_LOG_CHANNEL_ID = _int("ECON_LOG_CHANNEL_ID")
-STAFF_ROLE_IDS = set(_int_list("STAFF_ROLE_IDS"))
+STAFF_ROLE_IDS_DEFAULT = {1473523681132019824, 1473523738891784232}  # fallback if env missing
+if not STAFF_ROLE_IDS:
+    STAFF_ROLE_IDS = set(STAFF_ROLE_IDS_DEFAULT)
+
 BANK_REFRESH_ROLE_IDS = set(_int_list("BANK_REFRESH_ROLE_IDS"))
 # BANK_MESSAGE_IDS is kept for backward compatibility, but v72 persists message IDs in Postgres (approved)
 BANK_MESSAGE_IDS = _int_list("BANK_MESSAGE_IDS")
@@ -202,7 +205,7 @@ def staff_only():
                 f"--- Debug ---\n"
                 f"Your user_id: {dbg['user_id']}\n"
                 f"Detected role IDs: {dbg['detected_role_ids']}\n"
-                f"Configured STAFF_ROLE_IDS: {dbg['staff_role_ids']}\n"
+                f"Configured STAFF_ROLE_IDS (effective): {dbg['staff_role_ids']}\n"
                 f"Guild ID (interaction): {dbg['guild_id']}\n"
             )
             # best-effort ephemeral response
@@ -354,20 +357,45 @@ async def get_asset_def(asset_type: str, tier: str) -> Optional[Tuple[int, int]]
     return int(row["cost_val"]), int(row["add_income_val"])
 
 
+
+def _selected_option_from_interaction(interaction: discord.Interaction, option_name: str) -> Optional[str]:
+    """
+    Robustly retrieve a selected option value during autocomplete.
+    discord.py sometimes lacks namespace fields during autocomplete depending on client/event.
+    """
+    # 1) Try namespace
+    try:
+        ns = getattr(interaction, "namespace", None)
+        if ns is not None and hasattr(ns, option_name):
+            v = getattr(ns, option_name)
+            if v is not None:
+                return str(v)
+    except Exception:
+        pass
+    # 2) Try interaction.data options payload
+    try:
+        data = getattr(interaction, "data", None) or {}
+        opts = data.get("options") or []
+        # options can be nested for groups; handle shallow only (we don't use groups here)
+        for o in opts:
+            if o.get("name") == option_name and "value" in o:
+                return str(o.get("value"))
+    except Exception:
+        pass
+    return None
+
 async def asset_type_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     current_l = (current or "").lower()
     types = await list_asset_types()
+    if not types:
+        print('[warn] econ_asset_definitions returned 0 asset types (table empty or not populated).')
     out = [t for t in types if current_l in t.lower()][:25]
     return [app_commands.Choice(name=t, value=t) for t in out]
 
 
 async def tier_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    # We need the selected asset_type from the interaction namespace, if present
-    asset_type = ""
-    try:
-        asset_type = str(interaction.namespace.asset_type)
-    except Exception:
-        asset_type = ""
+    # Need selected asset_type to filter tiers
+    asset_type = _selected_option_from_interaction(interaction, "asset_type") or ""
     if not asset_type:
         return []
     tiers = await list_tiers_for_type(asset_type)
@@ -431,8 +459,9 @@ async def save_bank_message_ids(message_ids: List[int]) -> None:
                 )
 
 
-async def render_bank_lines() -> List[str]:
-    # Bank shows balances grouped by user (from characters table), sorted by user then character.
+async def render_bank_lines(guild: discord.Guild) -> List[str]:
+    # Bank shows balances grouped by character owner, WITHOUT pings/mentions.
+    # We render display names (server nicknames) for visual appeal.
     chars = await db_fetch(
         """
         SELECT user_id, name
@@ -447,16 +476,41 @@ async def render_bank_lines() -> List[str]:
         uid = int(r["user_id"])
         by_user.setdefault(uid, []).append(str(r["name"]))
 
-    lines: List[str] = []
-    for uid in sorted(by_user.keys()):
-        lines.append(f"**<@{uid}>**")
+    # Resolve display names
+    name_cache: Dict[int, str] = {}
+
+    async def display_name(uid: int) -> str:
+        if uid in name_cache:
+            return name_cache[uid]
+        m = guild.get_member(uid)
+        if m is None:
+            try:
+                m = await guild.fetch_member(uid)
+            except Exception:
+                m = None
+        if m is None:
+            name_cache[uid] = f"User {uid}"
+        else:
+            name_cache[uid] = m.display_name
+        return name_cache[uid]
+
+    # Build pretty markdown
+    now = datetime.now(CHICAGO_TZ)
+    header = f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)"
+    lines: List[str] = [header, "━━━━━━━━━━━━━━━━━━", ""]
+
+    if not by_user:
+        return lines + ["No characters found in DB."]
+
+    for uid in sorted(by_user.keys(), key=lambda x: (str(x))):
+        dn = await display_name(uid)
+        lines.append(f"**{dn}**")
+        # Render characters in a neat table-like style
         for cname in by_user[uid]:
             bal = await get_balance(cname)
-            lines.append(f"• {cname}: **{bal:,}**")
-        lines.append("")
+            lines.append(f"`{cname:<24}`  **{bal:>10,}**")
+        lines.append("")  # spacer
 
-    if not lines:
-        lines = ["No characters found in DB."]
     return lines
 
 
@@ -472,7 +526,7 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
     if not mids and BANK_MESSAGE_IDS:
         mids = list(BANK_MESSAGE_IDS)
 
-    lines = await render_bank_lines()
+    lines = await render_bank_lines(ch.guild)
     # split into chunks that fit; keep conservative
     chunks: List[str] = []
     cur = ""
@@ -745,7 +799,8 @@ async def on_ready():
     print(f"[test] Starting {APP_VERSION}…")
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; data guild: {DATA_GUILD_ID})")
     print(f"[debug] raw STAFF_ROLE_IDS env: {repr(_get('STAFF_ROLE_IDS',''))}")
-    print(f"[debug] STAFF_ROLE_IDS: {sorted(list(STAFF_ROLE_IDS))}")
+    print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
+    print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
 
     # Delete global commands to remove duplicates
     await delete_all_global_commands()
