@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v89"
+APP_VERSION = "EconBot_v90"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1493,6 +1493,18 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     )
 
 # -------------------------
+
+# Ensure new commands are registered as GUILD commands even if decorator registration was skipped for any reason.
+# This is idempotent: if the command already exists for the guild, add_command will raise and we ignore.
+try:
+    tree.add_command(cmd_upgrade_asset, guild=discord.Object(id=GUILD_ID))
+except Exception:
+    pass
+try:
+    tree.add_command(cmd_sell_asset, guild=discord.Object(id=GUILD_ID))
+except Exception:
+    pass
+
 # Startup / sync
 # -------------------------
 
@@ -1522,6 +1534,14 @@ async def on_ready():
     print(f"[debug] raw STAFF_ROLE_IDS env: {repr(_get('STAFF_ROLE_IDS',''))}")
     print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
     print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
+try:
+    # Show what the bot thinks is registered before syncing (helps diagnose missing commands)
+    guild_cmd_names = sorted([c.name for c in tree.get_commands(guild=discord.Object(id=GUILD_ID))])
+    global_cmd_names = sorted([c.name for c in tree.get_commands()])
+    print(f"[debug] Registered GUILD commands (pre-sync): {guild_cmd_names}")
+    print(f"[debug] Registered GLOBAL commands (pre-sync): {global_cmd_names}")
+except Exception as e:
+    print(f"[warn] Could not enumerate commands pre-sync: {e}")
 
     # Delete global commands to remove duplicates
     await delete_all_global_commands()
