@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v93"
+APP_VERSION = "EconBot_v94"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1533,66 +1533,87 @@ async def delete_all_global_commands() -> None:
 
 @client.event
 async def on_ready():
-    await ensure_schema()
-    await seed_asset_definitions()
+    # Keep on_ready resilient: never allow an exception to abort command sync.
     print(f"[test] Starting {APP_VERSION}…")
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; data guild: {DATA_GUILD_ID})")
     print(f"[debug] raw STAFF_ROLE_IDS env: {repr(_get('STAFF_ROLE_IDS',''))}")
     print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
     print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
 
-    # Show what the bot thinks is registered before syncing (diagnose missing commands)
-    try:
-        guild_cmd_names = sorted([c.name for c in tree.get_commands(guild=discord.Object(id=GUILD_ID))])
-        global_cmd_names = sorted([c.name for c in tree.get_commands()])
-        print(f"[debug] Registered GUILD commands (pre-sync): {guild_cmd_names}")
-        print(f"[debug] Registered GLOBAL commands (pre-sync): {global_cmd_names}")
-    except Exception as e:
-        print(f"[warn] Could not enumerate commands pre-sync: {e}")
+    guild_obj = discord.Object(id=GUILD_ID)
 
-    # Delete global commands to remove duplicates
-    await delete_all_global_commands()
-
-    # Force-register critical new commands into the guild registry (defensive).
-    # In rare cases, decorator registration can land in the local "global" set only.
+    # --- COMMAND SYNC (first, hardened) ---
     try:
-        tree.add_command(cmd_upgrade_asset, guild=discord.Object(id=GUILD_ID))
-    except Exception:
-        pass
-    try:
-        tree.add_command(cmd_sell_asset, guild=discord.Object(id=GUILD_ID))
-    except Exception:
-        pass
-
-    # Hard reset guild commands on Discord to eliminate stale signatures/duplicates,
-    # then re-sync the authoritative set.
-    await delete_all_guild_commands()
-
-    # Ensure any globally-registered commands in the local tree are also present in the guild tree
-    # before syncing (prevents "exists in code but not in guild scope").
-    try:
-        tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
-    except Exception as e:
-        print(f"[warn] copy_global_to failed/skipped: {e}")
-
-    # Sync to guild only
-    try:
-        synced = await tree.sync(guild=discord.Object(id=GUILD_ID))
-        print(f"[test] Synced {len(synced)} guild command(s).")
-        # Post-sync visibility check (what the server currently has)
+        # Defensive: ensure new commands are present in local guild registry.
+        # NOTE: decorated functions are Command objects.
         try:
-            post = sorted([c.name for c in await tree.fetch_commands(guild=discord.Object(id=GUILD_ID))])
+            tree.add_command(cmd_upgrade_asset, guild=guild_obj)
+        except Exception:
+            pass
+        try:
+            tree.add_command(cmd_sell_asset, guild=guild_obj)
+        except Exception:
+            pass
+
+        # Optional: copy any locally-registered global commands into guild scope (no global sync).
+        try:
+            tree.copy_global_to(guild=guild_obj)
+        except Exception as e:
+            print(f"[warn] copy_global_to failed/skipped: {e}")
+
+        # HARD RESET guild commands (authoritative overwrite) using supported API.
+        # This clears the local guild registry, then re-adds from our decorated registry via copy_global_to/add_command above,
+        # and then sync overwrites the server-side guild command set.
+        try:
+            tree.clear_commands(guild=guild_obj)
+        except Exception:
+            pass
+
+        # Re-add explicitly after clear (guaranteed)
+        try:
+            tree.add_command(cmd_upgrade_asset, guild=guild_obj)
+        except Exception:
+            pass
+        try:
+            tree.add_command(cmd_sell_asset, guild=guild_obj)
+        except Exception:
+            pass
+
+        synced = await tree.sync(guild=guild_obj)
+        print(f"[test] Synced {len(synced)} guild command(s).")
+
+        # Post-sync verification: what Discord now has.
+        try:
+            post = sorted([c.name for c in await tree.fetch_commands(guild=guild_obj)])
             print(f"[debug] Post-sync guild commands (server): {post}")
         except Exception as e:
             print(f"[warn] Could not fetch post-sync guild commands: {e}")
-    except Exception as e:
-        print(f"[warn] Guild sync failed: {e}")
 
-    # Refresh bank (safe)
+        # Cleanup global commands last (best-effort) to avoid duplicates from prior versions.
+        try:
+            await delete_all_global_commands()
+        except Exception as e:
+            print(f"[warn] Global command deletion failed/skipped: {e}")
+
+    except Exception as e:
+        print(f"[warn] Command sync block failed: {e}")
+
+    # --- DB / SEED / BANK (best-effort, after sync) ---
+    try:
+        await ensure_schema()
+    except Exception as e:
+        print(f"[warn] ensure_schema failed: {e}")
+
+    try:
+        await seed_asset_definitions()
+    except Exception as e:
+        print(f"[warn] seed_asset_definitions failed: {e}")
+
     try:
         await refresh_bank_dashboard(create_missing=True)
     except Exception as e:
         print(f"[warn] Initial bank refresh failed: {e}")
+
 
 
 def main():
