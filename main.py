@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v99"
+APP_VERSION = "EconBot_v100"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -90,6 +90,26 @@ def _tier_rank(tier: str) -> Optional[int]:
     except Exception:
         return None
 
+
+
+async def tier_cost_for(asset_type: str, tier: str) -> int | None:
+    """Return cost_val for the exact tier (NOT cumulative)."""
+    row = await db_fetchrow(
+        '''
+        SELECT cost_val
+        FROM econ_asset_definitions
+        WHERE asset_type=$1 AND tier=$2
+        LIMIT 1;
+        ''',
+        asset_type,
+        tier,
+    )
+    if not row:
+        return None
+    try:
+        return int(row["cost_val"])
+    except Exception:
+        return None
 
 async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional[int]:
     """Cumulative cost: sum of all tier costs up to and including target tier for an asset type.
@@ -176,26 +196,6 @@ def format_currency(total_cinth: int) -> str:
     return f"{sign}{compact} (Total: {total:,} Copper Cinth)"
 
 
-
-
-async def tier_cost_for(asset_type: str, tier: str) -> int | None:
-    """Return the cost_val for the specific tier (NOT cumulative)."""
-    row = await db_fetchrow(
-        '''
-        SELECT cost_val
-        FROM econ_asset_definitions
-        WHERE asset_type=$1 AND tier=$2
-        LIMIT 1;
-        ''',
-        asset_type,
-        tier,
-    )
-    if not row:
-        return None
-    try:
-        return int(row["cost_val"])
-    except Exception:
-        return None
 
 async def incremental_cost_between_tiers(asset_type: str, current_tier: str, target_tier: str) -> Optional[int]:
     """Upgrade cost from current_tier to target_tier for an asset_type.
@@ -1420,7 +1420,7 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
 @tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (optional refund).", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
-@app_commands.describe(refund_percent="Refund percent of the CURRENT tier cost (0-100). Default 100.")
+@app_commands.describe(refund_percent="Optional refund percent of cumulative cost (0-100). Default 0.")
 async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str, refund_percent: Optional[int] = 100):
     await interaction.response.defer(ephemeral=True)
 
@@ -1452,13 +1452,13 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
         await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
         return
 
-refund_amount = 0
-if refund_percent > 0:
-    tier_cost = await tier_cost_for(asset_type, tier)
-    if tier_cost is None or tier_cost <= 0:
-        await interaction.followup.send("Unable to calculate refund amount for this asset tier.", ephemeral=True)
-        return
-    refund_amount = int(round((tier_cost * refund_percent) / 100.0))
+    refund_amount = 0
+    if refund_percent > 0:
+        tier_cost = await tier_cost_for(asset_type, tier)
+        if tier_cost is None or tier_cost <= 0:
+            await interaction.followup.send("Unable to calculate refund amount for this asset tier.", ephemeral=True)
+            return
+        refund_amount = int(round((tier_cost * refund_percent) / 100.0))
 
     await db_exec(
         '''
