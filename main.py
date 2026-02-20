@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v86"
+APP_VERSION = "EconBot_v87"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -94,50 +94,6 @@ def _tier_rank(tier: str) -> Optional[int]:
 async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional[int]:
     """Cumulative cost: sum of all tier costs up to and including target tier for an asset type.
 
-async def incremental_cost_between_tiers(asset_type: str, current_tier: str, target_tier: str) -> Optional[int]:
-    """Upgrade cost from current_tier -> target_tier for an asset_type.
-    Sum of costs for tiers strictly above current and <= target.
-    """
-    cur_rank = _tier_rank(current_tier)
-    tgt_rank = _tier_rank(target_tier)
-    if tgt_rank is None:
-        return None
-
-    rows = await db_fetch(
-        '''
-        SELECT tier, cost_val
-        FROM econ_asset_definitions
-        WHERE asset_type=$1;
-        ''',
-        asset_type,
-    )
-    if not rows:
-        return None
-
-    # Rank-based sum (preferred)
-    if cur_rank is not None:
-        total = 0
-        any_found = False
-        for r in rows:
-            t = str(r["tier"])
-            tr = _tier_rank(t)
-            if tr is None:
-                continue
-            if tr > cur_rank and tr <= tgt_rank:
-                any_found = True
-                total += int(r["cost_val"])
-        if any_found:
-            return int(total)
-
-    # Fallback: cumulative difference
-    cum_t = await cumulative_cost_to_tier(asset_type, target_tier)
-    cum_c = await cumulative_cost_to_tier(asset_type, current_tier)
-    if cum_t is None or cum_c is None:
-        return None
-    return int(cum_t - cum_c)
-
-
-
     Requires tiers to be ordered by a numeric rank embedded in the tier label, e.g. '(1) ...', '(2) ...'.
     Falls back to the target tier's own cost if ranks are not parseable.
     """
@@ -184,6 +140,55 @@ async def incremental_cost_between_tiers(asset_type: str, current_tier: str, tar
             return c
 
     return None
+
+
+async def incremental_cost_between_tiers(asset_type: str, current_tier: str, target_tier: str) -> Optional[int]:
+    """Upgrade cost from current_tier -> target_tier for an asset_type.
+
+    Cost rule: sum of tier costs strictly above current tier rank and <= target tier rank.
+    Falls back to cumulative(target) - cumulative(current) when rank parsing works but no direct sums found.
+    """
+    cur_rank = _tier_rank(current_tier)
+    tgt_rank = _tier_rank(target_tier)
+    if tgt_rank is None:
+        return None
+
+    rows = await db_fetch(
+        '''
+        SELECT tier, cost_val
+        FROM econ_asset_definitions
+        WHERE asset_type=$1;
+        ''',
+        asset_type,
+    )
+    if not rows:
+        return None
+
+    # Prefer rank-based sum when current tier rank is known
+    if cur_rank is not None:
+        total = 0
+        found_any = False
+        for r in rows:
+            t = str(r["tier"]).strip()
+            tr = _tier_rank(t)
+            if tr is None:
+                continue
+            if tr > cur_rank and tr <= tgt_rank:
+                try:
+                    total += int(r["cost_val"])
+                    found_any = True
+                except Exception:
+                    continue
+        if found_any:
+            return int(total)
+
+    # Fallback: cumulative difference
+    cum_t = await cumulative_cost_to_tier(asset_type, target_tier)
+    cum_c = await cumulative_cost_to_tier(asset_type, current_tier)
+    if cum_t is None or cum_c is None:
+        return None
+    return int(cum_t - cum_c)
+
 
 
 
@@ -596,57 +601,6 @@ async def character_autocomplete(
     )
     return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
 
-async def ac_asset_for_character(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Autocomplete assets for selected character. Value format: 'Type | Tier | Name'."""
-    try:
-        char = getattr(interaction.namespace, "character", None) or getattr(interaction.namespace, "character_name", None)
-        if not char:
-            return []
-        rows = await get_assets_for_character(str(char))
-        needle = (current or "").lower()
-        out: List[app_commands.Choice[str]] = []
-        for r in rows:
-            label = f"{r['asset_type']} | {r['tier']} | {r['asset_name']}"
-            if needle and needle not in label.lower():
-                continue
-            out.append(app_commands.Choice(name=label[:100], value=label[:100]))
-            if len(out) >= 25:
-                break
-        return out
-    except Exception:
-        return []
-
-
-async def ac_target_tier(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Autocomplete target tiers for the selected asset (same type), filtered to higher tiers."""
-    try:
-        asset_label = getattr(interaction.namespace, "asset", None)
-        if not asset_label:
-            return []
-        parts = [p.strip() for p in str(asset_label).split("|")]
-        if len(parts) < 3:
-            return []
-        asset_type = parts[0]
-        cur_tier = parts[1]
-        cur_rank = _tier_rank(cur_tier)
-        tiers = await get_tiers_for_asset_type(asset_type)
-        needle = (current or "").lower()
-        out: List[app_commands.Choice[str]] = []
-        for t in tiers:
-            tr = _tier_rank(t)
-            if cur_rank is not None and tr is not None and tr <= cur_rank:
-                continue
-            if needle and needle not in t.lower():
-                continue
-            out.append(app_commands.Choice(name=t[:100], value=t[:100]))
-            if len(out) >= 25:
-                break
-        return out
-    except Exception:
-        return []
-
-
-
 
 async def get_character_owner(character_name: str) -> Optional[int]:
     row = await db_fetchrow(
@@ -965,6 +919,56 @@ async def render_bank_lines(guild: discord.Guild) -> List[str]:
         out += await render_character_card(guild, cname, owner_id=uid)
 
     return out
+
+async def ac_asset_for_character(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete assets for selected character. Value format: 'Type | Tier | Name'."""
+    try:
+        char = getattr(interaction.namespace, "character", None) or getattr(interaction.namespace, "character_name", None)
+        if not char:
+            return []
+        rows = await get_assets_for_character(str(char))
+        needle = (current or "").lower()
+        out: List[app_commands.Choice[str]] = []
+        for r in rows:
+            label = f"{r['asset_type']} | {r['tier']} | {r['asset_name']}"
+            if needle and needle not in label.lower():
+                continue
+            out.append(app_commands.Choice(name=label[:100], value=label[:100]))
+            if len(out) >= 25:
+                break
+        return out
+    except Exception:
+        return []
+
+
+async def ac_target_tier(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete target tiers for the selected asset (same type), filtered to higher tiers."""
+    try:
+        asset_label = getattr(interaction.namespace, "asset", None)
+        if not asset_label:
+            return []
+        parts = [p.strip() for p in str(asset_label).split("|")]
+        if len(parts) < 3:
+            return []
+        asset_type = parts[0]
+        cur_tier = parts[1]
+        cur_rank = _tier_rank(cur_tier)
+        tiers = await get_tiers_for_asset_type(asset_type)
+        needle = (current or "").lower()
+        out: List[app_commands.Choice[str]] = []
+        for t in tiers:
+            tr = _tier_rank(t)
+            if cur_rank is not None and tr is not None and tr <= cur_rank:
+                continue
+            if needle and needle not in t.lower():
+                continue
+            out.append(app_commands.Choice(name=t[:100], value=t[:100]))
+            if len(out) >= 25:
+                break
+        return out
+    except Exception:
+        return []
+
 
 
 async def refresh_bank_dashboard(create_missing: bool = True) -> None:
@@ -1351,7 +1355,6 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
     msg += f"New balance: **{format_currency(await get_balance(character))}**"
 
     await interaction.followup.send(msg, ephemeral=True)
-
 
 
     value = int(value)
