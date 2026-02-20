@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v54"
+APP_VERSION = "EconBot_v55"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -395,33 +395,53 @@ class DB:
 
 db = DB(DATABASE_URL)
 
-def is_staff(member: discord.abc.User | discord.Member | None) -> bool:
-    """Staff check for staff-only commands.
+async def _ensure_member(interaction: discord.Interaction) -> discord.Member | None:
+    """Ensure we have a discord.Member (with roles/permissions) for a guild interaction.
 
-    Priority:
-    1) Administrator always allowed
-    2) If STAFF_ROLE_IDS configured: user must have one of those roles
-    3) Fallback (when STAFF_ROLE_IDS is empty): allow users with Manage Guild OR Manage Messages
-       (prevents staff lockout if Railway env wasn't configured yet)
+    With Intents.none(), interaction.user is usually a Member, but can sometimes be a User-like object
+    without roles. We fetch the Member from the API as a fallback (does not require members intent).
     """
+    g = interaction.guild
+    if not g:
+        return None
+    u = interaction.user
+    if isinstance(u, discord.Member):
+        return u
+    # Try cache
+    try:
+        m = g.get_member(u.id)
+        if m:
+            return m
+    except Exception:
+        pass
+    # Fetch from API
+    try:
+        return await g.fetch_member(u.id)
+    except Exception:
+        return None
+
+def _member_role_ids(member: discord.Member | None) -> list[int]:
+    try:
+        return [int(r.id) for r in (member.roles or [])]
+    except Exception:
+        return []
+
+def is_staff_member(member: discord.Member | None) -> bool:
+    """Pure staff predicate once we have a Member."""
     if member is None:
         return False
-
     try:
         gp = getattr(member, "guild_permissions", None)
         if gp and gp.administrator:
             return True
     except Exception:
         pass
-
     # Role-based allow if configured
     try:
-        roles = getattr(member, "roles", []) or []
         if STAFF_ROLE_IDS:
-            return any(getattr(r, "id", 0) in STAFF_ROLE_IDS for r in roles)
+            return any(getattr(r, "id", 0) in STAFF_ROLE_IDS for r in (member.roles or []))
     except Exception:
         pass
-
     # Fallback if STAFF_ROLE_IDS not configured
     try:
         gp = getattr(member, "guild_permissions", None)
@@ -429,8 +449,24 @@ def is_staff(member: discord.abc.User | discord.Member | None) -> bool:
             return bool(gp.manage_guild or gp.manage_messages)
     except Exception:
         pass
-
     return False
+
+async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
+    """Returns (allowed, debug_string)."""
+    member = await _ensure_member(interaction)
+    allowed = is_staff_member(member)
+    role_ids = _member_role_ids(member)
+    gp = getattr(member, "guild_permissions", None) if member else None
+    dbg = (
+        f"Your user_id: {interaction.user.id}\n"
+        f"Detected role IDs: {role_ids}\n"
+        f"Configured STAFF_ROLE_IDS: {sorted(list(STAFF_ROLE_IDS))}\n"
+        f"Admin: {bool(getattr(gp,'administrator', False))}\n"
+        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}\n"
+        f"Manage Messages: {bool(getattr(gp,'manage_messages', False))}"
+    )
+    return allowed, dbg
+
 
 def can_refresh_bank(member: Optional[discord.Member]) -> bool:
     if member is None:
@@ -442,7 +478,7 @@ def can_refresh_bank(member: Optional[discord.Member]) -> bool:
         pass
     if BANK_REFRESH_ROLE_IDS and any(r.id in BANK_REFRESH_ROLE_IDS for r in getattr(member, "roles", [])):
         return True
-    return is_staff(member)
+    return is_staff_member(member)
 
 intents = discord.Intents.none()
 client = discord.Client(intents=intents)
@@ -633,9 +669,10 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
     g = interaction.guild
     if not g:
         return await interaction.followup.send("Use this in a server.", ephemeral=True)
-    mem = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if not is_staff(mem):
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, set STAFF_ROLE_IDS in Railway to the role ID(s) that should be allowed (comma-separated), or ensure you have Manage Server / Manage Messages permissions.", ephemeral=True)
+    mem = await _ensure_member(interaction)
+    allowed, dbg = await staff_check(interaction)
+    if not allowed:
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
 
     bal = await db.get_balance(g.id, character)
     new_bal = bal + int(delta_val)
@@ -658,9 +695,10 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     g = interaction.guild
     if not g:
         return await interaction.followup.send("Use this in a server.", ephemeral=True)
-    mem = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if not is_staff(mem):
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, set STAFF_ROLE_IDS in Railway to the role ID(s) that should be allowed (comma-separated), or ensure you have Manage Server / Manage Messages permissions.", ephemeral=True)
+    mem = await _ensure_member(interaction)
+    allowed, dbg = await staff_check(interaction)
+    if not allowed:
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
     if int(new_balance_val) < 0:
         return await interaction.followup.send("Balance cannot be negative.", ephemeral=True)
 
@@ -685,9 +723,10 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     g = interaction.guild
     if not g:
         return await interaction.followup.send("Use this in a server.", ephemeral=True)
-    mem = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if not is_staff(mem):
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, set STAFF_ROLE_IDS in Railway to the role ID(s) that should be allowed (comma-separated), or ensure you have Manage Server / Manage Messages permissions.", ephemeral=True)
+    mem = await _ensure_member(interaction)
+    allowed, dbg = await staff_check(interaction)
+    if not allowed:
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
 
     asset_type = (asset_type or "").strip()
     tier = (tier or "").strip()
@@ -756,18 +795,19 @@ async def cmd_refresh_bank(interaction: discord.Interaction):
     g = interaction.guild
     if not g:
         return await interaction.followup.send("Use this in a server.", ephemeral=True)
-    mem = interaction.user if isinstance(interaction.user, discord.Member) else None
+    mem = await _ensure_member(interaction)
     if not can_refresh_bank(mem):
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, set STAFF_ROLE_IDS in Railway to the role ID(s) that should be allowed (comma-separated), or ensure you have Manage Server / Manage Messages permissions.", ephemeral=True)
+        return await interaction.followup.send("You do not have permission to run this staff command.", ephemeral=True)
     await refresh_bank_dashboard(g)
     await interaction.followup.send("Bank dashboard refreshed.", ephemeral=True)
 
 @tree.command(name="econ_commands", description="Staff: show EconBot command list and what each command does.", guild=GUILD_OBJ)
 async def cmd_econ_commands(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    mem = interaction.user if isinstance(interaction.user, discord.Member) else None
-    if not is_staff(mem):
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, set STAFF_ROLE_IDS in Railway to the role ID(s) that should be allowed (comma-separated), or ensure you have Manage Server / Manage Messages permissions.", ephemeral=True)
+    mem = await _ensure_member(interaction)
+    allowed, dbg = await staff_check(interaction)
+    if not allowed:
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
     text = (
         "**Player Commands**\n"
         "/balance — Show a character’s current money and owned assets.\n"
