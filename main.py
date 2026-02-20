@@ -7,7 +7,7 @@ from discord import app_commands
 import asyncpg
 import re
 
-APP_VERSION = "EconBot_v62"
+APP_VERSION = "EconBot_v63"
 LAST_MEMBER_FETCH_ERROR = ""
 
 # --- Timezone handling (Railway-safe) ---
@@ -511,29 +511,18 @@ async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
     gp = getattr(member, "guild_permissions", None) if member else None
 
     dbg = (
-        f"Bot version: {APP_VERSION}
-"
-        f"Interaction guild_id: {getattr(interaction, 'guild_id', None)}
-"
-        f"Configured GUILD_ID: {GUILD_ID}
-"
-        f"User ID: {getattr(interaction.user, 'id', None)}
-"
-        f"Member fetched: {member is not None}
-"
-        f"Member fetch error: {LAST_MEMBER_FETCH_ERROR}
-"
-        f"Detected role IDs: {role_ids}
-"
-        f"Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}
-"
-        f"Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}
-"
-        f"Admin: {bool(getattr(gp,'administrator', False))}
-"
-        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}
-"
-        f"Manage Messages: {bool(getattr(gp,'manage_messages', False))}"
+        f"""Bot version: {APP_VERSION}
+Interaction guild_id: {getattr(interaction, 'guild_id', None)}
+Configured GUILD_ID: {GUILD_ID}
+User ID: {getattr(interaction.user, 'id', None)}
+Member fetched: {member is not None}
+Member fetch error: {LAST_MEMBER_FETCH_ERROR}
+Detected role IDs: {role_ids}
+Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}
+Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}
+Admin: {bool(getattr(gp,'administrator', False))}
+Manage Guild: {bool(getattr(gp,'manage_guild', False))}
+Manage Messages: {bool(getattr(gp,'manage_messages', False))}"""
     )
     return allowed, dbg
 
