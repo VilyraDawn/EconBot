@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v57"
+APP_VERSION = "EconBot_v58"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -482,17 +482,33 @@ def is_staff_member(member: discord.Member | None) -> bool:
 
 async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
     """Returns (allowed, debug_string)."""
+    # Ensure we can tell exactly which build is running
     member = await _ensure_member(interaction)
     allowed = is_staff_member(member)
     role_ids = _member_role_ids(member)
     gp = getattr(member, "guild_permissions", None) if member else None
+
     dbg = (
-        f"Your user_id: {interaction.user.id}\n"
-        f"Detected role IDs: {role_ids}\n"
-        f"Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}\n"
-        f"Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}\n"
-        f"Admin: {bool(getattr(gp,'administrator', False))}\n"
-        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}\n"
+        f"Bot version: {APP_VERSION}
+"
+        f"Guild ID (interaction): {getattr(interaction, 'guild_id', None)}
+"
+        f"User ID: {getattr(interaction.user, 'id', None)}
+"
+        f"Member fetched: {member is not None}
+"
+        f"Detected role IDs: {role_ids}
+"
+        f"raw STAFF_ROLE_IDS env: {os.getenv('STAFF_ROLE_IDS','')!r}
+"
+        f"STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}
+"
+        f"STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}
+"
+        f"Admin: {bool(getattr(gp,'administrator', False))}
+"
+        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}
+"
         f"Manage Messages: {bool(getattr(gp,'manage_messages', False))}"
     )
     return allowed, dbg
