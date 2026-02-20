@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v94"
+APP_VERSION = "EconBot_v95"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1561,23 +1561,9 @@ async def on_ready():
         except Exception as e:
             print(f"[warn] copy_global_to failed/skipped: {e}")
 
-        # HARD RESET guild commands (authoritative overwrite) using supported API.
-        # This clears the local guild registry, then re-adds from our decorated registry via copy_global_to/add_command above,
-        # and then sync overwrites the server-side guild command set.
-        try:
-            tree.clear_commands(guild=guild_obj)
-        except Exception:
-            pass
-
-        # Re-add explicitly after clear (guaranteed)
-        try:
-            tree.add_command(cmd_upgrade_asset, guild=guild_obj)
-        except Exception:
-            pass
-        try:
-            tree.add_command(cmd_sell_asset, guild=guild_obj)
-        except Exception:
-            pass
+# NOTE: We do NOT clear guild commands here.
+# tree.sync(guild=...) overwrites the server-side guild command set to match the locally-registered guild commands.
+# Clearing first would drop all existing commands unless we re-register every single one manually.
 
         synced = await tree.sync(guild=guild_obj)
         print(f"[test] Synced {len(synced)} guild command(s).")
