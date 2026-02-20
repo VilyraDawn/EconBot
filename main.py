@@ -20,7 +20,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v73"
+APP_VERSION = "EconBot_v74"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -71,6 +71,7 @@ GUILD_ID = _int("GUILD_ID")
 LEGACY_SOURCE_GUILD_ID = _int("LEGACY_SOURCE_GUILD_ID", GUILD_ID)
 BANK_CHANNEL_ID = _int("BANK_CHANNEL_ID")
 ECON_LOG_CHANNEL_ID = _int("ECON_LOG_CHANNEL_ID")
+STAFF_ROLE_IDS = set(_int_list("STAFF_ROLE_IDS"))
 STAFF_ROLE_IDS_DEFAULT = {1473523681132019824, 1473523738891784232}  # fallback if env missing
 if not STAFF_ROLE_IDS:
     STAFF_ROLE_IDS = set(STAFF_ROLE_IDS_DEFAULT)
