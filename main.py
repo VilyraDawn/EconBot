@@ -20,7 +20,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v74"
+APP_VERSION = "EconBot_v75"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -92,6 +92,58 @@ if not LEGACY_SOURCE_GUILD_ID:
 # All DB reads/writes (balances/assets/income/characters) use the legacy guild partition, per your confirmation.
 DATA_GUILD_ID = int(LEGACY_SOURCE_GUILD_ID)
 
+
+
+# -------------------------
+# Asset definitions seed (authoritative from NEW Asset Table.xlsx)
+# -------------------------
+ASSET_DEFINITIONS_SEED: List[Tuple[str, str, int, int]] = [
+    ("Guild Trade Workshop", "(1) Guild Apprentice", 300, 50),
+    ("Guild Trade Workshop", "(2) Guild Journeyman", 600, 100),
+    ("Guild Trade Workshop", "(3) Leased Workshop", 1200, 150),
+    ("Guild Trade Workshop", "(4) Small Workshop", 2000, 200),
+    ("Guild Trade Workshop", "(5) Large Workshop", 3000, 250),
+    ("Market Stall", "(1) Consignment Arrangement", 300, 50),
+    ("Market Stall", "(2) Small Alley Stand", 600, 100),
+    ("Market Stall", "(3) Market Stall", 1200, 150),
+    ("Market Stall", "(4) Small Shop", 2000, 200),
+    ("Market Stall", "(5) Large Shop", 3000, 250),
+    ("Farm/Ranch", "(1) Subsistence Surplus", 300, 50),
+    ("Farm/Ranch", "(2) Leased Fields", 600, 100),
+    ("Farm/Ranch", "(3) Owned Acre", 1200, 150),
+    ("Farm/Ranch", "(4) Small Fields and Barn", 2000, 200),
+    ("Farm/Ranch", "(5) Large Fields and Barn", 3000, 250),
+    ("Tavern/Inn", "(1) One-Room Flophouse", 300, 50),
+    ("Tavern/Inn", "(2) Leased Establishment", 600, 100),
+    ("Tavern/Inn", "(3) Small Tavern", 1200, 150),
+    ("Tavern/Inn", "(4) Large Tavern", 2000, 200),
+    ("Tavern/Inn", "(5) Large Tavern and Inn", 3000, 250),
+    ("Warehouse/Trade House", "(1) Small Storage Shed", 300, 50),
+    ("Warehouse/Trade House", "(2) Large Storage Shed", 600, 100),
+    ("Warehouse/Trade House", "(3) Small Trading Post", 1200, 150),
+    ("Warehouse/Trade House", "(4) Large Trading Post", 2000, 200),
+    ("Warehouse/Trade House", "(5) Large Warehouse and Trading Post", 3000, 250),
+    ("House", "(1) Shack", 600, 0),
+    ("House", "(2) Hut", 1200, 0),
+    ("House", "(3) House", 2000, 0),
+    ("House", "(4) Lodge", 3000, 0),
+    ("House", "(5) Mansion", 5000, 0),
+    ("Village", "(1) Chartered Assembly", 1200, 100),
+    ("Village", "(2) Hamlet", 2400, 200),
+    ("Village", "(3) Village", 4800, 300),
+    ("Village", "(4) Town", 9600, 400),
+    ("Village", "(5) Small City", 15000, 500),
+    ("Weapons", "(1) Hit +1 / Dmg +1d4", 300, 0),
+    ("Weapons", "(2) Hit +1 / Dmg +1d6", 600, 0),
+    ("Weapons", "(3) Hit +2 / Dmg +1d8", 1200, 0),
+    ("Weapons", "(4) Hit +2 / Dmg +1d10", 2400, 0),
+    ("Weapons", "(5) Hit +2 / Dmg +1d12", 4800, 0),
+    ("Armor", "(1) AC +1", 300, 0),
+    ("Armor", "(2) AC +2", 600, 0),
+    ("Armor", "(3) AC +2 / Adv Magic Atk", 1200, 0),
+    ("Armor", "(4) AC +2 / Adv Magic and Melee Atk", 2400, 0),
+    ("Armor", "(5) AC +3 / Adv Magic and Melee Atk", 4800, 0),
+]
 
 # -------------------------
 # Discord client setup
@@ -319,27 +371,35 @@ async def log_audit(interaction: discord.Interaction, action: str, details: Dict
 # -------------------------
 
 async def list_asset_types() -> List[str]:
-    rows = await db_fetch(
-        """
-        SELECT DISTINCT asset_type
-        FROM econ_asset_definitions
-        ORDER BY asset_type ASC;
-        """
-    )
-    return [str(r["asset_type"]) for r in rows]
+    try:
+        rows = await db_fetch(
+            """
+            SELECT DISTINCT asset_type
+            FROM econ_asset_definitions
+            ORDER BY asset_type ASC;
+            """
+        )
+        return [str(r["asset_type"]) for r in rows]
+    except Exception as e:
+        print(f"[warn] list_asset_types failed: {e}")
+        return []
 
 
 async def list_tiers_for_type(asset_type: str) -> List[str]:
-    rows = await db_fetch(
-        """
-        SELECT tier
-        FROM econ_asset_definitions
-        WHERE asset_type=$1
-        ORDER BY tier ASC;
-        """,
-        asset_type,
-    )
-    return [str(r["tier"]) for r in rows]
+    try:
+        rows = await db_fetch(
+            """
+            SELECT tier
+            FROM econ_asset_definitions
+            WHERE asset_type=$1
+            ORDER BY tier ASC;
+            """,
+            asset_type,
+        )
+        return [str(r["tier"]) for r in rows]
+    except Exception as e:
+        print(f"[warn] list_tiers_for_type({asset_type}) failed: {e}")
+        return []
 
 
 async def get_asset_def(asset_type: str, tier: str) -> Optional[Tuple[int, int]]:
@@ -384,6 +444,40 @@ def _selected_option_from_interaction(interaction: discord.Interaction, option_n
     except Exception:
         pass
     return None
+async def seed_asset_definitions() -> None:
+    """Upsert the authoritative asset definitions set into econ_asset_definitions."""
+    try:
+        await db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS econ_asset_definitions (
+              asset_type TEXT NOT NULL,
+              tier TEXT NOT NULL,
+              cost_val BIGINT NOT NULL,
+              add_income_val BIGINT NOT NULL,
+              PRIMARY KEY (asset_type, tier)
+            );
+            """
+        )
+        for asset_type, tier, cost_val, add_income_val in ASSET_DEFINITIONS_SEED:
+            await db_exec(
+                """
+                INSERT INTO econ_asset_definitions (asset_type, tier, cost_val, add_income_val)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (asset_type, tier)
+                DO UPDATE SET cost_val=EXCLUDED.cost_val, add_income_val=EXCLUDED.add_income_val;
+                """,
+                asset_type, tier, int(cost_val), int(add_income_val)
+            )
+        row = await db_fetchrow("SELECT COUNT(*) AS c FROM econ_asset_definitions;")
+        total = int(row["c"]) if row and "c" in row else 0
+        if total != len(ASSET_DEFINITIONS_SEED):
+            print(f"[warn] econ_asset_definitions rowcount={total} differs from seed={len(ASSET_DEFINITIONS_SEED)}.")
+        else:
+            print(f"[test] econ_asset_definitions seeded/verified: {total} row(s).")
+    except Exception as e:
+        print(f"[warn] seed_asset_definitions failed: {e}")
+
+
 
 async def asset_type_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     current_l = (current or "").lower()
@@ -797,6 +891,7 @@ async def delete_all_global_commands() -> None:
 @client.event
 async def on_ready():
     await ensure_schema()
+    await seed_asset_definitions()
     print(f"[test] Starting {APP_VERSION}…")
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; data guild: {DATA_GUILD_ID})")
     print(f"[debug] raw STAFF_ROLE_IDS env: {repr(_get('STAFF_ROLE_IDS',''))}")
