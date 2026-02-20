@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v90"
+APP_VERSION = "EconBot_v91"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -179,7 +179,9 @@ def format_currency(total_cinth: int) -> str:
 
 async def incremental_cost_between_tiers(asset_type: str, current_tier: str, target_tier: str) -> Optional[int]:
     """Upgrade cost from current_tier to target_tier for an asset_type.
+
     Rule: sum costs of tiers strictly above current tier through the target tier.
+    Fallback: cumulative(target) - cumulative(current) if rank-based sum cannot be computed.
     """
     cur_rank = _tier_rank(current_tier)
     tgt_rank = _tier_rank(target_tier)
@@ -197,7 +199,6 @@ async def incremental_cost_between_tiers(asset_type: str, current_tier: str, tar
     if not rows:
         return None
 
-    # Prefer rank-based sum
     if cur_rank is not None:
         total = 0
         any_found = False
@@ -212,7 +213,6 @@ async def incremental_cost_between_tiers(asset_type: str, current_tier: str, tar
         if any_found:
             return int(total)
 
-    # Fallback to cumulative difference
     cum_t = await cumulative_cost_to_tier(asset_type, target_tier)
     cum_c = await cumulative_cost_to_tier(asset_type, current_tier)
     if cum_t is None or cum_c is None:
@@ -598,9 +598,9 @@ async def character_autocomplete(
 
 
 async def ac_asset_for_character(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Autocomplete assets for selected character. Format: 'Type | Tier | Name'."""
+    """Autocomplete assets for the selected character. Format: 'Type | Tier | Name'."""
     try:
-        char = getattr(interaction.namespace, "character", None) or getattr(interaction.namespace, "character_name", None)
+        char = getattr(interaction.namespace, "character", None)
         if not char:
             return []
         rows = await get_assets_for_character(str(char))
@@ -619,7 +619,7 @@ async def ac_asset_for_character(interaction: discord.Interaction, current: str)
 
 
 async def ac_target_tier(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-    """Autocomplete higher tiers for the selected asset (same asset_type)."""
+    """Autocomplete higher tiers for the selected asset's type."""
     try:
         asset_label = getattr(interaction.namespace, "asset", None)
         if not asset_label:
@@ -630,6 +630,7 @@ async def ac_target_tier(interaction: discord.Interaction, current: str) -> List
         asset_type = parts[0]
         cur_tier = parts[1]
         cur_rank = _tier_rank(cur_tier)
+
         tiers = await get_tiers_for_asset_type(asset_type)
         needle = (current or "").lower()
         out: List[app_commands.Choice[str]] = []
@@ -1174,199 +1175,6 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
 
 
-@tree.command(name="upgrade_asset", description="(Staff) Upgrade an existing asset to a higher tier.", guild=discord.Object(id=GUILD_ID))
-@app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character, target_tier=ac_target_tier)
-async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, asset: str, target_tier: str):
-    await interaction.response.defer(ephemeral=True)
-
-    ok, dbg = await staff_check(interaction)
-    if not ok:
-        await interaction.followup.send(dbg, ephemeral=True)
-        return
-
-    parts = [p.strip() for p in str(asset).split("|")]
-    if len(parts) < 3:
-        await interaction.followup.send("Invalid asset selection.", ephemeral=True)
-        return
-    asset_type = parts[0]
-    current_tier = parts[1]
-    asset_name = "|".join(parts[2:]).strip()
-
-    exists = await db_fetchrow(
-        '''
-        SELECT 1
-        FROM econ_assets
-        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
-        LIMIT 1;
-        ''',
-        DATA_GUILD_ID,
-        character,
-        asset_type,
-        current_tier,
-        asset_name,
-    )
-    if not exists:
-        await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
-        return
-
-    cur_rank = _tier_rank(current_tier)
-    tgt_rank = _tier_rank(target_tier)
-    if cur_rank is not None and tgt_rank is not None and tgt_rank <= cur_rank:
-        await interaction.followup.send("Target tier must be higher than current tier.", ephemeral=True)
-        return
-
-    cost_val = await incremental_cost_between_tiers(asset_type, current_tier, target_tier)
-    if cost_val is None or cost_val <= 0:
-        await interaction.followup.send("Unable to calculate upgrade cost for that tier change.", ephemeral=True)
-        return
-
-    cur_bal = await get_balance(character)
-    if cur_bal < cost_val:
-        await interaction.followup.send(
-            f"Insufficient funds. Available: **{format_currency(cur_bal)}**. Required: **{format_currency(cost_val)}**.",
-            ephemeral=True,
-        )
-        return
-
-    await adjust_balance(character, -int(cost_val))
-    await db_exec(
-        '''
-        UPDATE econ_assets
-        SET tier=$1
-        WHERE guild_id=$2 AND character_name=$3 AND asset_type=$4 AND tier=$5 AND asset_name=$6;
-        ''',
-        target_tier,
-        DATA_GUILD_ID,
-        character,
-        asset_type,
-        current_tier,
-        asset_name,
-    )
-
-    await log_audit(
-        interaction,
-        "upgrade_asset",
-        {
-            "character": character,
-            "asset_type": asset_type,
-            "asset_name": asset_name,
-            "from_tier": current_tier,
-            "to_tier": target_tier,
-            "cost": int(cost_val),
-        },
-    )
-
-    try:
-        await refresh_bank_messages()
-    except Exception:
-        pass
-
-    await interaction.followup.send(
-        (
-            f"Upgraded **{character}** asset:\n"
-            f"- {asset_type} | {current_tier} | {asset_name}\n"
-            f"→ {asset_type} | {target_tier} | {asset_name}\n"
-            f"Cost: **{format_currency(cost_val)}**\n"
-            f"New balance: **{format_currency(await get_balance(character))}**"
-        ),
-        ephemeral=True,
-    )
-
-
-@tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (optional refund).", guild=discord.Object(id=GUILD_ID))
-@app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
-@app_commands.describe(refund_percent="Optional refund percent of cumulative cost (0-100). Default 0.")
-async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str, refund_percent: Optional[int] = 0):
-    await interaction.response.defer(ephemeral=True)
-
-    ok, dbg = await staff_check(interaction)
-    if not ok:
-        await interaction.followup.send(dbg, ephemeral=True)
-        return
-
-    refund_percent = int(refund_percent or 0)
-    if refund_percent < 0:
-        refund_percent = 0
-    if refund_percent > 100:
-        refund_percent = 100
-
-    parts = [p.strip() for p in str(asset).split("|")]
-    if len(parts) < 3:
-        await interaction.followup.send("Invalid asset selection.", ephemeral=True)
-        return
-    asset_type = parts[0]
-    tier = parts[1]
-    asset_name = "|".join(parts[2:]).strip()
-
-    row = await db_fetchrow(
-        '''
-        SELECT 1
-        FROM econ_assets
-        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
-        LIMIT 1;
-        ''',
-        DATA_GUILD_ID,
-        character,
-        asset_type,
-        tier,
-        asset_name,
-    )
-    if not row:
-        await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
-        return
-
-    refund_amount = 0
-    if refund_percent > 0:
-        base_cost = await cumulative_cost_to_tier(asset_type, tier)
-        if base_cost is None or base_cost <= 0:
-            await interaction.followup.send("Unable to calculate refund amount for this asset.", ephemeral=True)
-            return
-        refund_amount = int(round((base_cost * refund_percent) / 100.0))
-
-    await db_exec(
-        '''
-        DELETE FROM econ_assets
-        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5;
-        ''',
-        DATA_GUILD_ID,
-        character,
-        asset_type,
-        tier,
-        asset_name,
-    )
-
-    if refund_amount:
-        await adjust_balance(character, int(refund_amount))
-
-    await log_audit(
-        interaction,
-        "sell_asset",
-        {
-            "character": character,
-            "asset_type": asset_type,
-            "tier": tier,
-            "asset_name": asset_name,
-            "refund_percent": refund_percent,
-            "refund_amount": refund_amount,
-        },
-    )
-
-    try:
-        await refresh_bank_messages()
-    except Exception:
-        pass
-
-    msg = (
-        f"Sold/removed asset from **{character}**:\n"
-        f"- {asset_type} | {tier} | {asset_name}\n"
-    )
-    if refund_amount:
-        msg += f"Refund: **{format_currency(refund_amount)}** ({refund_percent}%)\n"
-    msg += f"New balance: **{format_currency(await get_balance(character))}**"
-
-    await interaction.followup.send(msg, ephemeral=True)
-
-
 @tree.command(name="econ_refresh_bank", description="(Staff) Refresh the bank dashboard messages.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 async def cmd_refresh_bank(interaction: discord.Interaction):
@@ -1492,19 +1300,197 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
         ephemeral=True,
     )
 
+@tree.command(name="upgrade_asset", description="(Staff) Upgrade an existing asset to a higher tier.", guild=discord.Object(id=GUILD_ID))
+@app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character, target_tier=ac_target_tier)
+async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, asset: str, target_tier: str):
+    await interaction.response.defer(ephemeral=True)
+
+    ok, dbg = await staff_check(interaction)
+    if not ok:
+        await interaction.followup.send(dbg, ephemeral=True)
+        return
+
+    parts = [p.strip() for p in str(asset).split("|")]
+    if len(parts) < 3:
+        await interaction.followup.send("Invalid asset selection.", ephemeral=True)
+        return
+    asset_type = parts[0]
+    current_tier = parts[1]
+    asset_name = "|".join(parts[2:]).strip()
+
+    exists = await db_fetchrow(
+        '''
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        asset_name,
+    )
+    if not exists:
+        await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
+        return
+
+    cur_rank = _tier_rank(current_tier)
+    tgt_rank = _tier_rank(target_tier)
+    if cur_rank is not None and tgt_rank is not None and tgt_rank <= cur_rank:
+        await interaction.followup.send("Target tier must be higher than current tier.", ephemeral=True)
+        return
+
+    cost_val = await incremental_cost_between_tiers(asset_type, current_tier, target_tier)
+    if cost_val is None or cost_val <= 0:
+        await interaction.followup.send("Unable to calculate upgrade cost for that tier change.", ephemeral=True)
+        return
+
+    cur_bal = await get_balance(character)
+    if cur_bal < cost_val:
+        await interaction.followup.send(
+            f"Insufficient funds. Available: **{format_currency(cur_bal)}**. Required: **{format_currency(cost_val)}**.",
+            ephemeral=True,
+        )
+        return
+
+    await adjust_balance(character, -int(cost_val))
+    await db_exec(
+        '''
+        UPDATE econ_assets
+        SET tier=$1
+        WHERE guild_id=$2 AND character_name=$3 AND asset_type=$4 AND tier=$5 AND asset_name=$6;
+        ''',
+        target_tier,
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        asset_name,
+    )
+
+    await log_audit(
+        interaction,
+        "upgrade_asset",
+        {
+            "character": character,
+            "asset_type": asset_type,
+            "asset_name": asset_name,
+            "from_tier": current_tier,
+            "to_tier": target_tier,
+            "cost": int(cost_val),
+        },
+    )
+
+    try:
+        await refresh_bank_dashboard(create_missing=True)
+    except Exception:
+        pass
+
+    await interaction.followup.send(
+        (
+            f"Upgraded **{character}** asset:\n"
+            f"- {asset_type} | {current_tier} | {asset_name}\n"
+            f"→ {asset_type} | {target_tier} | {asset_name}\n"
+            f"Cost: **{format_currency(cost_val)}**\n"
+            f"New balance: **{format_currency(await get_balance(character))}**"
+        ),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (optional refund).", guild=discord.Object(id=GUILD_ID))
+@app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
+@app_commands.describe(refund_percent="Optional refund percent of cumulative cost (0-100). Default 0.")
+async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str, refund_percent: Optional[int] = 0):
+    await interaction.response.defer(ephemeral=True)
+
+    ok, dbg = await staff_check(interaction)
+    if not ok:
+        await interaction.followup.send(dbg, ephemeral=True)
+        return
+
+    refund_percent = int(refund_percent or 0)
+    refund_percent = max(0, min(100, refund_percent))
+
+    parts = [p.strip() for p in str(asset).split("|")]
+    if len(parts) < 3:
+        await interaction.followup.send("Invalid asset selection.", ephemeral=True)
+        return
+    asset_type = parts[0]
+    tier = parts[1]
+    asset_name = "|".join(parts[2:]).strip()
+
+    row = await db_fetchrow(
+        '''
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        tier,
+        asset_name,
+    )
+    if not row:
+        await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
+        return
+
+    refund_amount = 0
+    if refund_percent > 0:
+        base_cost = await cumulative_cost_to_tier(asset_type, tier)
+        if base_cost is None or base_cost <= 0:
+            await interaction.followup.send("Unable to calculate refund amount for this asset.", ephemeral=True)
+            return
+        refund_amount = int(round((base_cost * refund_percent) / 100.0))
+
+    await db_exec(
+        '''
+        DELETE FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        tier,
+        asset_name,
+    )
+
+    if refund_amount:
+        await adjust_balance(character, int(refund_amount))
+
+    await log_audit(
+        interaction,
+        "sell_asset",
+        {
+            "character": character,
+            "asset_type": asset_type,
+            "tier": tier,
+            "asset_name": asset_name,
+            "refund_percent": refund_percent,
+            "refund_amount": refund_amount,
+        },
+    )
+
+    try:
+        await refresh_bank_dashboard(create_missing=True)
+    except Exception:
+        pass
+
+    msg = (
+        f"Sold/removed asset from **{character}**:\n"
+        f"- {asset_type} | {tier} | {asset_name}\n"
+    )
+    if refund_amount:
+        msg += f"Refund: **{format_currency(refund_amount)}** ({refund_percent}%)\n"
+    msg += f"New balance: **{format_currency(await get_balance(character))}**"
+
+    await interaction.followup.send(msg, ephemeral=True)
+
+
 # -------------------------
-
-# Ensure new commands are registered as GUILD commands even if decorator registration was skipped for any reason.
-# This is idempotent: if the command already exists for the guild, add_command will raise and we ignore.
-try:
-    tree.add_command(cmd_upgrade_asset, guild=discord.Object(id=GUILD_ID))
-except Exception:
-    pass
-try:
-    tree.add_command(cmd_sell_asset, guild=discord.Object(id=GUILD_ID))
-except Exception:
-    pass
-
 # Startup / sync
 # -------------------------
 
@@ -1534,14 +1520,15 @@ async def on_ready():
     print(f"[debug] raw STAFF_ROLE_IDS env: {repr(_get('STAFF_ROLE_IDS',''))}")
     print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
     print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
-try:
-    # Show what the bot thinks is registered before syncing (helps diagnose missing commands)
-    guild_cmd_names = sorted([c.name for c in tree.get_commands(guild=discord.Object(id=GUILD_ID))])
-    global_cmd_names = sorted([c.name for c in tree.get_commands()])
-    print(f"[debug] Registered GUILD commands (pre-sync): {guild_cmd_names}")
-    print(f"[debug] Registered GLOBAL commands (pre-sync): {global_cmd_names}")
-except Exception as e:
-    print(f"[warn] Could not enumerate commands pre-sync: {e}")
+
+    # Show what the bot thinks is registered before syncing (diagnose missing commands)
+    try:
+        guild_cmd_names = sorted([c.name for c in tree.get_commands(guild=discord.Object(id=GUILD_ID))])
+        global_cmd_names = sorted([c.name for c in tree.get_commands()])
+        print(f"[debug] Registered GUILD commands (pre-sync): {guild_cmd_names}")
+        print(f"[debug] Registered GLOBAL commands (pre-sync): {global_cmd_names}")
+    except Exception as e:
+        print(f"[warn] Could not enumerate commands pre-sync: {e}")
 
     # Delete global commands to remove duplicates
     await delete_all_global_commands()
