@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v77"
+APP_VERSION = "EconBot_v78"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -104,6 +104,39 @@ async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional
     )
     if not rows:
         return None
+
+
+def format_currency(total_cinth: int) -> str:
+    """Compact currency string with roll-up to highest denominations, dropping zeros, plus raw total."""
+    try:
+        total = int(total_cinth)
+    except Exception:
+        total = 0
+
+    sign = "-" if total < 0 else ""
+    n = abs(total)
+
+    denominations = [
+        (10000, "Mythic Crystal Novir", "Novir"),
+        (1000, "Platinum Oril", "Oril"),
+        (100, "Gold Elsh", "Elsh"),
+        (10, "Silver Arce", "Arce"),
+        (1, "Copper Cinth", "Cinth"),
+    ]
+
+    parts = []
+    for value, _full, short in denominations:
+        if n <= 0:
+            break
+        qty, n = divmod(n, value)
+        if qty:
+            parts.append(f"{qty} {short}")
+
+    if not parts:
+        parts = ["0 Cinth"]
+
+    compact = " • ".join(parts)
+    return f"{sign}{compact} (Total: {total:,} Copper Cinth)"
 
     if target_rank is not None:
         total = 0
@@ -777,7 +810,7 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
 async def cmd_balance(interaction: discord.Interaction, character: str):
     await interaction.response.defer(ephemeral=True)
     bal = await get_balance(character)
-    await interaction.followup.send(f"**{character}** balance: **{bal:,}**", ephemeral=True)
+    await interaction.followup.send(f"**{character}** balance: **{format_currency(bal)}**", ephemeral=True)
 
 
 @tree.command(name="income", description="Claim daily income for a character.", guild=discord.Object(id=GUILD_ID))
@@ -828,7 +861,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
 
     await log_audit(interaction, "income_claim", {"character": character, "income": daily_income, "new_balance": new_bal})
     await interaction.followup.send(
-        f"Claimed **{daily_income:,}** daily income for **{character}**.\nNew balance: **{new_bal:,}**",
+        f"Claimed **{format_currency(daily_income)}** daily income for **{character}**.\nNew balance: **{format_currency(new_bal)}**",
         ephemeral=True,
     )
 
@@ -859,7 +892,7 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
     await interaction.response.defer(ephemeral=True)
     new_bal = await adjust_balance(character, int(delta))
     await log_audit(interaction, "adjust_balance", {"character": character, "delta": int(delta), "new_balance": new_bal})
-    await interaction.followup.send(f"Adjusted **{character}** by **{delta:,}**. New balance: **{new_bal:,}**", ephemeral=True)
+    await interaction.followup.send(f"Adjusted **{character}** by **{format_currency(delta)}**. New balance: **{format_currency(new_bal)}**", ephemeral=True)
 
 
 @tree.command(name="econ_set_balance", description="(Staff) Set a character balance to an exact value.", guild=discord.Object(id=GUILD_ID))
@@ -870,7 +903,7 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     await interaction.response.defer(ephemeral=True)
     await set_balance(character, int(value))
     await log_audit(interaction, "set_balance", {"character": character, "value": int(value)})
-    await interaction.followup.send(f"Set **{character}** balance to **{int(value):,}**.", ephemeral=True)
+    await interaction.followup.send(f"Set **{character}** balance to **{format_currency(int(value))}**.", ephemeral=True)
 
 
 @tree.command(name="econ_refresh_bank", description="(Staff) Refresh the Bank dashboard channel messages.", guild=discord.Object(id=GUILD_ID))
@@ -919,7 +952,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     cur_bal = await get_balance(character)
     if cur_bal < cost_val:
         await interaction.followup.send(
-            f"Insufficient funds. Balance **{cur_bal:,}**, cost **{cost_val:,}**.",
+            f"Insufficient funds. Balance **{format_currency(cur_bal)}**, cost **{format_currency(cost_val)}**.",
             ephemeral=True,
         )
         return
@@ -993,8 +1026,8 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     await interaction.followup.send(
         f"Recorded purchase for **{character}**:\n"
         f"• **{asset_type}** — Tier **{tier}** — **{asset_name}**\n"
-        f"Cost: **{cost_val:,}** (new balance **{new_bal:,}**)\n"
-        f"Daily income now: **{new_daily_income:,}**",
+        f"Cost: **{format_currency(cost_val)}** (new balance **{format_currency(new_bal)}**)\n"
+        f"Daily income now: **{format_currency(new_daily_income)}**",
         ephemeral=True,
     )
 
