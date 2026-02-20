@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v92"
+APP_VERSION = "EconBot_v93"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1494,6 +1494,26 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
 # Startup / sync
 # -------------------------
 
+
+async def delete_all_guild_commands():
+    """Delete ALL guild-scoped commands in the configured GUILD_ID on Discord.
+    This is a server-side cleanup to eliminate stale signatures/duplicates.
+    """
+    try:
+        guild_obj = discord.Object(id=GUILD_ID)
+        guild_cmds = await tree.fetch_commands(guild=guild_obj)
+        if guild_cmds:
+            for c in guild_cmds:
+                try:
+                    await c.delete()
+                except Exception as e:
+                    print(f"[warn] Failed deleting GUILD /{getattr(c,'name','?')}: {e}")
+            print(f"[test] Requested deletion of {len(guild_cmds)} GUILD command(s).")
+        else:
+            print("[test] No GUILD commands found to delete.")
+    except Exception as e:
+        print(f"[warn] Guild command deletion failed/skipped: {e}")
+
 async def delete_all_global_commands() -> None:
     # You selected option B: bot deletes global commands automatically.
     try:
@@ -1532,6 +1552,21 @@ async def on_ready():
 
     # Delete global commands to remove duplicates
     await delete_all_global_commands()
+
+    # Force-register critical new commands into the guild registry (defensive).
+    # In rare cases, decorator registration can land in the local "global" set only.
+    try:
+        tree.add_command(cmd_upgrade_asset, guild=discord.Object(id=GUILD_ID))
+    except Exception:
+        pass
+    try:
+        tree.add_command(cmd_sell_asset, guild=discord.Object(id=GUILD_ID))
+    except Exception:
+        pass
+
+    # Hard reset guild commands on Discord to eliminate stale signatures/duplicates,
+    # then re-sync the authoritative set.
+    await delete_all_guild_commands()
 
     # Ensure any globally-registered commands in the local tree are also present in the guild tree
     # before syncing (prevents "exists in code but not in guild scope").
