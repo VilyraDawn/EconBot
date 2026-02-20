@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v96"
+APP_VERSION = "EconBot_v97"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -631,7 +631,7 @@ async def ac_target_tier(interaction: discord.Interaction, current: str) -> List
         cur_tier = parts[1]
         cur_rank = _tier_rank(cur_tier)
 
-        tiers = await get_tiers_for_asset_type(asset_type)
+        tiers = await list_tiers_for_type(asset_type)
         needle = (current or "").lower()
         out: List[app_commands.Choice[str]] = []
         for t in tiers:
@@ -1491,6 +1491,30 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
 
     await interaction.followup.send(msg, ephemeral=True)
 
+
+
+# -------------------------
+# Global app command error handler (prevents "stuck thinking" on exceptions)
+# -------------------------
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    # Always log the root error in Railway logs
+    try:
+        import traceback
+        traceback.print_exception(type(error), error, error.__traceback__)
+    except Exception:
+        pass
+
+    # Respond ephemerally so interactions don't hang forever
+    msg = "⚠️ Internal error while running that command. Check Railway logs for details."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
 
 # -------------------------
 # Startup / sync
