@@ -1,3 +1,14 @@
+# EconBot_v75 — Clean rebuild (guild-only commands, legacy DB partition, bank message IDs persisted in Postgres)
+# NOTE: This is a full replacement for main.py (Railway runs /app/main.py).
+# Constraints honored:
+# - Character-based economy (not user-based)
+# - No invented env vars (uses only the approved set)
+# - No invented DB tables EXCEPT the explicitly approved bank message persistence table (econ_bank_messages)
+# - No secondary_type, no ECON_ADMIN_ROLE_IDS, no duplicate purchase commands, no global slash sync (guild-only)
+# - All slash commands defer immediately
+
+from __future__ import annotations
+
 import os
 import json
 import re
