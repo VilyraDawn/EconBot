@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v85"
+APP_VERSION = "EconBot_v86"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -93,6 +93,50 @@ def _tier_rank(tier: str) -> Optional[int]:
 
 async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional[int]:
     """Cumulative cost: sum of all tier costs up to and including target tier for an asset type.
+
+async def incremental_cost_between_tiers(asset_type: str, current_tier: str, target_tier: str) -> Optional[int]:
+    """Upgrade cost from current_tier -> target_tier for an asset_type.
+    Sum of costs for tiers strictly above current and <= target.
+    """
+    cur_rank = _tier_rank(current_tier)
+    tgt_rank = _tier_rank(target_tier)
+    if tgt_rank is None:
+        return None
+
+    rows = await db_fetch(
+        '''
+        SELECT tier, cost_val
+        FROM econ_asset_definitions
+        WHERE asset_type=$1;
+        ''',
+        asset_type,
+    )
+    if not rows:
+        return None
+
+    # Rank-based sum (preferred)
+    if cur_rank is not None:
+        total = 0
+        any_found = False
+        for r in rows:
+            t = str(r["tier"])
+            tr = _tier_rank(t)
+            if tr is None:
+                continue
+            if tr > cur_rank and tr <= tgt_rank:
+                any_found = True
+                total += int(r["cost_val"])
+        if any_found:
+            return int(total)
+
+    # Fallback: cumulative difference
+    cum_t = await cumulative_cost_to_tier(asset_type, target_tier)
+    cum_c = await cumulative_cost_to_tier(asset_type, current_tier)
+    if cum_t is None or cum_c is None:
+        return None
+    return int(cum_t - cum_c)
+
+
 
     Requires tiers to be ordered by a numeric rank embedded in the tier label, e.g. '(1) ...', '(2) ...'.
     Falls back to the target tier's own cost if ranks are not parseable.
@@ -551,6 +595,57 @@ async def character_autocomplete(
         like,
     )
     return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
+
+async def ac_asset_for_character(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete assets for selected character. Value format: 'Type | Tier | Name'."""
+    try:
+        char = getattr(interaction.namespace, "character", None) or getattr(interaction.namespace, "character_name", None)
+        if not char:
+            return []
+        rows = await get_assets_for_character(str(char))
+        needle = (current or "").lower()
+        out: List[app_commands.Choice[str]] = []
+        for r in rows:
+            label = f"{r['asset_type']} | {r['tier']} | {r['asset_name']}"
+            if needle and needle not in label.lower():
+                continue
+            out.append(app_commands.Choice(name=label[:100], value=label[:100]))
+            if len(out) >= 25:
+                break
+        return out
+    except Exception:
+        return []
+
+
+async def ac_target_tier(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete target tiers for the selected asset (same type), filtered to higher tiers."""
+    try:
+        asset_label = getattr(interaction.namespace, "asset", None)
+        if not asset_label:
+            return []
+        parts = [p.strip() for p in str(asset_label).split("|")]
+        if len(parts) < 3:
+            return []
+        asset_type = parts[0]
+        cur_tier = parts[1]
+        cur_rank = _tier_rank(cur_tier)
+        tiers = await get_tiers_for_asset_type(asset_type)
+        needle = (current or "").lower()
+        out: List[app_commands.Choice[str]] = []
+        for t in tiers:
+            tr = _tier_rank(t)
+            if cur_rank is not None and tr is not None and tr <= cur_rank:
+                continue
+            if needle and needle not in t.lower():
+                continue
+            out.append(app_commands.Choice(name=t[:100], value=t[:100]))
+            if len(out) >= 25:
+                break
+        return out
+    except Exception:
+        return []
+
+
 
 
 async def get_character_owner(character_name: str) -> Optional[int]:
@@ -1064,6 +1159,200 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction: discord.Interaction, character: str, value: int):
     await interaction.response.defer(ephemeral=True)
+
+@tree.command(name="upgrade_asset", description="Upgrade an existing asset to a higher tier (deducts upgrade cost).")
+@app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character, target_tier=ac_target_tier)
+async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, asset: str, target_tier: str):
+    await interaction.response.defer(ephemeral=True)
+
+    ok, dbg = await staff_check(interaction)
+    if not ok:
+        await interaction.followup.send(dbg, ephemeral=True)
+        return
+
+    parts = [p.strip() for p in str(asset).split("|")]
+    if len(parts) < 3:
+        await interaction.followup.send("Invalid asset selection.", ephemeral=True)
+        return
+    asset_type = parts[0]
+    current_tier = parts[1]
+    asset_name = "|".join(parts[2:]).strip()
+
+    exists = await db_fetchrow(
+        '''
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        asset_name,
+    )
+    if not exists:
+        await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
+        return
+
+    cur_rank = _tier_rank(current_tier)
+    tgt_rank = _tier_rank(target_tier)
+    if cur_rank is not None and tgt_rank is not None and tgt_rank <= cur_rank:
+        await interaction.followup.send("Target tier must be higher than current tier.", ephemeral=True)
+        return
+
+    cost_val = await incremental_cost_between_tiers(asset_type, current_tier, target_tier)
+    if cost_val is None:
+        await interaction.followup.send("Unable to calculate upgrade cost for that tier change.", ephemeral=True)
+        return
+
+    cur_bal = await get_balance(character)
+    if cur_bal < cost_val:
+        await interaction.followup.send(
+            f"Insufficient funds. Available: **{format_currency(cur_bal)}**. Required: **{format_currency(cost_val)}**.",
+            ephemeral=True,
+        )
+        return
+
+    await adjust_balance(character, -int(cost_val))
+    await db_exec(
+        '''
+        UPDATE econ_assets
+        SET tier=$1
+        WHERE guild_id=$2 AND character_name=$3 AND asset_type=$4 AND tier=$5 AND asset_name=$6;
+        ''',
+        target_tier,
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        asset_name,
+    )
+
+    await log_audit(
+        interaction,
+        "upgrade_asset",
+        {
+            "character": character,
+            "asset_type": asset_type,
+            "asset_name": asset_name,
+            "from_tier": current_tier,
+            "to_tier": target_tier,
+            "cost": int(cost_val),
+        },
+    )
+
+    try:
+        await refresh_bank_messages()
+    except Exception:
+        pass
+
+    await interaction.followup.send(
+        (
+            f"Upgraded **{character}** asset:\n"
+            f"- {asset_type} | {current_tier} | {asset_name}\n"
+            f"→ {asset_type} | {target_tier} | {asset_name}\n"
+            f"Cost: **{format_currency(cost_val)}**\n"
+            f"New balance: **{format_currency(await get_balance(character))}**"
+        ),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="sell_asset", description="Sell/remove an asset (optional refund).")
+@app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
+@app_commands.describe(refund_percent="Optional refund percent of the asset's cumulative cost (0-100). Default 0.")
+async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str, refund_percent: Optional[int] = 0):
+    await interaction.response.defer(ephemeral=True)
+
+    ok, dbg = await staff_check(interaction)
+    if not ok:
+        await interaction.followup.send(dbg, ephemeral=True)
+        return
+
+    refund_percent = int(refund_percent or 0)
+    if refund_percent < 0:
+        refund_percent = 0
+    if refund_percent > 100:
+        refund_percent = 100
+
+    parts = [p.strip() for p in str(asset).split("|")]
+    if len(parts) < 3:
+        await interaction.followup.send("Invalid asset selection.", ephemeral=True)
+        return
+    asset_type = parts[0]
+    tier = parts[1]
+    asset_name = "|".join(parts[2:]).strip()
+
+    row = await db_fetchrow(
+        '''
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        tier,
+        asset_name,
+    )
+    if not row:
+        await interaction.followup.send("That asset no longer exists on this character.", ephemeral=True)
+        return
+
+    refund_amount = 0
+    if refund_percent > 0:
+        base_cost = await cumulative_cost_to_tier(asset_type, tier)
+        if base_cost is None:
+            await interaction.followup.send("Unable to calculate refund amount for this asset.", ephemeral=True)
+            return
+        refund_amount = int(round((base_cost * refund_percent) / 100.0))
+
+    await db_exec(
+        '''
+        DELETE FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        tier,
+        asset_name,
+    )
+
+    if refund_amount:
+        await adjust_balance(character, int(refund_amount))
+
+    await log_audit(
+        interaction,
+        "sell_asset",
+        {
+            "character": character,
+            "asset_type": asset_type,
+            "tier": tier,
+            "asset_name": asset_name,
+            "refund_percent": refund_percent,
+            "refund_amount": refund_amount,
+        },
+    )
+
+    try:
+        await refresh_bank_messages()
+    except Exception:
+        pass
+
+    msg = (
+        f"Sold/removed asset from **{character}**:\n"
+        f"- {asset_type} | {tier} | {asset_name}\n"
+    )
+    if refund_amount:
+        msg += f"Refund: **{format_currency(refund_amount)}** ({refund_percent}%)\n"
+    msg += f"New balance: **{format_currency(await get_balance(character))}**"
+
+    await interaction.followup.send(msg, ephemeral=True)
+
+
 
     value = int(value)
     if value < 0:
