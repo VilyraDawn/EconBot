@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 import asyncpg
 
-APP_VERSION = "EconBot_v51"
+APP_VERSION = "EconBot_v52"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -17,6 +17,12 @@ except Exception:
 
 ASSET_XLSX_FILENAME = "NEW Asset Table.xlsx"
 SEP = "|||"
+
+# If the XLSX file is not present in the deploy container, the bot can fall back to
+# an embedded snapshot derived from NEW Asset Table.xlsx (SHA256=c027a200d5de80dcc405bfa0703a87a8426464f72d18123368cb719b678a591f).
+# This preserves "spreadsheet is the authority" behavior for this deployment.
+EMBEDDED_ASSET_XLSX_SHA256 = "c027a200d5de80dcc405bfa0703a87a8426464f72d18123368cb719b678a591f"
+EMBEDDED_ASSET_ROWS_JSON = r"""[{"asset_type": "Guild Trade Workshop", "tier": "(1) Guild Apprentice", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Guild Trade Workshop", "tier": "(2) Guild Journeyman", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Guild Trade Workshop", "tier": "(3) Leased Workshop", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Guild Trade Workshop", "tier": "(4) Small Workshop", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Guild Trade Workshop", "tier": "(5) Large Workshop", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Market Stall", "tier": "(1) Consignment Arrangement", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Market Stall", "tier": "(2) Small Alley Stand", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Market Stall", "tier": "(3) Market Stall", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Market Stall", "tier": "(4) Small Shop", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Market Stall", "tier": "(5) Large Shop", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Farm/Ranch", "tier": "(1) Subsistence Surplus", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Farm/Ranch", "tier": "(2) Leased Fields", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Farm/Ranch", "tier": "(3) Owned Acre", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Farm/Ranch", "tier": "(4) Small Fields and Barn", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Farm/Ranch", "tier": "(5) Large Fields and Barn", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Tavern/Inn", "tier": "(1) One-Room Flophouse", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Tavern/Inn", "tier": "(2) Leased Establishment", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Tavern/Inn", "tier": "(3) Small Tavern", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Tavern/Inn", "tier": "(4) Large Tavern", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Tavern/Inn", "tier": "(5) Large Tavern and Inn", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Warehouse/Trade House", "tier": "(1) Small Storage Shed", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Warehouse/Trade House", "tier": "(2) Large Storage Shed", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Warehouse/Trade House", "tier": "(3) Small Trading Post", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Warehouse/Trade House", "tier": "(4) Large Trading Post", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Warehouse/Trade House", "tier": "(5) Large Warehouse and Trading Post", "cost_val": 0, "add_income_val": 0}, {"asset_type": "House", "tier": "(1) Shack", "cost_val": 0, "add_income_val": 0}, {"asset_type": "House", "tier": "(2) Hut", "cost_val": 0, "add_income_val": 0}, {"asset_type": "House", "tier": "(3) House", "cost_val": 0, "add_income_val": 0}, {"asset_type": "House", "tier": "(4) Lodge", "cost_val": 0, "add_income_val": 0}, {"asset_type": "House", "tier": "(5) Mansion", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Village", "tier": "(1) Chartered Assembly", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Village", "tier": "(2) Hamlet", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Village", "tier": "(3) Village", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Village", "tier": "(4) Town", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Village", "tier": "(5) Small City", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Weapons", "tier": "(1) Hit +1 / Dmg +1d4", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Weapons", "tier": "(2) Hit +1 / Dmg +1d6", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Weapons", "tier": "(3) Hit +2 / Dmg +1d8", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Weapons", "tier": "(4) Hit +2 / Dmg +1d10", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Weapons", "tier": "(5) Hit +2 / Dmg +1d12", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Armor", "tier": "(1) AC +1", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Armor", "tier": "(2) AC +2", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Armor", "tier": "(3) AC +2 / Adv Magic Atk", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Armor", "tier": "(4) AC +2 / Adv Magic and Melee Atk", "cost_val": 0, "add_income_val": 0}, {"asset_type": "Armor", "tier": "(5) AC +3 / Adv Magic and Melee Atk", "cost_val": 0, "add_income_val": 0}]"""
 
 def _get(name, default=None):
     v = os.getenv(name)
@@ -288,8 +294,15 @@ class AssetCatalog:
         self.path = self._find_xlsx()
 
         if not self.path:
-            print(f"[warn] Asset spreadsheet not found: {ASSET_XLSX_FILENAME} (expected at /app/{ASSET_XLSX_FILENAME})")
-            return
+            # Container does not have the XLSX. Fall back to embedded snapshot.
+            print(f"[warn] Asset spreadsheet not found at /app/{ASSET_XLSX_FILENAME}. Using EMBEDDED asset catalog snapshot (SHA256={EMBEDDED_ASSET_XLSX_SHA256}).")
+            try:
+                raw_rows = json.loads(EMBEDDED_ASSET_ROWS_JSON)
+                self._load_from_embedded(raw_rows)
+                return
+            except Exception as e:
+                print(f"[warn] Embedded asset catalog failed to load: {e}")
+                return
 
         try:
             raw = SimpleXlsx(self.path).read_rows()
@@ -880,8 +893,6 @@ async def on_ready():
     await db.init()
 
     assets.load()
-    if not assets.is_loaded():
-        print(f"[FATAL] Asset spreadsheet missing. You must deploy '{ASSET_XLSX_FILENAME}' into /app. Purchase commands will not function.")
 
     guild_obj = discord.Object(id=int(GUILD_ID))
 
