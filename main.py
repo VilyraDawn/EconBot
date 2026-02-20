@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v81"
+APP_VERSION = "EconBot_v82"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1035,9 +1035,32 @@ async def cmd_econ_commands(interaction: discord.Interaction):
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delta: int):
     await interaction.response.defer(ephemeral=True)
-    new_bal = await adjust_balance(character, int(delta))
-    await log_audit(interaction, "adjust_balance", {"character": character, "delta": int(delta), "new_balance": new_bal})
-    await interaction.followup.send(f"Adjusted **{character}** by **{format_currency(delta)}**. New balance: **{format_currency(new_bal)}**", ephemeral=True)
+
+    delta = int(delta)
+    cur_bal = await get_balance(character)
+    proposed = int(cur_bal) + int(delta)
+
+    if proposed < 0:
+        await interaction.followup.send(
+            (
+                "Denied: that adjustment would take the balance negative.
+"
+                f"Available funds: **{format_currency(cur_bal)}**
+"
+                f"Attempted adjustment: **{format_currency(delta)}**
+"
+                f"Would result in: **{format_currency(proposed)}**"
+            ),
+            ephemeral=True,
+        )
+        return
+
+    new_bal = await adjust_balance(character, delta)
+    await log_audit(interaction, "adjust_balance", {"character": character, "delta": delta, "new_balance": new_bal})
+    await interaction.followup.send(
+        f"Adjusted **{character}** by **{format_currency(delta)}**. New balance: **{format_currency(new_bal)}**",
+        ephemeral=True,
+    )
 
 
 @tree.command(name="econ_set_balance", description="(Staff) Set a character balance to an exact value.", guild=discord.Object(id=GUILD_ID))
@@ -1046,9 +1069,25 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
 @app_commands.autocomplete(character=character_autocomplete)
 async def cmd_econ_set_balance(interaction: discord.Interaction, character: str, value: int):
     await interaction.response.defer(ephemeral=True)
-    await set_balance(character, int(value))
-    await log_audit(interaction, "set_balance", {"character": character, "value": int(value)})
-    await interaction.followup.send(f"Set **{character}** balance to **{format_currency(int(value))}**.", ephemeral=True)
+
+    value = int(value)
+    if value < 0:
+        cur_bal = await get_balance(character)
+        await interaction.followup.send(
+            (
+                "Denied: balance cannot be set to a negative value.
+"
+                f"Current balance: **{format_currency(cur_bal)}**
+"
+                f"Attempted set value: **{format_currency(value)}**"
+            ),
+            ephemeral=True,
+        )
+        return
+
+    await set_balance(character, value)
+    await log_audit(interaction, "set_balance", {"character": character, "value": value})
+    await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
 
 
 @tree.command(name="econ_refresh_bank", description="(Staff) Refresh the Bank dashboard channel messages.", guild=discord.Object(id=GUILD_ID))
