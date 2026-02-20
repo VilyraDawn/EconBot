@@ -5,10 +5,8 @@ from typing import Optional, List, Tuple
 import discord
 from discord import app_commands
 import asyncpg
-import re
 
-APP_VERSION = "EconBot_v64"
-LAST_MEMBER_FETCH_ERROR = ""
+APP_VERSION = "EconBot_v65"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -206,39 +204,6 @@ class DB:
               action TEXT NOT NULL,
               details JSONB NOT NULL DEFAULT '{}'::jsonb
             );""")
-
-            # --- Data continuity: migrate econ tables from LEGACY_SOURCE_GUILD_ID to GUILD_ID (one-time, non-destructive) ---
-            try:
-                if int(LEGACY_SOURCE_GUILD_ID) != int(GUILD_ID):
-                    # only migrate if target guild has no balances yet but legacy does
-                    legacy_bal = await con.fetchval("SELECT COUNT(*) FROM econ_balances WHERE guild_id=$1;", int(LEGACY_SOURCE_GUILD_ID))
-                    target_bal = await con.fetchval("SELECT COUNT(*) FROM econ_balances WHERE guild_id=$1;", int(GUILD_ID))
-                    if int(legacy_bal or 0) > 0 and int(target_bal or 0) == 0:
-                        await con.execute("""
-                            INSERT INTO econ_balances (guild_id, character_name, balance_val, updated_at)
-                            SELECT $2, character_name, balance_val, updated_at
-                            FROM econ_balances WHERE guild_id=$1
-                            ON CONFLICT (guild_id, character_name) DO NOTHING;
-                        """, int(LEGACY_SOURCE_GUILD_ID), int(GUILD_ID))
-                        await con.execute("""
-                            INSERT INTO econ_income_claims (guild_id, character_name, last_claim_date)
-                            SELECT $2, character_name, last_claim_date
-                            FROM econ_income_claims WHERE guild_id=$1
-                            ON CONFLICT (guild_id, character_name) DO NOTHING;
-                        """, int(LEGACY_SOURCE_GUILD_ID), int(GUILD_ID))
-                        # econ_assets has no PK in this build; dedupe by natural key (guild,user,character,asset_name,type,tier)
-                        await con.execute("""
-                            INSERT INTO econ_assets (guild_id, character_name, asset_type, tier, created_at, updated_at, asset_name, user_id)
-                            SELECT $2, character_name, asset_type, tier, created_at, updated_at, COALESCE(asset_name,''), COALESCE(user_id,0)
-                            FROM econ_assets WHERE guild_id=$1
-                        """, int(LEGACY_SOURCE_GUILD_ID), int(GUILD_ID))
-                        await con.execute("""
-                            INSERT INTO econ_audit_log (guild_id, actor_user_id, action, details)
-                            VALUES ($1, 0, 'auto_migrate_legacy_guild', jsonb_build_object('from', $2, 'to', $1));
-                        """, int(GUILD_ID), int(LEGACY_SOURCE_GUILD_ID))
-            except Exception:
-                pass
-
 
             # NEW: Asset catalog table (requested)
             await con.execute("""
@@ -457,36 +422,11 @@ db = DB(DATABASE_URL)
 async def _ensure_member(interaction: discord.Interaction) -> discord.Member | None:
     """Ensure we have a discord.Member (with roles/permissions) for a guild interaction.
 
-    Reliable role detection requires intents.members=True AND (in Discord Developer Portal) Server Members Intent enabled.
-    We attempt:
-      1) interaction.user if it's already a Member
-      2) guild.get_member() cache
-      3) guild.fetch_member() API call
+    With Intents.none(), interaction.user is usually a Member, but can sometimes be a User-like object
+    without roles. We fetch the Member from the API as a fallback (does not require members intent).
     """
-    global LAST_MEMBER_FETCH_ERROR
-    LAST_MEMBER_FETCH_ERROR = ""
     g = interaction.guild
     if not g:
-        LAST_MEMBER_FETCH_ERROR = "interaction.guild is None (command invoked outside a guild?)"
-        return None
-    u = interaction.user
-    if isinstance(u, discord.Member):
-        return u
-    if hasattr(u, "roles"):
-        try:
-            return u  # type: ignore[return-value]
-        except Exception:
-            pass
-    try:
-        m = g.get_member(u.id)
-        if m:
-            return m
-    except Exception as e:
-        LAST_MEMBER_FETCH_ERROR = f"guild.get_member failed: {e}"
-    try:
-        return await g.fetch_member(u.id)
-    except Exception as e:
-        LAST_MEMBER_FETCH_ERROR = f"guild.fetch_member failed: {e}"
         return None
     u = interaction.user
     if isinstance(u, discord.Member):
@@ -542,20 +482,14 @@ async def staff_check(interaction: discord.Interaction) -> tuple[bool, str]:
     allowed = is_staff_member(member)
     role_ids = _member_role_ids(member)
     gp = getattr(member, "guild_permissions", None) if member else None
-
     dbg = (
-        f"""Bot version: {APP_VERSION}
-Interaction guild_id: {getattr(interaction, 'guild_id', None)}
-Configured GUILD_ID: {GUILD_ID}
-User ID: {getattr(interaction.user, 'id', None)}
-Member fetched: {member is not None}
-Member fetch error: {LAST_MEMBER_FETCH_ERROR}
-Detected role IDs: {role_ids}
-Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}
-Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}
-Admin: {bool(getattr(gp,'administrator', False))}
-Manage Guild: {bool(getattr(gp,'manage_guild', False))}
-Manage Messages: {bool(getattr(gp,'manage_messages', False))}"""
+        f"Your user_id: {interaction.user.id}\n"
+        f"Detected role IDs: {role_ids}\n"
+        f"Configured STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}\n"
+        f"Configured STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}\n"
+        f"Admin: {bool(getattr(gp,'administrator', False))}\n"
+        f"Manage Guild: {bool(getattr(gp,'manage_guild', False))}\n"
+        f"Manage Messages: {bool(getattr(gp,'manage_messages', False))}"
     )
     return allowed, dbg
 
@@ -566,7 +500,9 @@ def can_refresh_bank(member: Optional[discord.Member]) -> bool:
 
     # User-ID allowlist fallback
     try:
-            except Exception:
+        if int(getattr(member, "id", 0)) in STAFF_USER_IDS_ALLOWLIST:
+            return True
+    except Exception:
         pass
     try:
         if member.guild_permissions.administrator:
@@ -577,8 +513,7 @@ def can_refresh_bank(member: Optional[discord.Member]) -> bool:
         return True
     return is_staff_member(member)
 
-intents = discord.Intents.default()  # includes guilds
-intents.members = True  # required for reliable role detection
+intents = discord.Intents.none()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 GUILD_OBJ = discord.Object(id=int(GUILD_ID))
@@ -587,7 +522,7 @@ GUILD_OBJ = discord.Object(id=int(GUILD_ID))
 
 async def character_autocomplete(interaction: discord.Interaction, current: str):
     try:
-        res = await db.search_characters(GUILD_ID, current or "", 25)
+        res = await db.search_characters(LEGACY_SOURCE_GUILD_ID, current or "", 25)
         return [app_commands.Choice(name=n, value=n) for n, _uid in res]
     except Exception:
         return []
@@ -770,7 +705,7 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
     mem = await _ensure_member(interaction)
     allowed, dbg = await staff_check(interaction)
     if not allowed:
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf Detected role IDs is empty, enable **Server Members Intent** in the Discord Developer Portal for this bot and keep `intents.members = True` in code.\n\n--- Debug ---\n" + dbg, ephemeral=True)
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
 
     bal = await db.get_balance(g.id, character)
     new_bal = bal + int(delta_val)
@@ -796,7 +731,7 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     mem = await _ensure_member(interaction)
     allowed, dbg = await staff_check(interaction)
     if not allowed:
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf Detected role IDs is empty, enable **Server Members Intent** in the Discord Developer Portal for this bot and keep `intents.members = True` in code.\n\n--- Debug ---\n" + dbg, ephemeral=True)
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
     if int(new_balance_val) < 0:
         return await interaction.followup.send("Balance cannot be negative.", ephemeral=True)
 
@@ -824,7 +759,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     mem = await _ensure_member(interaction)
     allowed, dbg = await staff_check(interaction)
     if not allowed:
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf Detected role IDs is empty, enable **Server Members Intent** in the Discord Developer Portal for this bot and keep `intents.members = True` in code.\n\n--- Debug ---\n" + dbg, ephemeral=True)
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
 
     asset_type = (asset_type or "").strip()
     tier = (tier or "").strip()
@@ -905,7 +840,7 @@ async def cmd_econ_commands(interaction: discord.Interaction):
     mem = await _ensure_member(interaction)
     allowed, dbg = await staff_check(interaction)
     if not allowed:
-        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf Detected role IDs is empty, enable **Server Members Intent** in the Discord Developer Portal for this bot and keep `intents.members = True` in code.\n\n--- Debug ---\n" + dbg, ephemeral=True)
+        return await interaction.followup.send("You do not have permission to run this staff command.\n\nIf you expect access, verify STAFF_ROLE_IDS matches your role IDs, or grant Admin/Manage Server/Manage Messages.\n\n--- Debug ---\n" + dbg, ephemeral=True)
     text = (
         "**Player Commands**\n"
         "/balance — Show a character’s current money and owned assets.\n"
@@ -929,12 +864,41 @@ async def on_ready():
 
     guild_obj = discord.Object(id=int(GUILD_ID))
 
-    # --- Command sync (guild-only) ---
-synced = await tree.sync(guild=guild_obj)
+    # --- HARD cleanup of duplicates (requested) ---
+    # Delete ALL 'purchase_new' commands registered globally and in this guild, then re-sync guild-only.
     try:
-        print('[test] Synced commands: ' + ', '.join([c.name for c in synced]))
-    except Exception:
-        pass
+        # Global commands
+        try:
+            global_cmds = await tree.fetch_commands()  # global
+            for c in global_cmds:
+                if getattr(c, "name", "") == "purchase_new":
+                    try:
+                        await c.delete()
+                        print("[test] Deleted GLOBAL /purchase_new (cleanup).")
+                    except Exception as e:
+                        print(f"[warn] Failed to delete GLOBAL /purchase_new: {e}")
+        except Exception as e:
+            print(f"[warn] Global command fetch skipped: {e}")
+
+        # Guild commands
+        try:
+            guild_cmds = await tree.fetch_commands(guild=guild_obj)
+            for c in guild_cmds:
+                if getattr(c, "name", "") == "purchase_new":
+                    try:
+                        await c.delete()
+                        print("[test] Deleted GUILD /purchase_new (cleanup).")
+                    except Exception as e:
+                        print(f"[warn] Failed to delete GUILD /purchase_new: {e}")
+        except Exception as e:
+            print(f"[warn] Guild command fetch skipped: {e}")
+
+    except Exception as e:
+        print(f"[warn] Duplicate cleanup step failed: {e}")
+
+    # Sync guild-only command set
+    try:
+        synced = await tree.sync(guild=guild_obj)
         print(f"[test] Synced {len(synced)} guild command(s).")
     except Exception as e:
         print(f"[warn] Guild sync failed: {e}")
