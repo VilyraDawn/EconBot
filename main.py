@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v95"
+APP_VERSION = "EconBot_v96"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -1116,6 +1116,8 @@ async def cmd_econ_commands(interaction: discord.Interaction):
         "• `/income` — claim daily income\n\n"
         "**Staff**\n"
         "• `/purchase_new` — record an asset purchase\n"
+        "• `/upgrade_asset` — upgrade an existing asset\n"
+        "• `/sell_asset` — sell/remove an existing asset\n"
         "• `/econ_adjust` — adjust balance by delta\n"
         "• `/econ_set_balance` — set balance to value\n"
         "• `/econ_refresh_bank` — refresh bank dashboard\n"
