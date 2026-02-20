@@ -7,7 +7,7 @@ from discord import app_commands
 import asyncpg
 import re
 
-APP_VERSION = "EconBot_v70"
+APP_VERSION = "EconBot_v71"
 
 # --- Timezone handling (Railway-safe) ---
 try:
@@ -612,12 +612,15 @@ async def refresh_bank_dashboard(guild: discord.Guild):
             msgs.append(await ch.fetch_message(mid))
         except Exception:
             msgs.append(None)
-    while len(msgs) < len(users):
-        m = await ch.send("Initializing Bank of Vilyra…", allowed_mentions=discord.AllowedMentions.none())
-        msgs.append(m)
-        msg_ids.append(m.id)
+    # If BANK_MESSAGE_IDS are missing/outdated, do NOT auto-create new messages (prevents channel spam).
+    # Staff should set BANK_MESSAGE_IDS to existing message IDs if they want the bank dashboard persisted.
+    if len(msgs) < len(users):
+        print(f"[warn] Bank dashboard missing messages: have {len(msgs)} message(s) for {len(users)} user(s). "
+              f"Not creating new messages automatically to avoid spam. Set BANK_MESSAGE_IDS to existing messages.")
+        return
 
     for i, uid in enumerate(users):
+
         msg = msgs[i] or await ch.fetch_message(msg_ids[i])
         display = await get_display_name_no_ping(guild, uid)
         lines = []
@@ -870,20 +873,28 @@ async def on_ready():
     print(f"[debug] raw STAFF_ROLE_IDS env: {os.getenv('STAFF_ROLE_IDS', '')!r}")
 
     # One-time cleanup: delete ALL GLOBAL application commands to prevent duplicate (global+guild) commands.
+    # IMPORTANT: Do NOT delete guild commands here; we want stable guild command IDs.
     try:
-        global_cmds = await tree.fetch_commands()
+        global_cmds = await tree.fetch_commands()  # global commands
         if global_cmds:
             for c in global_cmds:
                 try:
                     await c.delete()
                 except Exception as e:
                     print(f"[warn] Failed to delete GLOBAL /{getattr(c,'name','?')}: {e}")
-            print(f"[test] Deleted {len(global_cmds)} GLOBAL command(s) (dedupe cleanup).")
+            print(f"[test] Requested deletion of {len(global_cmds)} GLOBAL command(s) (dedupe cleanup).")
         else:
             print("[test] No GLOBAL commands found (dedupe cleanup).")
+        # Confirm (best effort; Discord may take time to fully propagate)
+        try:
+            remaining = await tree.fetch_commands()
+            if remaining:
+                print(f"[warn] GLOBAL commands still present after deletion request: {len(remaining)} (may take time to propagate).")
+        except Exception:
+            pass
     except Exception as e:
         print(f"[warn] Global command cleanup skipped: {e}")
-    print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
+print(f"[debug] STAFF_ROLE_IDS (effective): {sorted(list(STAFF_ROLE_IDS))}")
     print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
     await db.init()
 
