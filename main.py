@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v100"
+APP_VERSION = "EconBot_v101"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -90,26 +90,6 @@ def _tier_rank(tier: str) -> Optional[int]:
     except Exception:
         return None
 
-
-
-async def tier_cost_for(asset_type: str, tier: str) -> int | None:
-    """Return cost_val for the exact tier (NOT cumulative)."""
-    row = await db_fetchrow(
-        '''
-        SELECT cost_val
-        FROM econ_asset_definitions
-        WHERE asset_type=$1 AND tier=$2
-        LIMIT 1;
-        ''',
-        asset_type,
-        tier,
-    )
-    if not row:
-        return None
-    try:
-        return int(row["cost_val"])
-    except Exception:
-        return None
 
 async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional[int]:
     """Cumulative cost: sum of all tier costs up to and including target tier for an asset type.
@@ -195,6 +175,30 @@ def format_currency(total_cinth: int) -> str:
     compact = " • ".join(parts)
     return f"{sign}{compact} (Total: {total:,} Copper Cinth)"
 
+# Base daily income granted on /income claim (in Copper Cinth units)
+BASE_DAILY_INCOME = 10
+
+
+
+
+async def tier_cost_for(asset_type: str, tier: str) -> Optional[int]:
+    """Return cost_val for the exact tier (NOT cumulative)."""
+    row = await db_fetchrow(
+        '''
+        SELECT cost_val
+        FROM econ_asset_definitions
+        WHERE asset_type=$1 AND tier=$2
+        LIMIT 1;
+        ''',
+        asset_type,
+        tier,
+    )
+    if not row:
+        return None
+    try:
+        return int(row["cost_val"])
+    except Exception:
+        return None
 
 
 async def incremental_cost_between_tiers(asset_type: str, current_tier: str, target_tier: str) -> Optional[int]:
@@ -1102,10 +1106,10 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         await interaction.followup.send("Daily income already claimed today.", ephemeral=True)
         return
 
-    daily_income = await recompute_daily_income(character)
-    # Add daily income to balance
-    new_bal = await adjust_balance(character, daily_income)
-    # Upsert claim
+    asset_income = await recompute_daily_income(character)
+    total_income = BASE_DAILY_INCOME + int(asset_income or 0)
+    # Add total income (base + assets) to balance
+    new_bal = await adjust_balance(character, total_income)
     await db_exec(
         """
         INSERT INTO econ_income_claims (guild_id, character_name, last_claim_date)
@@ -1118,9 +1122,9 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         today,
     )
 
-    await log_audit(interaction, "income_claim", {"character": character, "income": daily_income, "new_balance": new_bal})
+    await log_audit(interaction, "income_claim", {"character": character, "base_income": BASE_DAILY_INCOME, "asset_income": asset_income, "total_income": total_income, "new_balance": new_bal})
     await interaction.followup.send(
-        f"Claimed **{format_currency(daily_income)}** daily income for **{character}**.\nNew balance: **{format_currency(new_bal)}**",
+        f"Claimed daily income for **{character}**:\n• Base: **{format_currency(BASE_DAILY_INCOME)}**\n• Assets: **{format_currency(asset_income)}**\n• Total: **{format_currency(total_income)}**\n\nNew balance: **{format_currency(new_bal)}**",
         ephemeral=True,
     )
 
@@ -1460,6 +1464,7 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
             return
         refund_amount = int(round((tier_cost * refund_percent) / 100.0))
 
+
     await db_exec(
         '''
         DELETE FROM econ_assets
@@ -1498,7 +1503,7 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
         f"- {asset_type} | {tier} | {asset_name}\n"
     )
     if refund_amount:
-        msg += f"Refund: **{format_currency(refund_amount)}** ({refund_percent}% of tier cost)\n"
+        msg += f"Refund: **{format_currency(refund_amount)}** ({refund_percent}%)\n"
     msg += f"New balance: **{format_currency(await get_balance(character))}**"
 
     await interaction.followup.send(msg, ephemeral=True)
