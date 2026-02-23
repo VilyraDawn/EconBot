@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v104"
+APP_VERSION = "EconBot_v106"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -280,11 +280,7 @@ async def render_character_card(
     owner_display = "Unknown"
     if owner_id is not None:
         m = guild.get_member(int(owner_id))
-        if m is None:
-            try:
-                m = await guild.fetch_member(int(owner_id))
-            except Exception:
-                m = None
+        # Do not fetch members (avoids rate limits); rely on cache.
         owner_display = m.display_name if m else f"User {owner_id}"
 
     bal = await get_balance(character_name)
@@ -326,11 +322,7 @@ async def render_leaderboard_lines(
         if uid in cache:
             return cache[uid]
         m = guild.get_member(uid)
-        if m is None:
-            try:
-                m = await guild.fetch_member(uid)
-            except Exception:
-                m = None
+        # Do not fetch members (avoids rate limits); rely on cache only.
         cache[uid] = m.display_name if m else f"User {uid}"
         return cache[uid]
 
@@ -1254,10 +1246,16 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
 
     n = min(len(msgs), len(pages))
     for i in range(n):
-        try:
-            await msgs[i].edit(content=pages[i])
-        except Exception:
-            pass
+        # Robust edit with small retries; avoids silent stale page 1 on transient failures / rate limits.
+        for attempt in range(4):
+            try:
+                await msgs[i].edit(content=pages[i])
+                break
+            except discord.HTTPException as e:
+                # 429/5xx can happen; backoff a bit
+                await asyncio.sleep(0.8 * (attempt + 1))
+            except Exception:
+                await asyncio.sleep(0.5 * (attempt + 1))
 
     if len(msgs) > len(pages):
         for j in range(len(pages), len(msgs)):
