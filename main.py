@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v111"
+APP_VERSION = "EconBot_v112"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -317,8 +317,8 @@ async def render_leaderboard_lines(
 ) -> List[str]:
     """rows: [(character_name, owner_id, balance, income)]"""
     # Top balances
-    top_bal = sorted(rows, key=lambda r: int(r[2]), reverse=True)[:10]
-    top_inc = sorted(rows, key=lambda r: int(r[3]), reverse=True)[:10]
+    top_bal = sorted(rows, key=lambda r: int(r[2]), reverse=True)[:5]
+    top_inc = sorted(rows, key=lambda r: int(r[3]), reverse=True)[:5]
 
     # resolve owner display names (no pings)
     cache: Dict[int, str] = {}
@@ -440,6 +440,20 @@ intents.members = True  # required for role detection
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+
+
+
+def _cap_message(text: str, limit: int = 1900) -> str:
+    """Cap a Discord message to avoid 2000-char hard limit. Adds ellipsis when trimmed."""
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    trimmed = text[: max(0, limit - 20)]
+    nl = trimmed.rfind("\n")
+    if nl > 200:
+        trimmed = trimmed[:nl]
+    return trimmed.rstrip() + "\n… _(truncated)_"
 
 # -------------------------
 # DB
@@ -1479,6 +1493,8 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         },
     )
 
+    trigger_bank_refresh()
+
     await interaction.followup.send(
         (
             f"Claimed daily income for **{character}**:\n"
@@ -1545,6 +1561,8 @@ async def cmd_set_kingdom_tax(interaction: discord.Interaction, kingdom: str, ra
     bp = pct * 100  # convert percent to basis points
     await upsert_kingdom_tax_bp(k, bp)
     await log_audit(interaction, "set_kingdom_tax", {"kingdom": k, "percent": pct, "tax_rate_bp": bp})
+    trigger_bank_refresh()
+
     await interaction.followup.send(f"Set **{k}** tax rate to **{pct}%** (stored as **{bp} bp**).", ephemeral=True)
 
 
@@ -1608,14 +1626,12 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
 @staff_only()
 async def cmd_refresh_bank(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    # Optionally allow BANK_REFRESH_ROLE_IDS to run refresh too, but staff_only already gates role-based access.
+    # Manual refresh (staff). Uses debounced updater to avoid PATCH rate limits.
     try:
-        # Debounced refresh to avoid PATCH rate limits on startup
         trigger_bank_refresh()
-        await interaction.followup.send("Bank dashboard refreshed.", ephemeral=True)
+        await interaction.followup.send("Bank dashboard refresh queued.", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"Bank refresh failed: {e}", ephemeral=True)
-
+        await interaction.followup.send(f"Refresh failed: {e}", ephemeral=True)
 
 @tree.command(name="purchase_new", description="(Staff) Record an asset purchase for a character.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
@@ -2041,4 +2057,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(
+
+)
