@@ -31,7 +31,11 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v103"
+APP_VERSION = "EconBot_v104"
+
+# Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
+CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
+DEFAULT_KINGDOM_TAX_BP = 1000  # 10%
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -516,6 +520,24 @@ async def ensure_schema() -> None:
         );
         """
     )
+
+    # Seed canonical kingdoms with baseline 10% tax (do not override non-zero rates)
+    try:
+        for _k in CANON_KINGDOMS:
+            await db_exec(
+                """
+                INSERT INTO econ_kingdoms (guild_id, kingdom, tax_rate_bp, treasury)
+                VALUES ($1, $2, $3, 0)
+                ON CONFLICT (guild_id, kingdom) DO UPDATE
+                SET tax_rate_bp = CASE WHEN econ_kingdoms.tax_rate_bp = 0 THEN EXCLUDED.tax_rate_bp ELSE econ_kingdoms.tax_rate_bp END;
+                """,
+                DATA_GUILD_ID,
+                _k,
+                DEFAULT_KINGDOM_TAX_BP,
+            )
+    except Exception as e:
+        print(f"[warn] Could not seed econ_kingdoms baseline rates: {e}")
+
 
 
     # Adjust econ_assets unique constraint so the same asset_name can be reused across different asset_type/tier.
@@ -1366,13 +1388,20 @@ async def cmd_econ_commands(interaction: discord.Interaction):
 @staff_only()
 @app_commands.describe(kingdom="Kingdom name (must match character/asset kingdom values).", rate="Tax rate percent.")
 @app_commands.choices(
+    kingdom=[
+        app_commands.Choice(name="Sethrathiel", value="Sethrathiel"),
+        app_commands.Choice(name="Velarith", value="Velarith"),
+        app_commands.Choice(name="Lyvik", value="Lyvik"),
+        app_commands.Choice(name="Baelon", value="Baelon"),
+        app_commands.Choice(name="Avalea", value="Avalea"),
+    ],
     rate=[
         app_commands.Choice(name="10%", value=10),
         app_commands.Choice(name="20%", value=20),
         app_commands.Choice(name="30%", value=30),
         app_commands.Choice(name="40%", value=40),
         app_commands.Choice(name="50%", value=50),
-    ]
+    ],
 )
 async def cmd_set_kingdom_tax(interaction: discord.Interaction, kingdom: str, rate: app_commands.Choice[int]):
     await interaction.response.defer(ephemeral=True)
