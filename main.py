@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v106"
+APP_VERSION = "EconBot_v107"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -580,16 +580,27 @@ async def ensure_schema() -> None:
 # -------------------------
 
 async def _get_member(interaction: discord.Interaction) -> Optional[discord.Member]:
-    # Prefer interaction.user when it is a Member
+    """Best-effort member resolver WITHOUT hitting the Discord HTTP API.
+
+    We avoid fetch_member() here because staff checks can be called frequently and HTTP lookups
+    will cause rate limits (429), leading to empty roles and false permission denials.
+    """
+    # In guild interactions, discord.py typically provides a Member already.
     if isinstance(interaction.user, discord.Member):
         return interaction.user
-    # Fetch from guild if possible
+
+    # Try cache lookup (no HTTP).
     if interaction.guild is None:
         return None
     try:
-        return await interaction.guild.fetch_member(interaction.user.id)
+        m = interaction.guild.get_member(interaction.user.id)
+        if m is not None:
+            return m
     except Exception:
-        return None
+        pass
+
+    # As a last resort, do NOT fetch over HTTP here; return None and staff gate will explain.
+    return None
 
 
 async def is_staff(interaction: discord.Interaction) -> Tuple[bool, Dict[str, Any]]:
@@ -1250,6 +1261,9 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
         for attempt in range(4):
             try:
                 await msgs[i].edit(content=pages[i])
+                # Space edits to reduce 429s when multiple pages exist.
+                if i < n - 1:
+                    await asyncio.sleep(1.2)
                 break
             except discord.HTTPException as e:
                 # 429/5xx can happen; backoff a bit
@@ -1279,7 +1293,8 @@ def trigger_bank_refresh() -> None:
                 # small debounce window; collapse bursty updates
                 await asyncio.sleep(1.5)
                 try:
-                    await refresh_bank_dashboard(create_missing=True)
+                    # Debounced refresh to avoid PATCH rate limits on startup
+        trigger_bank_refresh()
                 except Exception as e:
                     print(f"[warn] Debounced bank refresh failed: {e}")
 
@@ -1563,7 +1578,8 @@ async def cmd_refresh_bank(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     # Optionally allow BANK_REFRESH_ROLE_IDS to run refresh too, but staff_only already gates role-based access.
     try:
-        await refresh_bank_dashboard(create_missing=True)
+        # Debounced refresh to avoid PATCH rate limits on startup
+        trigger_bank_refresh()
         await interaction.followup.send("Bank dashboard refreshed.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"Bank refresh failed: {e}", ephemeral=True)
@@ -1989,7 +2005,8 @@ async def on_ready():
         print(f"[warn] seed_asset_definitions failed: {e}")
 
     try:
-        await refresh_bank_dashboard(create_missing=True)
+        # Debounced refresh to avoid PATCH rate limits on startup
+        trigger_bank_refresh()
     except Exception as e:
         print(f"[warn] Initial bank refresh failed: {e}")
 
