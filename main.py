@@ -1,4 +1,4 @@
-# EconBot_v75 — Clean rebuild (guild-only commands, legacy DB partition, bank message IDs persisted in Postgres)
+# EconBot_v109 — Clean rebuild (guild-only commands, legacy DB partition, bank message IDs persisted in Postgres)
 # NOTE: This is a full replacement for main.py (Railway runs /app/main.py).
 # Constraints honored:
 # - Character-based economy (not user-based)
@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v108"
+APP_VERSION = "EconBot_v109"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -40,6 +40,10 @@ CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
 # -------------------------
+
+# --- Internal throttles (prevent rate-limit cascades) ---
+_STAFF_MEMBER_FETCH_LOCK = asyncio.Lock()
+
 # Env helpers (NO inventions)
 # -------------------------
 
@@ -575,29 +579,34 @@ async def ensure_schema() -> None:
         print(f"[warn] econ_assets unique-constraint adjustment skipped/failed: {e}")
 
 
-# -------------------------
-# Staff gating (ROLE ONLY)
-# -------------------------
-
 async def _get_member(interaction: discord.Interaction) -> Optional[discord.Member]:
-    """Best-effort member resolver WITHOUT hitting the Discord HTTP API.
+    """Resolve the invoking member for staff permission checks.
 
-    We avoid fetch_member() here because staff checks can be called frequently and HTTP lookups
-    will cause rate limits (429), leading to empty roles and false permission denials.
+    Priority order:
+    1) Use interaction.user if it's already a discord.Member (includes roles).
+    2) Use guild cache lookup (no HTTP).
+    3) As a last resort, fetch the member over HTTP *once* (serialized) to avoid false denials.
+       This is intentionally gated behind a lock to reduce 429s.
     """
-    # In guild interactions, discord.py typically provides a Member already.
     if isinstance(interaction.user, discord.Member):
         return interaction.user
 
-    # Try cache lookup (no HTTP).
     if interaction.guild is None:
         return None
+
     try:
-        m = interaction.guild.get_member(interaction.user.id)
-        if m is not None:
-            return m
+        cached = interaction.guild.get_member(interaction.user.id)
+        if cached is not None:
+            return cached
     except Exception:
         pass
+
+    # Last resort: single serialized HTTP fetch (helps when members intent/caching is insufficient).
+    try:
+        async with _STAFF_MEMBER_FETCH_LOCK:
+            return await interaction.guild.fetch_member(interaction.user.id)
+    except Exception:
+        return None
 
     # As a last resort, do NOT fetch over HTTP here; return None and staff gate will explain.
     return None
@@ -2003,14 +2012,6 @@ async def on_ready():
         await seed_asset_definitions()
     except Exception as e:
         print(f"[warn] seed_asset_definitions failed: {e}")
-
-    try:
-        # Debounced refresh to avoid PATCH rate limits on startup
-        trigger_bank_refresh()
-    except Exception as e:
-        print(f"[warn] Initial bank refresh failed: {e}")
-
-
 
 def main():
     client.run(DISCORD_TOKEN)
