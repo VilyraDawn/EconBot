@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v107"
+APP_VERSION = "EconBot_v108"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -1293,8 +1293,8 @@ def trigger_bank_refresh() -> None:
                 # small debounce window; collapse bursty updates
                 await asyncio.sleep(1.5)
                 try:
-                    # Debounced refresh to avoid PATCH rate limits on startup
-        trigger_bank_refresh()
+                    # Debounced refresh to avoid PATCH rate limits on bursty updates
+                    await refresh_bank_dashboard(create_missing=True)
                 except Exception as e:
                     print(f"[warn] Debounced bank refresh failed: {e}")
 
