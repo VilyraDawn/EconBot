@@ -31,7 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v101"
+APP_VERSION = "EconBot_v103"
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 
@@ -491,6 +491,32 @@ async def ensure_schema() -> None:
         """
     )
 
+    # Kingdom taxation support (explicitly approved):
+    # - characters.kingdom (required for income claims; populated by upstream character-creation bot)
+    # - econ_assets.kingdom (optional override; if NULL, inherits character home kingdom)
+    # - econ_kingdoms treasury + tax rates (basis points)
+    try:
+        await db_exec("ALTER TABLE characters ADD COLUMN IF NOT EXISTS kingdom TEXT;")
+    except Exception as e:
+        print(f"[warn] Could not add characters.kingdom (will require manual migration): {e}")
+
+    try:
+        await db_exec("ALTER TABLE econ_assets ADD COLUMN IF NOT EXISTS kingdom TEXT;")
+    except Exception as e:
+        print(f"[warn] Could not add econ_assets.kingdom (will require manual migration): {e}")
+
+    await db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS econ_kingdoms (
+            guild_id BIGINT NOT NULL,
+            kingdom TEXT NOT NULL,
+            tax_rate_bp INT NOT NULL DEFAULT 0,
+            treasury BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (guild_id, kingdom)
+        );
+        """
+    )
+
 
     # Adjust econ_assets unique constraint so the same asset_name can be reused across different asset_type/tier.
     # Desired uniqueness: (guild_id, user_id, character_name, asset_type, tier, asset_name)
@@ -890,6 +916,116 @@ async def recompute_daily_income(character_name: str) -> int:
 
 
 # -------------------------
+# Kingdom taxation helpers
+# -------------------------
+
+def _bp_to_percent(bp: int) -> str:
+    # 100 bp = 1%
+    return f"{bp / 100:.0f}%" if bp % 100 == 0 else f"{bp / 100:.2f}%"
+
+def _calc_tax(amount_cinth: int, tax_rate_bp: int) -> int:
+    # Whole-cinth rule: ALWAYS round DOWN (floor) to nearest cinth.
+    if amount_cinth <= 0 or tax_rate_bp <= 0:
+        return 0
+    return (int(amount_cinth) * int(tax_rate_bp)) // 10000
+
+async def get_character_kingdom(character_name: str) -> Optional[str]:
+    # Home kingdom lives in characters table (populated by upstream bot).
+    try:
+        row = await db_fetchrow(
+            """
+            SELECT kingdom
+            FROM characters
+            WHERE guild_id=$1 AND name=$2 AND archived=FALSE
+            LIMIT 1;
+            """,
+            DATA_GUILD_ID,
+            character_name,
+        )
+        if not row:
+            return None
+        hk = row.get("kingdom")
+        return str(hk).strip() if hk is not None and str(hk).strip() else None
+    except Exception:
+        return None
+
+async def get_kingdom_tax_bp(kingdom: str) -> int:
+    row = await db_fetchrow(
+        """
+        SELECT tax_rate_bp
+        FROM econ_kingdoms
+        WHERE guild_id=$1 AND kingdom=$2
+        LIMIT 1;
+        """,
+        DATA_GUILD_ID,
+        kingdom,
+    )
+    return int(row["tax_rate_bp"]) if row else 0
+
+async def upsert_kingdom_tax_bp(kingdom: str, tax_rate_bp: int) -> None:
+    await db_exec(
+        """
+        INSERT INTO econ_kingdoms (guild_id, kingdom, tax_rate_bp, treasury)
+        VALUES ($1, $2, $3, 0)
+        ON CONFLICT (guild_id, kingdom)
+        DO UPDATE SET tax_rate_bp=EXCLUDED.tax_rate_bp;
+        """,
+        DATA_GUILD_ID,
+        kingdom,
+        int(tax_rate_bp),
+    )
+
+async def add_to_kingdom_treasury(kingdom: str, amount_cinth: int) -> None:
+    if amount_cinth <= 0:
+        return
+    await db_exec(
+        """
+        INSERT INTO econ_kingdoms (guild_id, kingdom, tax_rate_bp, treasury)
+        VALUES ($1, $2, 0, $3)
+        ON CONFLICT (guild_id, kingdom)
+        DO UPDATE SET treasury=econ_kingdoms.treasury + EXCLUDED.treasury;
+        """,
+        DATA_GUILD_ID,
+        kingdom,
+        int(amount_cinth),
+    )
+
+async def fetch_kingdom_treasuries() -> List[Tuple[str, int, int]]:
+    rows = await db_fetch(
+        """
+        SELECT kingdom, tax_rate_bp, treasury
+        FROM econ_kingdoms
+        WHERE guild_id=$1
+        ORDER BY kingdom ASC;
+        """,
+        DATA_GUILD_ID,
+    )
+    out: List[Tuple[str, int, int]] = []
+    for r in rows:
+        out.append((str(r["kingdom"]), int(r["tax_rate_bp"]), int(r["treasury"])))
+    return out
+
+async def render_treasury_lines() -> List[str]:
+    treas = await fetch_kingdom_treasuries()
+    if not treas:
+        return [
+            "🏰 **Kingdom Treasuries**",
+            "━━━━━━━━━━━━━━━━━━",
+            "_No kingdoms configured yet._",
+            "",
+        ]
+    out: List[str] = [
+        "🏰 **Kingdom Treasuries**",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+    for kingdom, bp, treasury in treas:
+        out.append(f"• **{kingdom}** — Treasury: **{format_currency(treasury)}** — Tax: **{_bp_to_percent(bp)}**")
+    out.append("")
+    return out
+
+
+
+# -------------------------
 # Bank dashboard persistence (approved)
 # -------------------------
 
@@ -949,6 +1085,8 @@ async def render_bank_lines(guild: discord.Guild) -> List[str]:
         "━━━━━━━━━━━━━━━━━━",
         "",
     ]
+    out += await render_treasury_lines()
+
 
     if not chars:
         return out + ["No characters found in DB."]
@@ -1106,10 +1244,60 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         await interaction.followup.send("Daily income already claimed today.", ephemeral=True)
         return
 
-    asset_income = await recompute_daily_income(character)
-    total_income = BASE_DAILY_INCOME + int(asset_income or 0)
-    # Add total income (base + assets) to balance
-    new_bal = await adjust_balance(character, total_income)
+    
+    # Kingdom taxation:
+    # - Base income is taxed to the character's home kingdom.
+    # - Each asset's income is taxed to its own kingdom if set; otherwise inherits home kingdom.
+    character_kingdom = await get_character_kingdom(character)
+    if not character_kingdom:
+        await interaction.followup.send(
+            "This character has no **home kingdom** set in the `characters` table. Income cannot be claimed until it is set.",
+            ephemeral=True,
+        )
+        return
+
+    # Pull per-asset incomes so we can bucket taxes per kingdom (whole-cinth only).
+    asset_rows = await db_fetch(
+        """
+        SELECT a.asset_type, a.tier, a.asset_name, COALESCE(a.kingdom, '') AS asset_kingdom, d.add_income_val
+        FROM econ_assets a
+        JOIN econ_asset_definitions d
+          ON d.asset_type=a.asset_type AND d.tier=a.tier
+        WHERE a.guild_id=$1 AND a.character_name=$2;
+        """,
+        DATA_GUILD_ID,
+        character,
+    )
+
+    asset_income = sum(int(r["add_income_val"]) for r in asset_rows)
+    base_income = int(BASE_DAILY_INCOME)
+    gross_total = base_income + int(asset_income or 0)
+
+    # Build kingdom buckets (gross amounts per kingdom)
+    buckets: Dict[str, int] = {}
+    buckets[character_kingdom] = buckets.get(character_kingdom, 0) + base_income
+    for r in asset_rows:
+        k = str(r["asset_kingdom"] or "").strip()
+        if not k:
+            k = character_kingdom
+        buckets[k] = buckets.get(k, 0) + int(r["add_income_val"])
+
+    # Compute tax per kingdom bucket (round DOWN) and update treasuries
+    total_tax = 0
+    for k, amt in buckets.items():
+        bp = await get_kingdom_tax_bp(k)
+        tax = _calc_tax(int(amt), int(bp))
+        if tax > 0:
+            await add_to_kingdom_treasury(k, tax)
+        total_tax += int(tax)
+
+    net_total = int(gross_total) - int(total_tax)
+    if net_total < 0:
+        net_total = 0  # safety; should not happen with floor-tax
+
+    # Add NET income to balance
+    new_bal = await adjust_balance(character, net_total)
+
     await db_exec(
         """
         INSERT INTO econ_income_claims (guild_id, character_name, last_claim_date)
@@ -1122,11 +1310,36 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         today,
     )
 
-    await log_audit(interaction, "income_claim", {"character": character, "base_income": BASE_DAILY_INCOME, "asset_income": asset_income, "total_income": total_income, "new_balance": new_bal})
+
+    await log_audit(
+        interaction,
+        "income_claim",
+        {
+            "character": character,
+            "character_kingdom": character_kingdom,
+            "base_income": base_income,
+            "asset_income": asset_income,
+            "gross_total": gross_total,
+            "tax_total": total_tax,
+            "net_total": net_total,
+            "new_balance": new_bal,
+            "buckets": buckets,
+        },
+    )
+
     await interaction.followup.send(
-        f"Claimed daily income for **{character}**:\n• Base: **{format_currency(BASE_DAILY_INCOME)}**\n• Assets: **{format_currency(asset_income)}**\n• Total: **{format_currency(total_income)}**\n\nNew balance: **{format_currency(new_bal)}**",
+        (
+            f"Claimed daily income for **{character}**:\n"
+            f"• Base: **{format_currency(base_income)}** (taxed to **{character_kingdom}**)\n"
+            f"• Assets: **{format_currency(asset_income)}**\n"
+            f"• Gross: **{format_currency(gross_total)}**\n"
+            f"• Tax (rounded down): **{format_currency(total_tax)}**\n"
+            f"• Net received: **{format_currency(net_total)}**\n\n"
+            f"New balance: **{format_currency(new_bal)}**"
+        ),
         ephemeral=True,
     )
+
 
 
 @tree.command(name="econ_commands", description="List EconBot commands.", guild=discord.Object(id=GUILD_ID))
@@ -1144,9 +1357,35 @@ async def cmd_econ_commands(interaction: discord.Interaction):
         "• `/sell_asset` — sell/remove an existing asset\n"
         "• `/econ_adjust` — adjust balance by delta\n"
         "• `/econ_set_balance` — set balance to value\n"
-        "• `/econ_refresh_bank` — refresh bank dashboard\n"
+        "• `/econ_refresh_bank` — refresh bank dashboard\n• `/econ_set_kingdom_tax` — set kingdom tax rate (10–50%)\n"
     )
     await interaction.followup.send(msg, ephemeral=True)
+
+
+@tree.command(name="econ_set_kingdom_tax", description="Set a kingdom's income tax rate (10–50%).", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.describe(kingdom="Kingdom name (must match character/asset kingdom values).", rate="Tax rate percent.")
+@app_commands.choices(
+    rate=[
+        app_commands.Choice(name="10%", value=10),
+        app_commands.Choice(name="20%", value=20),
+        app_commands.Choice(name="30%", value=30),
+        app_commands.Choice(name="40%", value=40),
+        app_commands.Choice(name="50%", value=50),
+    ]
+)
+async def cmd_set_kingdom_tax(interaction: discord.Interaction, kingdom: str, rate: app_commands.Choice[int]):
+    await interaction.response.defer(ephemeral=True)
+    k = (kingdom or "").strip()
+    if not k:
+        await interaction.followup.send("Kingdom name is required.", ephemeral=True)
+        return
+    pct = int(rate.value)
+    bp = pct * 100  # convert percent to basis points
+    await upsert_kingdom_tax_bp(k, bp)
+    await log_audit(interaction, "set_kingdom_tax", {"kingdom": k, "percent": pct, "tax_rate_bp": bp})
+    await interaction.followup.send(f"Set **{k}** tax rate to **{pct}%** (stored as **{bp} bp**).", ephemeral=True)
+
 
 
 @tree.command(name="econ_adjust", description="(Staff) Adjust a character balance by delta.", guild=discord.Object(id=GUILD_ID))
