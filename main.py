@@ -290,10 +290,13 @@ async def render_character_card(
     bal = await get_balance(character_name)
     inc = await recompute_daily_income(character_name)
     assets = await get_assets_for_character(character_name)
+    kingdom = await get_character_kingdom(character_name)
 
     out: List[str] = []
     out.append("━━━━━━━━━━━━━━━━━━")
     out.append(f"**{character_name}**  ·  *{owner_display}*")
+    if kingdom:
+        out.append(f"🏰 **Kingdom:** {kingdom}")
     out.append(f"💰 **Balance:** {format_currency(bal)}")
     out.append(f"🌙 **Daily Income:** {format_currency(inc)}")
 
@@ -733,6 +736,27 @@ async def get_character_owner(character_name: str) -> Optional[int]:
     return int(row["user_id"]) if row else None
 
 
+
+async def get_character_kingdom(character_name: str) -> Optional[str]:
+    row = await db_fetchrow(
+        """
+        SELECT kingdom
+        FROM characters
+        WHERE guild_id=$1 AND name=$2 AND archived=FALSE
+        LIMIT 1;
+        """,
+        DATA_GUILD_ID,
+        character_name,
+    )
+    if not row:
+        return None
+    k = row.get("kingdom")
+    if k is None:
+        return None
+    k = str(k).strip()
+    return k if k else None
+
+
 # -------------------------
 # Economy core helpers
 # -------------------------
@@ -1086,11 +1110,13 @@ async def save_bank_message_ids(message_ids: List[int]) -> None:
                 )
 
 
-async def render_bank_lines(guild: discord.Guild) -> List[str]:
-    # Bank shows balances grouped as:
-    # 1) Leaderboards (top balance + top income)
-    # 2) Full character "card rows" including full asset list (no pings)
+async def render_bank_pages(guild: discord.Guild) -> List[str]:
+    """
+    Returns full message pages (content strings) for the bank dashboard.
 
+    Page 1: header + kingdom treasuries + leaderboards
+    Pages 2+: full character cards (never split across messages)
+    """
     chars = await db_fetch(
         '''
         SELECT user_id, name
@@ -1102,18 +1128,20 @@ async def render_bank_lines(guild: discord.Guild) -> List[str]:
     )
 
     now = datetime.now(CHICAGO_TZ)
-    out: List[str] = [
+
+    header_lines: List[str] = [
         f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)",
         "━━━━━━━━━━━━━━━━━━",
         "",
     ]
-    out += await render_treasury_lines()
 
+    header_lines += await render_treasury_lines()
+    header_lines.append("")
 
     if not chars:
-        return out + ["No characters found in DB."]
+        return ["\n".join(header_lines + ["No characters found in DB."])]
 
-    # Precompute balance+income for leaderboards
+    # Precompute balance+income for leaderboards (single DB authority)
     rows: List[Tuple[str, int, int, int]] = []
     for r in chars:
         cname = str(r["name"])
@@ -1122,32 +1150,73 @@ async def render_bank_lines(guild: discord.Guild) -> List[str]:
         inc = await recompute_daily_income(cname)
         rows.append((cname, uid, bal, inc))
 
-    out += await render_leaderboard_lines(guild, rows)
+    header_lines += await render_leaderboard_lines(guild, rows)
+    header_lines.append("")
+    header_lines.append("📜 **Ledger Entries**")
+    header_lines.append("━━━━━━━━━━━━━━━━━━")
+    header_lines.append("_See the following messages for full character cards._")
 
-    out.append("📜 **Ledger Entries**")
-    out.append("━━━━━━━━━━━━━━━━━━")
-    out.append("")
-
-    # Render full character cards (sorted by owner then name for readability)
-    # build owner display cache
-    cache: Dict[int, str] = {}
-    async def dn(uid: int) -> str:
-        if uid in cache:
-            return cache[uid]
-        m = guild.get_member(uid)
-        if m is None:
-            try:
-                m = await guild.fetch_member(uid)
-            except Exception:
-                m = None
-        cache[uid] = m.display_name if m else f"User {uid}"
-        return cache[uid]
-
+    # Build card blocks (each block is a complete card)
     rows_sorted = sorted(rows, key=lambda r: (int(r[1]), str(r[0]).lower()))
-    for cname, uid, bal, inc in rows_sorted:
-        out += await render_character_card(guild, cname, owner_id=uid)
+    card_blocks: List[str] = []
+    for cname, uid, _, _ in rows_sorted:
+        card_lines = await render_character_card(guild, cname, owner_id=uid)
+        card_text = "\n".join(card_lines).strip()
 
-    return out
+        # Ensure a single card never exceeds a safe limit; truncate asset list if needed
+        max_card_len = 1800
+        if len(card_text) > max_card_len:
+            lines = card_text.split("\n")
+            removed = 0
+            while len("\n".join(lines)) > max_card_len and any(l.startswith("- ") for l in lines):
+                for i in range(len(lines) - 1, -1, -1):
+                    if lines[i].startswith("- "):
+                        lines.pop(i)
+                        removed += 1
+                        break
+                else:
+                    break
+            if removed > 0:
+                try:
+                    insert_at = len(lines)
+                    for i in range(len(lines) - 1, -1, -1):
+                        if lines[i].startswith("🏷️ **Assets"):
+                            insert_at = i + 1
+                            break
+                    lines.insert(insert_at, f"- …and {removed} more (not shown)")
+                except Exception:
+                    pass
+            card_text = "\n".join(lines).strip()
+
+        card_blocks.append(card_text)
+
+    # Paginate cards so no card is split across messages
+    pages: List[str] = []
+    pages.append("\n".join(header_lines).strip())
+
+    max_page_len = 1900
+    current: List[str] = []
+    current_len = 0
+
+    def flush():
+        nonlocal current, current_len
+        if current:
+            pages.append("\n\n".join(current).strip())
+            current = []
+            current_len = 0
+
+    for block in card_blocks:
+        add_len = len(block) + (2 if current else 0)  # account for \n\n
+        if current_len + add_len > max_page_len:
+            flush()
+            current.append(block)
+            current_len = len(block)
+        else:
+            current.append(block)
+            current_len += add_len
+
+    flush()
+    return pages
 
 
 async def refresh_bank_dashboard(create_missing: bool = True) -> None:
@@ -1157,27 +1226,14 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
     if ch is None or not isinstance(ch, (discord.TextChannel, discord.Thread)):
         return
 
-    # Prefer DB-stored message IDs, fallback to env BANK_MESSAGE_IDS
     mids = await bank_message_ids_from_db()
     if not mids and BANK_MESSAGE_IDS:
         mids = list(BANK_MESSAGE_IDS)
 
-    lines = await render_bank_lines(ch.guild)
-    # split into chunks that fit; keep conservative
-    chunks: List[str] = []
-    cur = ""
-    for ln in lines:
-        add = (ln + "\n")
-        if len(cur) + len(add) > 1700:
-            chunks.append(cur.strip())
-            cur = ""
-        cur += add
-    if cur.strip():
-        chunks.append(cur.strip())
-    if not chunks:
-        chunks = ["(empty)"]
+    pages = await render_bank_pages(ch.guild)
+    if not pages:
+        pages = ["(empty)"]
 
-    # Fetch messages if IDs exist
     msgs: List[discord.Message] = []
     for mid in mids:
         try:
@@ -1186,26 +1242,55 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
         except Exception:
             pass
 
-    # Create missing messages ONCE and persist in Postgres (approved)
-    if create_missing and len(msgs) < len(chunks):
-        # Create new messages to match number of chunks
+    if create_missing and len(msgs) < len(pages):
         try:
-            while len(msgs) < len(chunks):
+            while len(msgs) < len(pages):
                 m = await ch.send("Initializing Bank of Vilyra…")
                 msgs.append(m)
-            # Persist message IDs so we do not spam on future restarts
             await save_bank_message_ids([int(m.id) for m in msgs])
             print(f"[test] Bank dashboard message IDs saved to Postgres: {len(msgs)}")
         except Exception as e:
             print(f"[warn] Bank dashboard create/persist failed: {e}")
 
-    # If still insufficient messages, do not spam; just edit what exists.
-    n = min(len(msgs), len(chunks))
+    n = min(len(msgs), len(pages))
     for i in range(n):
         try:
-            await msgs[i].edit(content=chunks[i])
+            await msgs[i].edit(content=pages[i])
         except Exception:
             pass
+
+    if len(msgs) > len(pages):
+        for j in range(len(pages), len(msgs)):
+            try:
+                await msgs[j].edit(content="(unused bank page)")
+            except Exception:
+                pass
+
+# Debounced bank refresh to avoid rate-limits when multiple actions occur quickly
+_bank_refresh_task: Optional[asyncio.Task] = None
+_bank_refresh_lock: asyncio.Lock = asyncio.Lock()
+
+def trigger_bank_refresh() -> None:
+    global _bank_refresh_task
+    try:
+        if _bank_refresh_task and not _bank_refresh_task.done():
+            return
+
+        async def _runner():
+            async with _bank_refresh_lock:
+                # small debounce window; collapse bursty updates
+                await asyncio.sleep(1.5)
+                try:
+                    await refresh_bank_dashboard(create_missing=True)
+                except Exception as e:
+                    print(f"[warn] Debounced bank refresh failed: {e}")
+
+        _bank_refresh_task = asyncio.create_task(_runner())
+    except Exception:
+        # If we're not in a running loop yet, ignore; caller can use /econ_refresh_bank
+        return
+
+
 
 
 # -------------------------
@@ -1362,6 +1447,8 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         ephemeral=True,
     )
 
+    trigger_bank_refresh()
+
 
 
 @tree.command(name="econ_commands", description="List EconBot commands.", guild=discord.Object(id=GUILD_ID))
@@ -1445,6 +1532,8 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
         ephemeral=True,
     )
 
+    trigger_bank_refresh()
+
 
 @tree.command(name="econ_set_balance", description="(Staff) Set a character balance to an exact value.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
@@ -1467,6 +1556,7 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     await set_balance(character, value)
     await log_audit(interaction, "set_balance", {"character": character, "value": value})
     await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
+    trigger_bank_refresh()
 
 
 @tree.command(name="econ_refresh_bank", description="(Staff) Refresh the bank dashboard messages.", guild=discord.Object(id=GUILD_ID))
@@ -1672,10 +1762,7 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
         },
     )
 
-    try:
-        await refresh_bank_dashboard(create_missing=True)
-    except Exception:
-        pass
+    trigger_bank_refresh()
 
     await interaction.followup.send(
         (
@@ -1761,10 +1848,7 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
         },
     )
 
-    try:
-        await refresh_bank_dashboard(create_missing=True)
-    except Exception:
-        pass
+    trigger_bank_refresh()
 
     msg = (
         f"Sold/removed asset from **{character}**:\n"
