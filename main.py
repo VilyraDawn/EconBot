@@ -613,21 +613,43 @@ async def _get_member(interaction: discord.Interaction) -> Optional[discord.Memb
 
 
 async def is_staff(interaction: discord.Interaction) -> Tuple[bool, Dict[str, Any]]:
+    """Return (is_staff, debug_dict). Uses role IDs and falls back to guild permissions."""
     member = await _get_member(interaction)
+
     role_ids: List[int] = []
+    admin = False
+    manage_guild = False
+    manage_messages = False
+
     if member is not None:
         try:
             role_ids = [int(r.id) for r in getattr(member, "roles", [])]
         except Exception:
             role_ids = []
+        try:
+            perms = getattr(member, "guild_permissions", None)
+            if perms is not None:
+                admin = bool(getattr(perms, "administrator", False))
+                manage_guild = bool(getattr(perms, "manage_guild", False))
+                manage_messages = bool(getattr(perms, "manage_messages", False))
+        except Exception:
+            pass
+
     allowed = False
-    if STAFF_ROLE_IDS and role_ids:
-        allowed = any(rid in STAFF_ROLE_IDS for rid in role_ids)
+    if admin or manage_guild or manage_messages:
+        allowed = True
+
+    if not allowed and STAFF_ROLE_IDS and role_ids:
+        allowed = any((rid in STAFF_ROLE_IDS) for rid in role_ids)
+
     debug = {
-        "user_id": int(interaction.user.id),
-        "detected_role_ids": role_ids,
-        "staff_role_ids": sorted(list(STAFF_ROLE_IDS)),
-        "guild_id": int(interaction.guild_id or 0),
+        "user_id": int(interaction.user.id) if interaction.user else None,
+        "guild_id": int(interaction.guild_id) if interaction.guild_id else None,
+        "detected_role_ids": sorted(role_ids),
+        "configured_staff_role_ids": sorted(list(STAFF_ROLE_IDS)),
+        "admin": admin,
+        "manage_guild": manage_guild,
+        "manage_messages": manage_messages,
     }
     return allowed, debug
 
@@ -1269,7 +1291,8 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
         # Robust edit with small retries; avoids silent stale page 1 on transient failures / rate limits.
         for attempt in range(4):
             try:
-                await msgs[i].edit(content=pages[i])
+                if msgs[i].content != pages[i]:
+                    await msgs[i].edit(content=pages[i])
                 # Space edits to reduce 429s when multiple pages exist.
                 if i < n - 1:
                     await asyncio.sleep(1.2)
