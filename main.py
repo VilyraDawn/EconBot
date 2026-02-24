@@ -1,28 +1,3 @@
-
-
-# Initial dashboard render
-request_bank_header_refresh()
-request_bank_full_refresh()
-
-# Periodic reconcile (in case something external changes)
-async def _bank_reconcile_loop():
-    while True:
-        try:
-            request_bank_header_refresh()
-        except Exception:
-            pass
-        await asyncio.sleep(120)
-
-async def _bank_full_reconcile_loop():
-    while True:
-        try:
-            request_bank_full_refresh(debounce_seconds=0.0)
-        except Exception:
-            pass
-        await asyncio.sleep(600)
-
-bot.loop.create_task(_bank_reconcile_loop())
-bot.loop.create_task(_bank_full_reconcile_loop())
 # EconBot_v109 — Clean rebuild (guild-only commands, legacy DB partition, bank message IDs persisted in Postgres)
 # NOTE: This is a full replacement for main.py (Railway runs /app/main.py).
 # Constraints honored:
@@ -56,8 +31,7 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v111"
-_ON_READY_RAN: bool = False
+APP_VERSION = "EconBot_v112"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -343,8 +317,8 @@ async def render_leaderboard_lines(
 ) -> List[str]:
     """rows: [(character_name, owner_id, balance, income)]"""
     # Top balances
-    top_bal = sorted(rows, key=lambda r: int(r[2]), reverse=True)[:10]
-    top_inc = sorted(rows, key=lambda r: int(r[3]), reverse=True)[:10]
+    top_bal = sorted(rows, key=lambda r: int(r[2]), reverse=True)[:5]
+    top_inc = sorted(rows, key=lambda r: int(r[3]), reverse=True)[:5]
 
     # resolve owner display names (no pings)
     cache: Dict[int, str] = {}
@@ -466,6 +440,20 @@ intents.members = True  # required for role detection
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+
+
+
+def _cap_message(text: str, limit: int = 1900) -> str:
+    """Cap a Discord message to avoid 2000-char hard limit. Adds ellipsis when trimmed."""
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    trimmed = text[: max(0, limit - 20)]
+    nl = trimmed.rfind("\n")
+    if nl > 200:
+        trimmed = trimmed[:nl]
+    return trimmed.rstrip() + "\n… _(truncated)_"
 
 # -------------------------
 # DB
@@ -692,7 +680,7 @@ def staff_only():
                 f"--- Debug ---\n"
                 f"Your user_id: {dbg['user_id']}\n"
                 f"Detected role IDs: {dbg['detected_role_ids']}\n"
-                f"Configured STAFF_ROLE_IDS (effective): {dbg['configured_staff_role_ids']}\n"
+                f"Configured STAFF_ROLE_IDS (effective): {dbg.get('configured_staff_role_ids')}\n"
                 f"Guild ID (interaction): {dbg['guild_id']}\n"
             )
             # best-effort ephemeral response
@@ -1170,13 +1158,38 @@ async def save_bank_message_ids(message_ids: List[int]) -> None:
                 )
 
 
+async def render_bank_pages(guild: discord.Guild) -> List[str]:
+    """
+    Returns full message pages (content strings) for the bank dashboard.
 
-async def _fetch_character_rows_for_bank() -> Tuple[List[Dict[str, Any]], List[Tuple[str, int, int, int]]]:
-    """Return (chars, rows) where rows = [(character_name, owner_id, balance, income)]."""
+    Page 1: header + kingdom treasuries + leaderboards
+    Pages 2+: full character cards (never split across messages)
+    """
     chars = await db_fetch(
-        "SELECT user_id, name, kingdom FROM characters WHERE guild_id=$1 AND archived=FALSE ORDER BY name ASC;",
+        '''
+        SELECT user_id, name
+        FROM characters
+        WHERE guild_id=$1 AND archived=FALSE
+        ORDER BY name ASC;
+        ''',
         DATA_GUILD_ID,
     )
+
+    now = datetime.now(CHICAGO_TZ)
+
+    header_lines: List[str] = [
+        f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    header_lines += await render_treasury_lines()
+    header_lines.append("")
+
+    if not chars:
+        return ["\n".join(header_lines + ["No characters found in DB."])]
+
+    # Precompute balance+income for leaderboards (single DB authority)
     rows: List[Tuple[str, int, int, int]] = []
     for r in chars:
         cname = str(r["name"])
@@ -1184,54 +1197,21 @@ async def _fetch_character_rows_for_bank() -> Tuple[List[Dict[str, Any]], List[T
         bal = await get_balance(cname)
         inc = await recompute_daily_income(cname)
         rows.append((cname, uid, bal, inc))
-    return chars, rows
-
-
-async def render_bank_header_lines(guild: discord.Guild, chars: List[Dict[str, Any]], rows: List[Tuple[str, int, int, int]]) -> List[str]:
-    header_lines: List[str] = []
-    header_lines.append("🏦 **Bank of Vilyra**")
-    header_lines.append("━━━━━━━━━━━━━━━━━━")
-
-    treasury_lines = await render_treasury_lines()
-    header_lines.extend(treasury_lines)
-    header_lines.append("")
-
-    if not chars:
-        header_lines.append("_No characters found in DB._")
-        return header_lines
 
     header_lines += await render_leaderboard_lines(guild, rows)
     header_lines.append("")
     header_lines.append("📜 **Ledger Entries**")
     header_lines.append("━━━━━━━━━━━━━━━━━━")
     header_lines.append("_See the following messages for full character cards._")
-    return header_lines
 
-
-async def render_bank_header_page(guild: discord.Guild) -> str:
-    chars, rows = await _fetch_character_rows_for_bank()
-    lines = await render_bank_header_lines(guild, chars, rows)
-    return "\n".join(lines).strip() or "(empty)"
-
-
-async def render_bank_pages(guild: discord.Guild) -> List[str]:
-    """Render bank dashboard pages.
-
-    Page 1: Header + treasuries + leaderboards (always stays together).
-    Page 2..N: Complete character cards, never split across messages.
-    """
-    chars, rows = await _fetch_character_rows_for_bank()
-    header_lines = await render_bank_header_lines(guild, chars, rows)
-
-    if not chars:
-        return ["\n".join(header_lines)]
-
+    # Build card blocks (each block is a complete card)
     rows_sorted = sorted(rows, key=lambda r: (int(r[1]), str(r[0]).lower()))
     card_blocks: List[str] = []
     for cname, uid, _, _ in rows_sorted:
         card_lines = await render_character_card(guild, cname, owner_id=uid)
         card_text = "\n".join(card_lines).strip()
 
+        # Ensure a single card never exceeds a safe limit; truncate asset list if needed
         max_card_len = 1800
         if len(card_text) > max_card_len:
             lines = card_text.split("\n")
@@ -1251,86 +1231,85 @@ async def render_bank_pages(guild: discord.Guild) -> List[str]:
                         if lines[i].startswith("🏷️ **Assets"):
                             insert_at = i + 1
                             break
-                    lines.insert(insert_at, f"- _(…{removed} more assets not shown)_")
+                    lines.insert(insert_at, f"- …and {removed} more (not shown)")
                 except Exception:
                     pass
-            card_text = "\n".join(lines)
+            card_text = "\n".join(lines).strip()
 
         card_blocks.append(card_text)
 
-    pages: List[str] = ["\n".join(header_lines).strip()]
+    # Paginate cards so no card is split across messages
+    pages: List[str] = []
+    pages.append("\n".join(header_lines).strip())
 
+    max_page_len = 1900
     current: List[str] = []
     current_len = 0
-    max_page_len = 1900
-    for card in card_blocks:
-        sep = "" if not current else "\n\n"
-        add_len = len(sep) + len(card)
-        if current and current_len + add_len > max_page_len:
-            pages.append("\n\n".join(current).strip())
-            current = [card]
-            current_len = len(card)
-        else:
-            if sep:
-                current_len += len(sep)
-            current.append(card)
-            current_len += len(card)
-    if current:
-        pages.append("\n\n".join(current).strip())
 
+    def flush():
+        nonlocal current, current_len
+        if current:
+            pages.append("\n\n".join(current).strip())
+            current = []
+            current_len = 0
+
+    for block in card_blocks:
+        add_len = len(block) + (2 if current else 0)  # account for \n\n
+        if current_len + add_len > max_page_len:
+            flush()
+            current.append(block)
+            current_len = len(block)
+        else:
+            current.append(block)
+            current_len += add_len
+
+    flush()
     return pages
 
-async def refresh_bank_header_only(*, create_missing: bool = True) -> None:
-    """Refresh only the first dashboard message (header/treasuries/leaderboards)."""
-    if BANK_CHANNEL_ID is None:
-        return
-    channel = bot.get_channel(BANK_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(BANK_CHANNEL_ID)
-        except Exception:
-            return
-    if not isinstance(channel, discord.TextChannel):
-        return
 
-    ids = await bank_message_ids_from_db()
-    if not ids and create_missing:
-        try:
-            msg = await channel.send("🏦 Initializing bank dashboard…")
-            await upsert_bank_message_ids([msg.id])
-            ids = [msg.id]
-        except Exception as e:
-            print(f"[warn] Could not create bank header message: {e}")
-            return
 
-    if not ids:
-        return
+async def render_bank_header_page(guild: discord.Guild) -> str:
+    """Render only page 1 (header + treasuries + leaderboards)."""
+    chars = await db_fetch(
+        '''
+        SELECT user_id, name
+        FROM characters
+        WHERE guild_id=$1 AND archived=FALSE
+        ORDER BY name ASC;
+        ''',
+        DATA_GUILD_ID,
+    )
 
-    guild = channel.guild
-    content = await render_bank_header_page(guild)
+    now = datetime.now(CHICAGO_TZ)
 
-    new_hash = str(hash(content))
-    prev_hash = getattr(refresh_bank_header_only, "_last_hash", None)
-    if prev_hash == new_hash:
-        return
+    header_lines: List[str] = [
+        f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
 
-    try:
-        msg = await channel.fetch_message(ids[0])
-        await msg.edit(content=content)
-        refresh_bank_header_only._last_hash = new_hash  # type: ignore[attr-defined]
-    except discord.NotFound:
-        if create_missing:
-            try:
-                msg2 = await channel.send(content)
-                new_ids = [msg2.id] + ids[1:]
-                await upsert_bank_message_ids(new_ids)
-                refresh_bank_header_only._last_hash = new_hash  # type: ignore[attr-defined]
-            except Exception as e:
-                print(f"[warn] Could not recreate bank header message: {e}")
-    except Exception as e:
-        print(f"[warn] Header message edit failed: {e}")
+    header_lines += await render_treasury_lines()
+    header_lines.append("")
 
-async def refresh_bank_dashboard(create_missing: bool = True) -> None:
+    if not chars:
+        return "\n".join(header_lines + ["No characters found in DB."])
+
+    rows: List[Tuple[str, int, int, int]] = []
+    for r in chars:
+        cname = str(r["name"])
+        uid = int(r["user_id"])
+        bal = await get_balance(cname)
+        inc = await recompute_daily_income(cname)
+        rows.append((cname, uid, bal, inc))
+
+    header_lines += await render_leaderboard_lines(guild, rows)
+    header_lines.append("")
+    header_lines.append("📜 **Ledger Entries**")
+    header_lines.append("━━━━━━━━━━━━━━━━━━")
+    header_lines.append("_See the following messages for full character cards._")
+    return "\n".join(header_lines)
+
+async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool = False) -> None:
     if not BANK_CHANNEL_ID:
         return
     ch = client.get_channel(int(BANK_CHANNEL_ID))
@@ -1341,7 +1320,7 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
     if not mids and BANK_MESSAGE_IDS:
         mids = list(BANK_MESSAGE_IDS)
 
-    pages = await render_bank_pages(ch.guild)
+    pages = [await render_bank_header_page(ch.guild)] if header_only else await render_bank_pages(ch.guild)
     if not pages:
         pages = ["(empty)"]
 
@@ -1363,6 +1342,14 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
         except Exception as e:
             print(f"[warn] Bank dashboard create/persist failed: {e}")
 
+    if header_only:
+        if not msgs:
+            return
+        try:
+            await msgs[0].edit(content=pages[0])
+        except discord.HTTPException as e:
+            print(f"[warn] Failed to edit header page: {e}")
+        return
     n = min(len(msgs), len(pages))
     for i in range(n):
         # Robust edit with small retries; avoids silent stale page 1 on transient failures / rate limits.
@@ -1387,85 +1374,60 @@ async def refresh_bank_dashboard(create_missing: bool = True) -> None:
             except Exception:
                 pass
 
+# Bank refresh coordinator (Option A1): single worker + dirty flags to avoid overlapping refreshes.
+_bank_refresh_task: Optional[asyncio.Task] = None
+_bank_refresh_lock: asyncio.Lock = asyncio.Lock()
+_bank_dirty_full: bool = False
+_bank_dirty_header: bool = False
 
-# -------------------------
-# Bank dashboard refresh coordinator (fail-safe)
-# -------------------------
-# - Header (treasuries + leaderboards) updates quickly after balance/tax changes.
-# - Full card pages update in a debounced, single-flight way to avoid PATCH 429 spam.
-# - If updates arrive while a refresh is running, we run again (dirty flag) so we never miss a change.
+def request_bank_refresh(*, full: bool = True) -> None:
+    """Schedule a bank dashboard refresh.
 
-_header_task: Optional[asyncio.Task] = None
-_header_lock: asyncio.Lock = asyncio.Lock()
-_header_dirty: bool = False
+    full=True recomputes all pages (header + cards).
+    full=False recomputes only page 1 (header/treasuries/leaderboards).
+    Multiple calls are coalesced; if a refresh is already running, we mark the desired work as 'dirty'
+    so it runs again immediately afterward.
+    """
+    global _bank_refresh_task, _bank_dirty_full, _bank_dirty_header
+    if full:
+        _bank_dirty_full = True
+    else:
+        _bank_dirty_header = True
 
-_full_task: Optional[asyncio.Task] = None
-_full_lock: asyncio.Lock = asyncio.Lock()
-_full_dirty: bool = False
-_full_last_request_ts: float = 0.0
-
-def request_bank_header_refresh() -> None:
-    """Request a quick update of page 1 (header/treasuries/leaderboards)."""
-    global _header_task, _header_dirty
-    _header_dirty = True
-    try:
-        if _header_task and not _header_task.done():
-            return
-
-        async def _runner():
-            global _header_dirty
-            async with _header_lock:
-                while _header_dirty:
-                    _header_dirty = False
-                    try:
-                        await refresh_bank_header_only(create_missing=True)
-                    except Exception as e:
-                        print(f"[warn] Header refresh failed: {e}")
-                    await asyncio.sleep(0.5)
-
-        _header_task = asyncio.create_task(_runner())
-    except Exception:
+    if _bank_refresh_task and not _bank_refresh_task.done():
         return
 
-def request_bank_full_refresh(debounce_seconds: float = 8.0) -> None:
-    """Request a full dashboard refresh (all pages). Debounced and single-flight."""
-    global _full_task, _full_dirty, _full_last_request_ts
-    _full_dirty = True
-    try:
-        _full_last_request_ts = asyncio.get_event_loop().time()
-    except Exception:
-        _full_last_request_ts = 0.0
+    async def _worker():
+        global _bank_dirty_full, _bank_dirty_header
+        async with _bank_refresh_lock:
+            # Small debounce window to collapse bursts of updates.
+            await asyncio.sleep(1.2)
+            # Loop until no more dirty work remains.
+            while _bank_dirty_full or _bank_dirty_header:
+                do_full = _bank_dirty_full
+                do_header = _bank_dirty_header and not do_full
+                # consume flags
+                if do_full:
+                    _bank_dirty_full = False
+                    _bank_dirty_header = False
+                elif do_header:
+                    _bank_dirty_header = False
 
-    try:
-        if _full_task and not _full_task.done():
-            return
+                try:
+                    await refresh_bank_dashboard(create_missing=True, header_only=do_header)
+                except Exception as e:
+                    print(f"[warn] Bank refresh failed: {e}")
+                # small spacing between back-to-back cycles; reduces PATCH 429s
+                await asyncio.sleep(0.6)
 
-        async def _runner():
-            global _full_dirty, _full_last_request_ts
-            async with _full_lock:
-                while _full_dirty:
-                    _full_dirty = False
-                    start = asyncio.get_event_loop().time()
-                    while True:
-                        await asyncio.sleep(0.6)
-                        now = asyncio.get_event_loop().time()
-                        if now - _full_last_request_ts >= debounce_seconds:
-                            break
-                        if now - start > 30.0:
-                            break
-                    try:
-                        await refresh_bank_dashboard(create_missing=True)
-                    except Exception as e:
-                        print(f"[warn] Full bank refresh failed: {e}")
-                    await asyncio.sleep(0.5)
+    _bank_refresh_task = asyncio.create_task(_worker())
 
-        _full_task = asyncio.create_task(_runner())
-    except Exception:
-        return
-
+# Back-compat alias used across commands
 def trigger_bank_refresh() -> None:
-    """Back-compat: treat as a full refresh request."""
-    request_bank_full_refresh()
+    request_bank_refresh(full=True)
+
+def trigger_bank_header_refresh() -> None:
+    request_bank_refresh(full=False)
 # -------------------------
 # Commands
 # -------------------------
@@ -1607,6 +1569,8 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         },
     )
 
+    trigger_bank_refresh()
+
     await interaction.followup.send(
         (
             f"Claimed daily income for **{character}**:\n"
@@ -1620,7 +1584,9 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         ephemeral=True,
     )
 
-    request_bank_header_refresh(); request_bank_full_refresh()
+
+
+
 @tree.command(name="econ_commands", description="List EconBot commands.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 async def cmd_econ_commands(interaction: discord.Interaction):
@@ -1670,6 +1636,8 @@ async def cmd_set_kingdom_tax(interaction: discord.Interaction, kingdom: str, ra
     bp = pct * 100  # convert percent to basis points
     await upsert_kingdom_tax_bp(k, bp)
     await log_audit(interaction, "set_kingdom_tax", {"kingdom": k, "percent": pct, "tax_rate_bp": bp})
+    trigger_bank_refresh()
+
     await interaction.followup.send(f"Set **{k}** tax rate to **{pct}%** (stored as **{bp} bp**).", ephemeral=True)
 
 
@@ -1702,7 +1670,9 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
         ephemeral=True,
     )
 
-    request_bank_header_refresh(); request_bank_full_refresh()
+    trigger_bank_refresh()
+
+
 @tree.command(name="econ_set_balance", description="(Staff) Set a character balance to an exact value.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 @app_commands.describe(character="Character name", value="New balance (must be >= 0)")
@@ -1724,19 +1694,19 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     await set_balance(character, value)
     await log_audit(interaction, "set_balance", {"character": character, "value": value})
     await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
-    request_bank_header_refresh(); request_bank_full_refresh()
+    trigger_bank_refresh()
+
+
 @tree.command(name="econ_refresh_bank", description="(Staff) Refresh the bank dashboard messages.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 async def cmd_refresh_bank(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    # Optionally allow BANK_REFRESH_ROLE_IDS to run refresh too, but staff_only already gates role-based access.
+    # Manual refresh (staff). Uses debounced updater to avoid PATCH rate limits.
     try:
-        # Debounced refresh to avoid PATCH rate limits on startup
-        request_bank_header_refresh(); request_bank_full_refresh()
-        await interaction.followup.send("Bank dashboard refreshed.", ephemeral=True)
+        trigger_bank_refresh()
+        await interaction.followup.send("Bank dashboard refresh queued.", ephemeral=True)
     except Exception as e:
-        await interaction.followup.send(f"Bank refresh failed: {e}", ephemeral=True)
-
+        await interaction.followup.send(f"Refresh failed: {e}", ephemeral=True)
 
 @tree.command(name="purchase_new", description="(Staff) Record an asset purchase for a character.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
@@ -1929,7 +1899,8 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
         },
     )
 
-    request_bank_header_refresh(); request_bank_full_refresh()
+    trigger_bank_refresh()
+
     await interaction.followup.send(
         (
             f"Upgraded **{character}** asset:\n"
@@ -2014,7 +1985,8 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
         },
     )
 
-    request_bank_header_refresh(); request_bank_full_refresh()
+    trigger_bank_refresh()
+
     msg = (
         f"Sold/removed asset from **{character}**:\n"
         f"- {asset_type} | {tier} | {asset_name}\n"
@@ -2095,10 +2067,6 @@ async def delete_all_global_commands() -> None:
 async def on_ready():
     # Keep on_ready resilient: never allow an exception to abort command sync.
     print(f"[test] Starting {APP_VERSION}…")
-    global _ON_READY_RAN
-    if _ON_READY_RAN:
-        return
-    _ON_READY_RAN = True
     print(f"[test] Logged in as {client.user} (commands guild: {GUILD_ID}; data guild: {DATA_GUILD_ID})")
     print(f"[debug] raw STAFF_ROLE_IDS env: {repr(_get('STAFF_ROLE_IDS',''))}")
     print(f"[debug] STAFF_ROLE_IDS_DEFAULT: {sorted(list(STAFF_ROLE_IDS_DEFAULT))}")
@@ -2164,4 +2132,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(
+
+)
