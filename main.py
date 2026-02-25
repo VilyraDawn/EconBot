@@ -985,6 +985,71 @@ async def log_audit(interaction: discord.Interaction, action: str, details: Dict
         print(f"[warn] audit log insert failed: {e}")
 
 
+async def _safe_actor_name(interaction: discord.Interaction) -> str:
+    # Never mention/ping users. Prefer server nickname (display_name) when available.
+    try:
+        u = interaction.user
+        return getattr(u, "display_name", None) or getattr(u, "name", "Unknown")
+    except Exception:
+        return "Unknown"
+
+
+def _fmt_kv(details: Dict[str, Any], keys: List[str]) -> List[str]:
+    lines: List[str] = []
+    for k in keys:
+        if k in details and details[k] is not None and details[k] != "":
+            lines.append(f"- **{k.replace('_', ' ').title()}:** {details[k]}")
+    return lines
+
+
+async def log_econ_channel(interaction: discord.Interaction, action: str, details: Dict[str, Any]) -> None:
+    """Send an econ action log line to the configured Discord channel (no mentions)."""
+    if not ECON_LOG_CHANNEL_ID:
+        return
+    try:
+        channel = client.get_channel(int(ECON_LOG_CHANNEL_ID))
+        if channel is None:
+            channel = await client.fetch_channel(int(ECON_LOG_CHANNEL_ID))  # type: ignore
+        if channel is None:
+            print(f"[warn] ECON log channel not found: {ECON_LOG_CHANNEL_ID}")
+            return
+
+        actor_name = await _safe_actor_name(interaction)
+        actor_id = int(interaction.user.id) if getattr(interaction, "user", None) else 0
+
+        header = f"**ECON LOG:** `{action}`"
+        actor_line = f"**Actor:** {actor_name} ({actor_id})"
+
+        lines: List[str] = [header, actor_line]
+
+        if action == "purchase_new":
+            lines += _fmt_kv(details, ["character", "tier", "asset_name", "asset_type", "cost", "add_income", "sales_kingdom", "new_balance"])
+        elif action == "upgrade_asset":
+            lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "from_tier", "to_tier", "cost", "sales_kingdom"])
+        elif action == "sell_asset":
+            lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "tier", "refund_amount"])
+        elif action == "income_claim":
+            lines += _fmt_kv(details, ["character", "character_kingdom", "base_income", "asset_income", "gross_total", "tax_total", "net_total", "new_balance"])
+        elif action in ("adjust_balance", "set_balance"):
+            lines += _fmt_kv(details, ["character", "delta", "value", "new_balance"])
+        elif action in ("set_kingdom_tax", "set_kingdom_treasury"):
+            lines += _fmt_kv(details, ["kingdom", "percent", "tax_rate_bp", "treasury"])
+        else:
+            lines += _fmt_kv(details, ["character", "kingdom", "amount", "cost", "new_balance"])
+
+        msg = _cap_message("\n".join(lines))
+        await channel.send(msg, allowed_mentions=discord.AllowedMentions.none())  # type: ignore
+    except Exception as e:
+        print(f"[warn] ECON channel log failed: {e}")
+
+
+async def log_econ(interaction: discord.Interaction, action: str, details: Dict[str, Any]) -> None:
+    """Write to DB audit log and to Discord econ log channel (if configured)."""
+    await log_econ(interaction, action, details)
+    await log_econ_channel(interaction, action, details)
+
+
+
 # -------------------------
 # Assets (definitions in econ_asset_definitions; purchases in econ_assets)
 # -------------------------
@@ -1836,7 +1901,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     )
 
 
-    await log_audit(
+    await log_econ(
         interaction,
         "income_claim",
         {
@@ -1919,7 +1984,7 @@ async def cmd_set_kingdom_tax(interaction: discord.Interaction, kingdom: str, ra
     pct = int(rate.value)
     bp = pct * 100  # convert percent to basis points
     await upsert_kingdom_tax_bp(k, bp)
-    await log_audit(interaction, "set_kingdom_tax", {"kingdom": k, "percent": pct, "tax_rate_bp": bp})
+    await log_econ(interaction, "set_kingdom_tax", {"kingdom": k, "percent": pct, "tax_rate_bp": bp})
     trigger_bank_refresh()
 
     await interaction.followup.send(f"Set **{k}** tax rate to **{pct}%** (stored as **{bp} bp**).", ephemeral=True)
@@ -2001,7 +2066,7 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
         return
 
     new_bal = await adjust_balance(character, delta)
-    await log_audit(interaction, "adjust_balance", {"character": character, "delta": delta, "new_balance": new_bal})
+    await log_econ(interaction, "adjust_balance", {"character": character, "delta": delta, "new_balance": new_bal})
     await interaction.followup.send(
         f"Adjusted **{character}** by **{format_currency(delta)}**. New balance: **{format_currency(new_bal)}**",
         ephemeral=True,
@@ -2029,7 +2094,7 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
         return
 
     await set_balance(character, value)
-    await log_audit(interaction, "set_balance", {"character": character, "value": value})
+    await log_econ(interaction, "set_balance", {"character": character, "value": value})
     await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
     trigger_bank_refresh()
 
@@ -2143,7 +2208,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     # Income is computed dynamically from assets; we don't store a separate total.
     new_daily_income = await recompute_daily_income(character)
 
-    await log_audit(
+    await log_econ(
         interaction,
         "purchase_new",
         {
@@ -2257,7 +2322,7 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
         asset_name,
     )
 
-    await log_audit(
+    await log_econ(
         interaction,
         "upgrade_asset",
         {
@@ -2344,7 +2409,7 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
     if refund_amount:
         await adjust_balance(character, int(refund_amount))
 
-    await log_audit(
+    await log_econ(
         interaction,
         "sell_asset",
         {
