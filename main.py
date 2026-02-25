@@ -13,6 +13,7 @@ import os
 import json
 import re
 import asyncio
+from io import BytesIO
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
@@ -31,7 +32,13 @@ except Exception as e:
     raise RuntimeError("asyncpg is required for EconBot") from e
 
 
-APP_VERSION = "EconBot_v112"
+try:
+    import openpyxl  # type: ignore
+except Exception:
+    openpyxl = None  # type: ignore
+
+
+APP_VERSION = "EconBot_v115"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -151,10 +158,81 @@ async def cumulative_cost_to_tier(asset_type: str, target_tier: str) -> Optional
 
 
 
-def format_currency(total_cinth: int) -> str:
-    """Compact currency with roll-up to highest denominations, dropping zeros, plus raw total."""
+def _plural(unit: str, qty: int) -> str:
+    """Pluralization for currency units.
+
+    Canon (per user):
+    - Elsh plural is Elsh
+    - Oril plural is Orils
+    - Arce plural is Arces
+    - Cinth plural is Cinths
+    - Novir shown as Novir for both (kept as-is)
+    """
+    if qty == 1:
+        return unit
+    if unit == "Elsh":
+        return "Elsh"
+    if unit == "Oril":
+        return "Orils"
+    if unit == "Arce":
+        return "Arces"
+    if unit == "Cinth":
+        return "Cinths"
+    if unit == "Novir":
+        return "Novir"
+    return unit + "s"
+
+
+def format_balance(total_val: int) -> str:
+    """Format as: '1 Novir, 2 Orils, 3 Elsh, 4 Arces, 5 Cinths (12,345 Val)'.
+
+    Always shows all denominations (including zeros) and includes total in Val.
+    """
     try:
-        total = int(total_cinth)
+        total = int(total_val)
+    except Exception:
+        total = 0
+
+    sign = "-" if total < 0 else ""
+    n = abs(total)
+
+    novir, n = divmod(n, 10000)
+    oril, n = divmod(n, 1000)
+    elsh, n = divmod(n, 100)
+    arce, cinth = divmod(n, 10)
+
+    parts = [
+        f"{novir} {_plural('Novir', novir)}",
+        f"{oril} {_plural('Oril', oril)}",
+        f"{elsh} {_plural('Elsh', elsh)}",
+        f"{arce} {_plural('Arce', arce)}",
+        f"{cinth} {_plural('Cinth', cinth)}",
+    ]
+    return f"{sign}{', '.join(parts)} ({total:,} Val)"
+
+
+def format_amount(val: int) -> str:
+    """Single-amount formatter for income lines and per-asset deltas.
+
+    - If exactly 1 Arce (10 Val), show '1 Arce'.
+    - Otherwise show '{val:,} Val'.
+    """
+    try:
+        v = int(val)
+    except Exception:
+        v = 0
+    if v == 10:
+        return "1 Arce"
+    return f"{v:,} Val"
+
+
+def format_currency(total_val: int) -> str:
+    """Backward-compatible compact formatter used across non-card views.
+
+    Keeps existing parts of the bot (treasuries, leaderboards, logs) stable.
+    """
+    try:
+        total = int(total_val)
     except Exception:
         total = 0
 
@@ -170,18 +248,18 @@ def format_currency(total_cinth: int) -> str:
     ]
 
     parts: List[str] = []
-    for value, short in denominations:
+    for value, unit in denominations:
         if n <= 0:
             break
         qty, n = divmod(n, value)
         if qty:
-            parts.append(f"{qty} {short}")
+            parts.append(f"{qty} {_plural(unit, int(qty))}")
 
     if not parts:
-        parts = ["0 Cinth"]
+        parts = ["0 Cinths"]
 
     compact = " • ".join(parts)
-    return f"{sign}{compact} (Total: {total:,} Copper Cinth)"
+    return f"{sign}{compact} ({total:,} Val)"
 
 # Base daily income granted on /income claim (in Copper Cinth units)
 BASE_DAILY_INCOME = 10
@@ -255,7 +333,7 @@ async def get_assets_for_character(character_name: str) -> List[Dict[str, Any]]:
     """Return full asset rows for a character."""
     rows = await db_fetch(
         '''
-        SELECT asset_type, tier, asset_name
+        SELECT asset_type, tier, asset_name, COALESCE(kingdom, '') AS kingdom
         FROM econ_assets
         WHERE guild_id=$1 AND character_name=$2
         ''',
@@ -272,42 +350,89 @@ async def get_assets_for_character(character_name: str) -> List[Dict[str, Any]]:
     return sorted(rows, key=_key)
 
 
-async def render_character_card(
-    guild: discord.Guild,
-    character_name: str,
-    owner_id: Optional[int] = None,
-) -> List[str]:
-    """Render a single character card (no pings). Returns list of lines."""
-    if owner_id is None:
-        owner_id = await get_character_owner(character_name)
+async def get_assets_with_income_for_character(character_name: str) -> List[Dict[str, Any]]:
+    """Return assets for a character including per-tier income value."""
+    rows = await db_fetch(
+        '''
+        SELECT a.asset_type, a.tier, a.asset_name, COALESCE(a.kingdom, '') AS kingdom,
+               d.add_income_val
+        FROM econ_assets a
+        JOIN econ_asset_definitions d
+          ON d.asset_type=a.asset_type AND d.tier=a.tier
+        WHERE a.guild_id=$1 AND a.character_name=$2
+        ''',
+        DATA_GUILD_ID,
+        character_name,
+    )
 
-    owner_display = "Unknown"
-    if owner_id is not None:
-        m = guild.get_member(int(owner_id))
-        # Do not fetch members (avoids rate limits); rely on cache.
-        owner_display = m.display_name if m else f"User {owner_id}"
+    def _key(r: Dict[str, Any]) -> Tuple[int, str, str]:
+        rk = _tier_rank(str(r.get("tier", "")))
+        if rk is None:
+            rk = 9999
+        return (rk, str(r.get("asset_type", "")), str(r.get("asset_name", "")))
+
+    return sorted(rows, key=_key)
+
+
+async def _display_name_from_cache(guild: discord.Guild, user_id: int) -> str:
+    """Plain-text display name (server nickname if set). No pings, no fetch."""
+    m = guild.get_member(int(user_id))
+    return m.display_name if m else f"User {user_id}"
+
+
+def _tier_label(tier: str) -> str:
+    rk = _tier_rank(str(tier))
+    if rk is None:
+        return str(tier)
+    return f"T{rk}"
+
+
+async def render_character_section(character_name: str) -> List[str]:
+    """Render the character portion of a card (no nickname header, no border)."""
+    kingdom = await get_character_kingdom(character_name)
+    kingdom = str(kingdom or "").strip() or "(No Kingdom)"
 
     bal = await get_balance(character_name)
-    inc = await recompute_daily_income(character_name)
-    assets = await get_assets_for_character(character_name)
-    kingdom = await get_character_kingdom(character_name)
+    assets = await get_assets_with_income_for_character(character_name)
+    asset_income_sum = sum(int(a.get("add_income_val") or 0) for a in assets)
 
     out: List[str] = []
-    out.append("━━━━━━━━━━━━━━━━━━")
-    out.append(f"**{character_name}**  ·  *{owner_display}*")
-    if kingdom:
-        out.append(f"🏰 **Kingdom:** {kingdom}")
-    out.append(f"💰 **Balance:** {format_currency(bal)}")
-    out.append(f"🌙 **Daily Income:** {format_currency(inc)}")
+    out.append(f"**{character_name}** - {kingdom}")
+    out.append(f"💰 **Balance:** {format_balance(bal)}")
+    out.append(f"📈 **Income:** {format_amount(BASE_DAILY_INCOME)} | **Income from Assets:** {asset_income_sum:,} Val")
+    out.append(f"🧾 **__Assets__**")
 
-    if assets:
-        out.append(f"🏷️ **Assets ({len(assets)}):**")
-        for a in assets:
-            out.append(f"- {a['asset_type']} | {a['tier']} | {a['asset_name']}")
-    else:
-        out.append("🏷️ **Assets:** (none)")
+    if not assets:
+        out.append("- (none)")
+        return out
 
-    out.append("")  # spacer
+    for a in assets:
+        tier = _tier_label(str(a.get("tier", "")))
+        aname = str(a.get("asset_name", "")).strip() or str(a.get("asset_type", "")).strip()
+        akingdom = str(a.get("kingdom", "")).strip() or "(No Kingdom)"
+        add = int(a.get("add_income_val") or 0)
+        out.append(f"- {tier} - {aname} - {akingdom} - +{add:,} Val")
+    return out
+
+
+async def render_user_card_block(
+    guild: discord.Guild,
+    owner_id: int,
+    character_names: List[str],
+) -> List[str]:
+    """Render a full card block matching the user's required Discord formatting."""
+    owner_display = await _display_name_from_cache(guild, owner_id)
+
+    out: List[str] = []
+    out.append("___________________________________________________________________")
+    out.append(f"***{owner_display}***")
+
+    for idx, cname in enumerate(character_names):
+        if idx > 0:
+            out.append("")
+        out.extend(await render_character_section(cname))
+
+    out.append("___________________________________________________________________")
     return out
 
 
@@ -913,6 +1038,31 @@ async def get_asset_def(asset_type: str, tier: str) -> Optional[Tuple[int, int]]
 
 
 
+
+
+async def get_asset_definition_kingdom(asset_type: str, tier: str) -> Optional[str]:
+    """Return the sales/tax kingdom assigned to this asset definition row (nullable)."""
+    try:
+        row = await db_fetchrow(
+            """
+            SELECT kingdom
+            FROM econ_asset_definitions
+            WHERE asset_type=$1 AND tier=$2
+            LIMIT 1;
+            """,
+            asset_type,
+            tier,
+        )
+        if not row:
+            return None
+        k = row.get("kingdom")
+        if k is None:
+            return None
+        k = str(k).strip()
+        return k if k else None
+    except Exception:
+        return None
+
 def _selected_option_from_interaction(interaction: discord.Interaction, option_name: str) -> Optional[str]:
     """
     Robustly retrieve a selected option value during autocomplete.
@@ -948,17 +1098,20 @@ async def seed_asset_definitions() -> None:
               tier TEXT NOT NULL,
               cost_val BIGINT NOT NULL,
               add_income_val BIGINT NOT NULL,
+              kingdom TEXT,
               PRIMARY KEY (asset_type, tier)
             );
             """
         )
+        # Additive migration: asset sales kingdom (nullable)
+        await db_exec("ALTER TABLE econ_asset_definitions ADD COLUMN IF NOT EXISTS kingdom TEXT;")
         for asset_type, tier, cost_val, add_income_val in ASSET_DEFINITIONS_SEED:
             await db_exec(
                 """
                 INSERT INTO econ_asset_definitions (asset_type, tier, cost_val, add_income_val)
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (asset_type, tier)
-                DO UPDATE SET cost_val=EXCLUDED.cost_val, add_income_val=EXCLUDED.add_income_val;
+                DO NOTHING;
                 """,
                 asset_type, tier, int(cost_val), int(add_income_val)
             )
@@ -971,6 +1124,123 @@ async def seed_asset_definitions() -> None:
     except Exception as e:
         print(f"[warn] seed_asset_definitions failed: {e}")
 
+
+
+def _parse_val_cell(v: Any) -> Optional[int]:
+    """Parse a spreadsheet cell that may look like '300 Val' or 300 into an int (base Val/Cinth units)."""
+    if v is None:
+        return None
+    if isinstance(v, (int,)):
+        return int(v)
+    if isinstance(v, float):
+        # Spreadsheet might store whole numbers as floats
+        return int(round(v))
+    s = str(v).strip()
+    if not s:
+        return None
+    # Extract the first integer-like token
+    m = re.search(r"-?\d+", s.replace(",", ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
+
+
+async def import_asset_definitions_from_xlsx_bytes(data: bytes) -> Tuple[int, int, int, List[str]]:
+    """Import/update econ_asset_definitions from an uploaded NEW Asset Table.xlsx.
+
+    Policy: UPSERT by (asset_type, tier). Existing rows are UPDATED (no duplicates).
+    Returns: (rows_processed, inserted_count, updated_count, errors)
+    """
+    errors: List[str] = []
+    if openpyxl is None:
+        return 0, 0, 0, ["openpyxl is not available in this runtime."]
+
+    try:
+        wb = openpyxl.load_workbook(BytesIO(data), data_only=True)
+    except Exception as e:
+        return 0, 0, 0, [f"Failed to read XLSX: {e}"]
+
+    # Use first worksheet
+    ws = wb.worksheets[0]
+
+    # Read header row
+    header_row = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    header_map = {str(h).strip(): i for i, h in enumerate(header_row) if h is not None}
+
+    required = ["Asset Type", "Tier", "Cost to Acquire", "Add to Income"]
+    # Optional (but recommended): Kingdom (destination for purchase/upgrade funds + income tax bucket)
+    i_kingdom = header_map.get("Kingdom")
+    missing = [h for h in required if h not in header_map]
+    if missing:
+        return 0, 0, 0, [f"XLSX missing required column(s): {', '.join(missing)}"]
+
+    i_type = header_map["Asset Type"]
+    i_tier = header_map["Tier"]
+    i_cost = header_map["Cost to Acquire"]
+    i_inc = header_map["Add to Income"]
+
+    processed = 0
+    inserted = 0
+    updated = 0
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        # Skip empty rows
+        if row is None or all(v is None or str(v).strip() == "" for v in row):
+            continue
+
+        asset_type = str(row[i_type]).strip() if row[i_type] is not None else ""
+        tier = str(row[i_tier]).strip() if row[i_tier] is not None else ""
+        cost_val = _parse_val_cell(row[i_cost])
+        add_income_val = _parse_val_cell(row[i_inc]) or 0
+        kingdom_val: Optional[str] = None
+        if i_kingdom is not None and i_kingdom < len(row):
+            kv = row[i_kingdom]
+            if kv is not None:
+                k = str(kv).strip()
+                if k:
+                    # Validate against canonical list to avoid typos silently creating new kingdoms.
+                    if k not in CANON_KINGDOMS:
+                        errors.append(f"Row {row_idx}: invalid Kingdom '{k}' (must be one of: {', '.join(CANON_KINGDOMS)})")
+                        continue
+                    kingdom_val = k
+
+        if not asset_type or not tier:
+            errors.append(f"Row {row_idx}: missing Asset Type or Tier")
+            continue
+        if cost_val is None:
+            errors.append(f"Row {row_idx}: could not parse Cost to Acquire")
+            continue
+
+        processed += 1
+
+        # UPSERT; determine insert vs update using xmax=0 trick
+        rec = await db_fetchrow(
+            """
+            WITH upsert AS (
+              INSERT INTO econ_asset_definitions(asset_type, tier, cost_val, add_income_val, kingdom)
+              VALUES ($1, $2, $3, $4, $5)
+              ON CONFLICT (asset_type, tier)
+              DO UPDATE SET cost_val=EXCLUDED.cost_val, add_income_val=EXCLUDED.add_income_val,
+                            kingdom=COALESCE(EXCLUDED.kingdom, econ_asset_definitions.kingdom)
+              RETURNING (xmax = 0) AS inserted
+            )
+            SELECT inserted FROM upsert;
+            """,
+            asset_type,
+            tier,
+            int(cost_val),
+            int(add_income_val),
+            kingdom_val,
+        )
+        if rec and bool(rec["inserted"]):
+            inserted += 1
+        else:
+            updated += 1
+
+    return processed, inserted, updated, errors
 
 
 async def asset_type_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
@@ -1204,11 +1474,17 @@ async def render_bank_pages(guild: discord.Guild) -> List[str]:
     header_lines.append("━━━━━━━━━━━━━━━━━━")
     header_lines.append("_See the following messages for full character cards._")
 
-    # Build card blocks (each block is a complete card)
-    rows_sorted = sorted(rows, key=lambda r: (int(r[1]), str(r[0]).lower()))
+    # Build card blocks grouped by user (each block is a complete card)
+    by_user: Dict[int, List[str]] = {}
+    for cname, uid, _, _ in rows:
+        by_user.setdefault(int(uid), []).append(str(cname))
+
+    for uid in by_user:
+        by_user[uid] = sorted(by_user[uid], key=lambda s: s.lower())
+
     card_blocks: List[str] = []
-    for cname, uid, _, _ in rows_sorted:
-        card_lines = await render_character_card(guild, cname, owner_id=uid)
+    for uid in sorted(by_user.keys()):
+        card_lines = await render_user_card_block(guild, uid, by_user[uid])
         card_text = "\n".join(card_lines).strip()
 
         # Ensure a single card never exceeds a safe limit; truncate asset list if needed
@@ -1228,7 +1504,7 @@ async def render_bank_pages(guild: discord.Guild) -> List[str]:
                 try:
                     insert_at = len(lines)
                     for i in range(len(lines) - 1, -1, -1):
-                        if lines[i].startswith("🏷️ **Assets"):
+                        if "Assets" in lines[i]:
                             insert_at = i + 1
                             break
                     lines.insert(insert_at, f"- …and {removed} more (not shown)")
@@ -1335,7 +1611,10 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
     if create_missing and len(msgs) < len(pages):
         try:
             while len(msgs) < len(pages):
-                m = await ch.send("Initializing Bank of Vilyra…")
+                m = await ch.send(
+                    "Initializing Bank of Vilyra…",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
                 msgs.append(m)
             await save_bank_message_ids([int(m.id) for m in msgs])
             print(f"[test] Bank dashboard message IDs saved to Postgres: {len(msgs)}")
@@ -1346,7 +1625,7 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
         if not msgs:
             return
         try:
-            await msgs[0].edit(content=pages[0])
+            await msgs[0].edit(content=pages[0], allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as e:
             print(f"[warn] Failed to edit header page: {e}")
         return
@@ -1356,7 +1635,7 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
         for attempt in range(4):
             try:
                 if msgs[i].content != pages[i]:
-                    await msgs[i].edit(content=pages[i])
+                    await msgs[i].edit(content=pages[i], allowed_mentions=discord.AllowedMentions.none())
                 # Space edits to reduce 429s when multiple pages exist.
                 if i < n - 1:
                     await asyncio.sleep(1.2)
@@ -1370,7 +1649,7 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
     if len(msgs) > len(pages):
         for j in range(len(pages), len(msgs)):
             try:
-                await msgs[j].edit(content="(unused bank page)")
+                await msgs[j].edit(content="(unused bank page)", allowed_mentions=discord.AllowedMentions.none())
             except Exception:
                 pass
 
@@ -1441,7 +1720,11 @@ async def cmd_balance(interaction: discord.Interaction, character: str):
     if guild is None:
         await interaction.followup.send("This command must be used in a server.", ephemeral=True)
         return
-    card_lines = await render_character_card(guild, character)
+    owner_id = await get_character_owner(character)
+    if owner_id is None:
+        await interaction.followup.send("Character not found in DB.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        return
+    card_lines = await render_user_card_block(guild, int(owner_id), [character])
     # render as a single message if possible
     txt = "\n".join(card_lines).strip()
     if len(txt) > 1900:
@@ -1453,7 +1736,7 @@ async def cmd_balance(interaction: discord.Interaction, character: str):
                 break
             trimmed.append(ln)
         txt = "\n".join(trimmed).strip()
-    await interaction.followup.send(txt, ephemeral=True)
+    await interaction.followup.send(txt, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @tree.command(name="income", description="Claim daily income for a character.", guild=discord.Object(id=GUILD_ID))
@@ -1603,6 +1886,7 @@ async def cmd_econ_commands(interaction: discord.Interaction):
         "• `/econ_adjust` — adjust balance by delta\n"
         "• `/econ_set_balance` — set balance to value\n"
         "• `/econ_refresh_bank` — refresh bank dashboard\n• `/econ_set_kingdom_tax` — set kingdom tax rate (10–50%)\n"
+        "• `/econ_import_assets` — import/update NEW Asset Table.xlsx into DB\n"
     )
     await interaction.followup.send(msg, ephemeral=True)
 
@@ -1640,6 +1924,59 @@ async def cmd_set_kingdom_tax(interaction: discord.Interaction, kingdom: str, ra
 
     await interaction.followup.send(f"Set **{k}** tax rate to **{pct}%** (stored as **{bp} bp**).", ephemeral=True)
 
+
+
+@tree.command(
+    name="econ_import_assets",
+    description="Import/update asset definitions from an uploaded NEW Asset Table.xlsx (no duplicates).",
+    guild=discord.Object(id=GUILD_ID),
+)
+@staff_only()
+async def cmd_econ_import_assets(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+
+    if openpyxl is None:
+        await interaction.followup.send(
+            "This runtime is missing `openpyxl`, so I cannot read XLSX files. Install/openpyxl in Railway and redeploy.",
+            ephemeral=True,
+        )
+        return
+
+    fname = (file.filename or "").lower()
+    if not fname.endswith(".xlsx"):
+        await interaction.followup.send("Please upload a `.xlsx` file.", ephemeral=True)
+        return
+
+    try:
+        data = await file.read()
+    except Exception as e:
+        await interaction.followup.send(f"Failed to download attachment: {e}", ephemeral=True)
+        return
+
+    processed, inserted, updated, errors = await import_asset_definitions_from_xlsx_bytes(data)
+
+    # Refresh the in-memory catalog and bank dashboard after import
+    try:
+        await load_asset_catalog()
+    except Exception:
+        pass
+
+    try:
+        trigger_bank_refresh()
+    except Exception:
+        pass
+
+    msg = (
+        f"Asset import complete. Rows processed: **{processed}**\n"
+        f"Inserted: **{inserted}** | Updated: **{updated}**\n"
+    )
+    if errors:
+        # Avoid flooding; show up to 10
+        shown = errors[:10]
+        msg += "\n**Warnings/Errors (first 10):**\n" + "\n".join(f"• {e}" for e in shown)
+        if len(errors) > 10:
+            msg += f"\n… and {len(errors) - 10} more."
+    await interaction.followup.send(msg, ephemeral=True)
 
 
 @tree.command(name="econ_adjust", description="(Staff) Adjust a character balance by delta.", guild=discord.Object(id=GUILD_ID))
@@ -1739,6 +2076,12 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
         await interaction.followup.send("Unable to compute cumulative cost for this asset type/tier.", ephemeral=True)
         return
 
+    # Destination kingdom for purchase funds:
+    # Prefer definition's assigned kingdom; fall back to character home kingdom.
+    sales_kingdom = await get_asset_definition_kingdom(asset_type, tier)
+    if not sales_kingdom:
+        sales_kingdom = await get_character_kingdom(character)
+
     cur_bal = await get_balance(character)
     if cur_bal < cost_val:
         await interaction.followup.send(
@@ -1777,8 +2120,8 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     try:
         await db_exec(
             """
-            INSERT INTO econ_assets (guild_id, character_name, user_id, asset_name, asset_type, tier, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW());
+            INSERT INTO econ_assets (guild_id, character_name, user_id, asset_name, asset_type, tier, kingdom, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW());
             """,
             DATA_GUILD_ID,
             character,
@@ -1786,6 +2129,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
             asset_name,
             asset_type,
             tier,
+            sales_kingdom,
         )
     except Exception as e:
         await interaction.followup.send(f"Failed to add asset (see logs for details): {e}", ephemeral=True)
@@ -1793,6 +2137,8 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
 
     # Deduct cost
     new_bal = await adjust_balance(character, -cost_val)
+    if sales_kingdom:
+        await add_to_kingdom_treasury(sales_kingdom, int(cost_val))
 
     # Income is computed dynamically from assets; we don't store a separate total.
     new_daily_income = await recompute_daily_income(character)
@@ -1808,6 +2154,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
             "asset_name": asset_name,
             "cost": cost_val,
             "add_income": add_income_val,
+            "sales_kingdom": sales_kingdom,
             "new_balance": new_bal,
             "new_daily_income": new_daily_income,
         },
@@ -1816,7 +2163,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     await interaction.followup.send(
         f"Recorded purchase for **{character}**:\n"
         f"• **{asset_type}** | **{tier}** | **{asset_name}**\n"
-        f"Cost: **{format_currency(cost_val)}** (new balance **{format_currency(new_bal)}**)\n"
+        f"Cost: **{format_currency(cost_val)}** → sent to **{sales_kingdom or 'N/A'}** treasury (new balance **{format_currency(new_bal)}**)\n"
         f"Daily income now: **{format_currency(new_daily_income)}**",
         ephemeral=True,
     )
@@ -1863,6 +2210,27 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
         await interaction.followup.send("Unable to calculate upgrade cost for that tier change.", ephemeral=True)
         return
 
+    # Destination kingdom for upgrade funds:
+    # Prefer the asset's stored kingdom; if missing, fall back to definition kingdom for target tier; then character home kingdom.
+    row_k = await db_fetchrow(
+        '''
+        SELECT COALESCE(kingdom, '') AS k
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        asset_name,
+    )
+    upgrade_kingdom = str((row_k or {}).get('k', '') or '').strip()
+    if not upgrade_kingdom:
+        upgrade_kingdom = await get_asset_definition_kingdom(asset_type, target_tier) or ''
+    if not upgrade_kingdom:
+        upgrade_kingdom = await get_character_kingdom(character) or ''
+
     cur_bal = await get_balance(character)
     if cur_bal < cost_val:
         await interaction.followup.send(
@@ -1872,13 +2240,16 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
         return
 
     await adjust_balance(character, -int(cost_val))
+    if upgrade_kingdom:
+        await add_to_kingdom_treasury(upgrade_kingdom, int(cost_val))
     await db_exec(
         '''
         UPDATE econ_assets
-        SET tier=$1
+        SET tier=$1, kingdom=CASE WHEN COALESCE(kingdom,'')='' THEN $2 ELSE kingdom END
         WHERE guild_id=$2 AND character_name=$3 AND asset_type=$4 AND tier=$5 AND asset_name=$6;
         ''',
         target_tier,
+        upgrade_kingdom,
         DATA_GUILD_ID,
         character,
         asset_type,
@@ -1896,6 +2267,7 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
             "from_tier": current_tier,
             "to_tier": target_tier,
             "cost": int(cost_val),
+            "sales_kingdom": upgrade_kingdom,
         },
     )
 
@@ -1906,7 +2278,7 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
             f"Upgraded **{character}** asset:\n"
             f"- {asset_type} | {current_tier} | {asset_name}\n"
             f"→ {asset_type} | {target_tier} | {asset_name}\n"
-            f"Cost: **{format_currency(cost_val)}**\n"
+            f"Cost: **{format_currency(cost_val)}** → sent to **{upgrade_kingdom or 'N/A'}** treasury\n"
             f"New balance: **{format_currency(await get_balance(character))}**"
         ),
         ephemeral=True,
