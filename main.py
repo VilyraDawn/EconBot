@@ -1044,8 +1044,13 @@ async def log_econ_channel(interaction: discord.Interaction, action: str, detail
 
 
 async def log_econ(interaction: discord.Interaction, action: str, details: Dict[str, Any]) -> None:
-    """Write to DB audit log and to Discord econ log channel (if configured)."""
-    await log_econ(interaction, action, details)
+    """Write to DB audit log and to Discord econ log channel (if configured).
+
+    IMPORTANT: This must never call itself (no recursion). It wraps:
+      - log_audit (DB json audit)
+      - log_econ_channel (Discord channel log)
+    """
+    await log_audit(interaction, action, details)
     await log_econ_channel(interaction, action, details)
 
 
