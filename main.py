@@ -38,7 +38,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v116"
+APP_VERSION = "EconBot_v117"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -1424,6 +1424,24 @@ async def add_to_kingdom_treasury(kingdom: str, amount_cinth: int) -> None:
         int(amount_cinth),
     )
 
+
+
+async def set_kingdom_treasury_exact(kingdom: str, treasury_cinth: int) -> None:
+    """Set a kingdom treasury to an exact value (cinths). Preserves existing tax_rate_bp."""
+    treasury_cinth = int(treasury_cinth)
+    if treasury_cinth < 0:
+        treasury_cinth = 0
+    await db_exec(
+        """
+        INSERT INTO econ_kingdoms (guild_id, kingdom, tax_rate_bp, treasury)
+        VALUES ($1, $2, 0, $3)
+        ON CONFLICT (guild_id, kingdom)
+        DO UPDATE SET treasury=EXCLUDED.treasury;
+        """,
+        DATA_GUILD_ID,
+        kingdom,
+        treasury_cinth,
+    )
 async def fetch_kingdom_treasuries() -> List[Tuple[str, int, int]]:
     rows = await db_fetch(
         """
@@ -2023,6 +2041,36 @@ async def cmd_econ_adjust(interaction: discord.Interaction, character: str, delt
         ephemeral=True,
     )
 
+
+
+@tree.command(name="set_kingdom_treasury", description="(Staff) Set a kingdom treasury to an exact value (Val).", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.describe(kingdom="Kingdom name.", amount="New treasury amount (Val, must be >= 0).")
+@app_commands.choices(
+    kingdom=[
+        app_commands.Choice(name="Sethrathiel", value="Sethrathiel"),
+        app_commands.Choice(name="Velarith", value="Velarith"),
+        app_commands.Choice(name="Lyvik", value="Lyvik"),
+        app_commands.Choice(name="Baelon", value="Baelon"),
+        app_commands.Choice(name="Avalea", value="Avalea"),
+    ]
+)
+async def cmd_set_kingdom_treasury(interaction: discord.Interaction, kingdom: str, amount: int):
+    await interaction.response.defer(ephemeral=True)
+    k = (kingdom or "").strip()
+    if not k:
+        await interaction.followup.send("Kingdom name is required.", ephemeral=True)
+        return
+    amount = int(amount)
+    if amount < 0:
+        await interaction.followup.send("Amount must be >= 0.", ephemeral=True)
+        return
+
+    await set_kingdom_treasury_exact(k, amount)
+    await log_econ(interaction, "set_kingdom_treasury", {"kingdom": k, "treasury": amount})
+    trigger_bank_refresh()
+
+    await interaction.followup.send(f"Set **{k}** treasury to **{format_currency(amount)}**.", ephemeral=True)
     trigger_bank_refresh()
 
 
@@ -2305,15 +2353,11 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
     )
 
 
-@tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (optional refund).", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (refunds 100% of total invested cost).", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
-@app_commands.describe(refund_percent="Optional refund percent of total invested cost (0-100). Default 100.")
-async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str, refund_percent: Optional[int] = 100):
+async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str):
     await interaction.response.defer(ephemeral=True)
-
-    refund_percent = int(refund_percent or 0)
-    refund_percent = max(0, min(100, refund_percent))
 
     parts = [p.strip() for p in str(asset).split("|")]
     if len(parts) < 3:
@@ -2345,13 +2389,11 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
         # Safety fallback for legacy rows; do not block sale.
         asset_kingdom = str((await get_character_kingdom(character)) or "").strip()
 
-    gross_refund = 0
-    if refund_percent > 0:
-        cumulative_cost = await cumulative_cost_to_tier(asset_type, tier)
-        if cumulative_cost is None or cumulative_cost <= 0:
-            await interaction.followup.send("Unable to calculate cumulative cost for this asset.", ephemeral=True)
-            return
-        gross_refund = int(round((int(cumulative_cost) * refund_percent) / 100.0))
+    cumulative_cost = await cumulative_cost_to_tier(asset_type, tier)
+    if cumulative_cost is None or cumulative_cost <= 0:
+        await interaction.followup.send("Unable to calculate cumulative cost for this asset.", ephemeral=True)
+        return
+    gross_refund = int(cumulative_cost)
 
     tax_bp = 0
     if gross_refund > 0 and asset_kingdom:
@@ -2385,7 +2427,6 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
             "tier": tier,
             "asset_name": asset_name,
             "asset_kingdom": asset_kingdom,
-            "refund_percent": refund_percent,
             "gross_refund": gross_refund,
             "tax_bp": tax_bp,
             "tax_amount": tax_amount,
@@ -2400,7 +2441,7 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
         f"- {asset_type} | {tier} | {asset_name}\n"
     )
     if gross_refund:
-        msg += f"Gross refund: **{format_currency(gross_refund)}** ({refund_percent}%)\n"
+        msg += f"Gross refund: **{format_currency(gross_refund)}**\n"
         if tax_amount and asset_kingdom:
             msg += f"Tax to **{asset_kingdom}**: **{format_currency(tax_amount)}** ({tax_bp/100:.2f}%)\n"
         msg += f"Net to character: **{format_currency(net_refund)}**\n"
