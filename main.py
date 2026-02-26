@@ -14,6 +14,7 @@ import json
 import re
 import asyncio
 from io import BytesIO
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
@@ -38,7 +39,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v120"
+APP_VERSION = "EconBot_v121"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -49,6 +50,38 @@ CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 # Put the image file in your repo at this relative path (default below) so it is always available.
 BALANCE_CARD_IMAGE_PATH = os.getenv("BALANCE_CARD_IMAGE_PATH", "assets/great_anus.jpg")
 BALANCE_CARD_IMAGE_FILENAME = os.getenv("BALANCE_CARD_IMAGE_FILENAME", "balance_card.jpg")
+
+
+# Resolve bundled image path relative to this file (Railway working directory can vary).
+_BASE_DIR = Path(__file__).resolve().parent
+
+
+def _find_parchment_path() -> Optional[Path]:
+    """Return an existing path to the parchment image, or None if not found."""
+    candidates: list[Path] = []
+
+    # User-configured path (absolute or relative to this file)
+    p = Path(BALANCE_CARD_IMAGE_PATH)
+    candidates.append(p if p.is_absolute() else (_BASE_DIR / p))
+
+    # Common fallbacks inside ./assets (handles accidental filename/case differences)
+    assets_dir = _BASE_DIR / "assets"
+    for name in [
+        "great_anus.jpg",
+        "Great Anus.jpg",
+        "Great%20Anus.jpg",
+        "great_anus.jpeg",
+        "great_anus.png",
+    ]:
+        candidates.append(assets_dir / name)
+
+    for c in candidates:
+        try:
+            if c.exists() and c.is_file():
+                return c
+        except Exception:
+            continue
+    return None
 
 
 def _parchment_embed() -> discord.Embed:
@@ -62,8 +95,25 @@ async def send_ephemeral_with_parchment(interaction: discord.Interaction, conten
 
     Falls back to sending content without an image if the file is missing.
     """
+    p = _find_parchment_path()
+    if not p:
+        print(f"[warn] Balance/Income image missing. Tried {BALANCE_CARD_IMAGE_PATH!r} relative to {_BASE_DIR}.")
+        # Helpful diagnostics to confirm deploy packaging
+        assets_dir = _BASE_DIR / "assets"
+        if assets_dir.exists() and assets_dir.is_dir():
+            try:
+                print(f"[debug] assets/ contents: {[x.name for x in assets_dir.iterdir() if x.is_file()]}")
+            except Exception:
+                pass
+        await interaction.followup.send(
+            content,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
     try:
-        f = discord.File(BALANCE_CARD_IMAGE_PATH, filename=BALANCE_CARD_IMAGE_FILENAME)
+        f = discord.File(str(p), filename=BALANCE_CARD_IMAGE_FILENAME)
         await interaction.followup.send(
             content,
             ephemeral=True,
@@ -72,7 +122,7 @@ async def send_ephemeral_with_parchment(interaction: discord.Interaction, conten
             allowed_mentions=discord.AllowedMentions.none(),
         )
     except FileNotFoundError:
-        print(f"[warn] Balance/Income image missing at {BALANCE_CARD_IMAGE_PATH!r}; sending without image")
+        print(f"[warn] Balance/Income image missing at {str(p)!r}; sending without image")
         await interaction.followup.send(
             content,
             ephemeral=True,
