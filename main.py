@@ -38,14 +38,46 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v118"
+APP_VERSION = "EconBot_v120"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
 DEFAULT_KINGDOM_TAX_BP = 1000  # 10%
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
-BALANCE_CARD_IMAGE_URL = "https://cdn.discordapp.com/attachments/1421905114788134993/1476449684263407881/1631280-doc_brown_full.jpg?ex=69a12a6b&is=699fd8eb&hm=25f261b6f47bd09f9f2d064b2ea2b45b9bf829abf025fc28387f5a50572fb853"
+# Balance/Income parchment image should be bundled with the bot (do NOT use expiring Discord CDN URLs).
+# Put the image file in your repo at this relative path (default below) so it is always available.
+BALANCE_CARD_IMAGE_PATH = os.getenv("BALANCE_CARD_IMAGE_PATH", "assets/great_anus.jpg")
+BALANCE_CARD_IMAGE_FILENAME = os.getenv("BALANCE_CARD_IMAGE_FILENAME", "balance_card.jpg")
+
+
+def _parchment_embed() -> discord.Embed:
+    e = discord.Embed()
+    e.set_image(url=f"attachment://{BALANCE_CARD_IMAGE_FILENAME}")
+    return e
+
+
+async def send_ephemeral_with_parchment(interaction: discord.Interaction, content: str):
+    """Send an ephemeral message with the bundled parchment image attached.
+
+    Falls back to sending content without an image if the file is missing.
+    """
+    try:
+        f = discord.File(BALANCE_CARD_IMAGE_PATH, filename=BALANCE_CARD_IMAGE_FILENAME)
+        await interaction.followup.send(
+            content,
+            ephemeral=True,
+            embed=_parchment_embed(),
+            file=f,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except FileNotFoundError:
+        print(f"[warn] Balance/Income image missing at {BALANCE_CARD_IMAGE_PATH!r}; sending without image")
+        await interaction.followup.send(
+            content,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 # -------------------------
@@ -1826,14 +1858,7 @@ async def cmd_balance(interaction: discord.Interaction, character: str):
                 break
             trimmed.append(ln)
         txt = "\n".join(trimmed).strip()
-    embed = discord.Embed()
-    embed.set_image(url=BALANCE_CARD_IMAGE_URL)
-    await interaction.followup.send(
-        txt,
-        ephemeral=True,
-        embed=embed,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    await send_ephemeral_with_parchment(interaction, txt)
 
 
 @tree.command(name="income", description="Claim daily income for a character.", guild=discord.Object(id=GUILD_ID))
@@ -1951,18 +1976,16 @@ async def cmd_income(interaction: discord.Interaction, character: str):
 
     trigger_bank_refresh()
 
-    await interaction.followup.send(
-        (
-            f"Claimed daily income for **{character}**:\n"
-            f"• Base: **{format_currency(base_income)}** (taxed to **{character_kingdom}**)\n"
-            f"• Assets: **{format_currency(asset_income)}**\n"
-            f"• Gross: **{format_currency(gross_total)}**\n"
-            f"• Tax (rounded down): **{format_currency(total_tax)}**\n"
-            f"• Net received: **{format_currency(net_total)}**\n\n"
-            f"New balance: **{format_currency(new_bal)}**"
-        ),
-        ephemeral=True,
+    msg = (
+        f"Claimed daily income for **{character}**:\n"
+        f"• Base: **{format_currency(base_income)}** (taxed to **{character_kingdom}**)\n"
+        f"• Assets: **{format_currency(asset_income)}**\n"
+        f"• Gross: **{format_currency(gross_total)}**\n"
+        f"• Tax (rounded down): **{format_currency(total_tax)}**\n"
+        f"• Net received: **{format_currency(net_total)}**\n\n"
+        f"New balance: **{format_currency(new_bal)}**"
     )
+    await send_ephemeral_with_parchment(interaction, msg)
 
 
 
