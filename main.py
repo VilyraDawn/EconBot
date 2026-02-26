@@ -38,12 +38,14 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v117"
+APP_VERSION = "EconBot_v118"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
 DEFAULT_KINGDOM_TAX_BP = 1000  # 10%
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
+
+BALANCE_CARD_IMAGE_URL = "https://cdn.discordapp.com/attachments/1421905114788134993/1476449684263407881/1631280-doc_brown_full.jpg?ex=69a12a6b&is=699fd8eb&hm=25f261b6f47bd09f9f2d064b2ea2b45b9bf829abf025fc28387f5a50572fb853"
 
 
 # -------------------------
@@ -1824,7 +1826,14 @@ async def cmd_balance(interaction: discord.Interaction, character: str):
                 break
             trimmed.append(ln)
         txt = "\n".join(trimmed).strip()
-    await interaction.followup.send(txt, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    embed = discord.Embed()
+    embed.set_image(url=BALANCE_CARD_IMAGE_URL)
+    await interaction.followup.send(
+        txt,
+        ephemeral=True,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @tree.command(name="income", description="Claim daily income for a character.", guild=discord.Object(id=GUILD_ID))
