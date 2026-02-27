@@ -8,6 +8,7 @@
 # - All slash commands defer immediately
 
 from __future__ import annotations
+import unicodedata
 
 import os
 import json
@@ -39,7 +40,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v121"
+APP_VERSION = "EconBot_v122"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -295,6 +296,25 @@ def format_balance(total_val: int) -> str:
     return f"{sign}{', '.join(parts)} ({total:,} Val)"
 
 
+def sanitize_plain_text(s: str) -> str:
+    """Sanitize user/DB-provided text so Discord markdown can't be broken by backticks/codeblocks.
+    We do NOT escape '*' or '_' globally (you rely on those for formatting).
+    We only neutralize characters that can force code blocks or inline code, and strip zero-width chars.
+    """
+    if s is None:
+        return ""
+    s = str(s)
+    # Normalize and remove zero-width/invisible formatting characters
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(ch for ch in s if ch not in {"\u200b", "\u200c", "\u200d", "\ufeff"})
+    # Neutralize backticks which can create inline code or code blocks
+    s = s.replace("```", "''").replace("`", "'")
+    # Prevent accidental mentions even though we also set AllowedMentions.none()
+    s = s.replace("@", "@\u200b")
+    # Hard-trim
+    return s.strip()
+
+
 def format_amount(val: int) -> str:
     """Single-amount formatter for income lines and per-asset deltas.
 
@@ -474,14 +494,15 @@ def _tier_label(tier: str) -> str:
 async def render_character_section(character_name: str) -> List[str]:
     """Render the character portion of a card (no nickname header, no border)."""
     kingdom = await get_character_kingdom(character_name)
-    kingdom = str(kingdom or "").strip() or "(No Kingdom)"
+    kingdom = sanitize_plain_text(str(kingdom or "")).strip() or "(No Kingdom)"
 
     bal = await get_balance(character_name)
     assets = await get_assets_with_income_for_character(character_name)
     asset_income_sum = sum(int(a.get("add_income_val") or 0) for a in assets)
 
     out: List[str] = []
-    out.append(f"**{character_name}** - {kingdom}")
+    safe_cname = sanitize_plain_text(character_name)
+    out.append(f"**{safe_cname}** - {kingdom}")
     out.append(f"💰 **Balance:** {format_balance(bal)}")
     out.append(f"📈 **Income:** {format_amount(BASE_DAILY_INCOME)} | **Income from Assets:** {asset_income_sum:,} Val")
     out.append(f"🧾 **__Assets__**")
@@ -492,8 +513,8 @@ async def render_character_section(character_name: str) -> List[str]:
 
     for a in assets:
         tier = _tier_label(str(a.get("tier", "")))
-        aname = str(a.get("asset_name", "")).strip() or str(a.get("asset_type", "")).strip()
-        akingdom = str(a.get("kingdom", "")).strip() or "(No Kingdom)"
+        aname = sanitize_plain_text(str(a.get("asset_name", ""))).strip() or sanitize_plain_text(str(a.get("asset_type", ""))).strip()
+        akingdom = sanitize_plain_text(str(a.get("kingdom", ""))).strip() or "(No Kingdom)"
         add = int(a.get("add_income_val") or 0)
         out.append(f"- {tier} - {aname} - {akingdom} - +{add:,} Val")
     return out
@@ -505,7 +526,7 @@ async def render_user_card_block(
     character_names: List[str],
 ) -> List[str]:
     """Render a full card block matching the user's required Discord formatting."""
-    owner_display = await _display_name_from_cache(guild, owner_id)
+    owner_display = sanitize_plain_text(await _display_name_from_cache(guild, owner_id))
 
     out: List[str] = []
     out.append("___________________________________________________________________")
@@ -547,14 +568,14 @@ async def render_leaderboard_lines(
         out.append("- (none)")
     else:
         for i, (c, uid, bal, inc) in enumerate(top_bal, start=1):
-            out.append(f"{i}. **{c}** — *{await dn(uid)}* — {format_currency(bal)}")
+            out.append(f"{i}. **{sanitize_plain_text(c)}** — *{sanitize_plain_text(await dn(uid))}* — {format_currency(bal)}")
     out.append("")
     out.append("**Top Daily Income**")
     if not top_inc:
         out.append("- (none)")
     else:
         for i, (c, uid, bal, inc) in enumerate(top_inc, start=1):
-            out.append(f"{i}. **{c}** — *{await dn(uid)}* — {format_currency(inc)}")
+            out.append(f"{i}. **{sanitize_plain_text(c)}** — *{sanitize_plain_text(await dn(uid))}* — {format_currency(inc)}")
     out.append("")
     return out
 
