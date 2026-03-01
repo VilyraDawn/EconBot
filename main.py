@@ -40,7 +40,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v122"
+APP_VERSION = "EconBot_v124"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -315,6 +315,33 @@ def sanitize_plain_text(s: str) -> str:
     return s.strip()
 
 
+def normalize_dashboard_markdown(s: str) -> str:
+    """Ensure Discord renders markdown by preventing accidental code blocks.
+    - Removes leading BOM/zero-width chars
+    - Strips any accidental triple-backtick fences
+    - Removes 4-space indentation that would create preformatted blocks
+    - Strips trailing whitespace
+    """
+    if s is None:
+        return ""
+    # Normalize newlines
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Remove any accidental fenced code blocks
+    s = s.replace("```", "''")
+    # Clean lines
+    out_lines = []
+    for line in s.split("\n"):
+        # Strip zero-width / BOM at start of line
+        line = line.lstrip("\ufeff\u200b\u200c\u200d")
+        # Prevent 4-space indentation from triggering preformatted/code blocks
+        if line.startswith("    "):
+            line = line.lstrip()
+        out_lines.append(line.rstrip())
+    # Ensure message doesn't start with whitespace
+    return "\n".join(out_lines).strip("\n")
+
+
+
 def format_amount(val: int) -> str:
     """Single-amount formatter for income lines and per-asset deltas.
 
@@ -368,6 +395,13 @@ def format_currency(total_val: int) -> str:
 # Base daily income granted on /income claim (in Copper Cinth units)
 BASE_DAILY_INCOME = 10
 
+
+
+
+def current_base_daily_income(now: Optional[datetime] = None) -> int:
+    """Return base daily income, doubled on Fri/Sat/Sun (America/Chicago)."""
+    dt = now or datetime.now(CHICAGO_TZ)
+    return int(BASE_DAILY_INCOME) * (2 if dt.weekday() in (4, 5, 6) else 1)
 
 
 
@@ -504,7 +538,7 @@ async def render_character_section(character_name: str) -> List[str]:
     safe_cname = sanitize_plain_text(character_name)
     out.append(f"**{safe_cname}** - {kingdom}")
     out.append(f"💰 **Balance:** {format_balance(bal)}")
-    out.append(f"📈 **Income:** {format_amount(BASE_DAILY_INCOME)} | **Income from Assets:** {asset_income_sum:,} Val")
+    out.append(f"📈 **Income:** {format_amount(current_base_daily_income())} | **Income from Assets:** {asset_income_sum:,} Val")
     out.append(f"🧾 **__Assets__**")
 
     if not assets:
@@ -1790,6 +1824,7 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
         mids = list(BANK_MESSAGE_IDS)
 
     pages = [await render_bank_header_page(ch.guild)] if header_only else await render_bank_pages(ch.guild)
+    pages = [normalize_dashboard_markdown(p) for p in pages]
     if not pages:
         pages = ["(empty)"]
 
@@ -1988,7 +2023,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     )
 
     asset_income = sum(int(r["add_income_val"]) for r in asset_rows)
-    base_income = int(BASE_DAILY_INCOME)
+    base_income = int(current_base_daily_income())
     gross_total = base_income + int(asset_income or 0)
 
     # Build kingdom buckets (gross amounts per kingdom)
