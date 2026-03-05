@@ -40,7 +40,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v124"
+APP_VERSION = "EconBot_v126"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -539,7 +539,7 @@ async def render_character_section(character_name: str) -> List[str]:
     out.append(f"**{safe_cname}** - {kingdom}")
     out.append(f"💰 **Balance:** {format_balance(bal)}")
     out.append(f"📈 **Income:** {format_amount(current_base_daily_income())} | **Income from Assets:** {asset_income_sum:,} Val")
-    out.append(f"🧾 **__Assets__**")
+    out.append(f"🧾 **Assets**")
 
     if not assets:
         out.append("- (none)")
@@ -2234,6 +2234,65 @@ async def cmd_econ_set_balance(interaction: discord.Interaction, character: str,
     await log_econ(interaction, "set_balance", {"character": character, "value": value})
     await interaction.followup.send(f"Set **{character}** balance to **{format_currency(value)}**.", ephemeral=True)
     trigger_bank_refresh()
+
+
+@tree.command(name="econ_grant_all", description="(Staff) Give every registered character an amount of Val.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.describe(amount="Amount to add to every character balance (Val)")
+async def cmd_econ_grant_all(interaction: discord.Interaction, amount: int):
+    """Grant all registered (non-archived) characters a flat Val amount.
+
+    This is a bulk operation that affects econ_balances only. It does not touch assets,
+    treasuries, taxes, or leaderboards.
+    """
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        amt = int(amount)
+    except Exception:
+        await interaction.followup.send("Amount must be an integer Val value.", ephemeral=True)
+        return
+
+    if amt == 0:
+        await interaction.followup.send("Amount is 0 Val — no changes made.", ephemeral=True)
+        return
+
+    # Count eligible characters for reporting
+    count_row = await db_fetchrow(
+        """
+        SELECT COUNT(*) AS n
+        FROM characters
+        WHERE guild_id=$1 AND archived=FALSE;
+        """,
+        DATA_GUILD_ID,
+    )
+    n_chars = int(count_row["n"]) if count_row else 0
+    if n_chars <= 0:
+        await interaction.followup.send("No registered characters found.", ephemeral=True)
+        return
+
+    status = await db_exec(
+        """
+        INSERT INTO econ_balances (guild_id, character_name, balance_val, updated_at)
+        SELECT $1, c.name, $2::bigint, NOW()
+        FROM characters c
+        WHERE c.guild_id=$1 AND c.archived=FALSE
+        ON CONFLICT (guild_id, character_name)
+        DO UPDATE SET balance_val = econ_balances.balance_val + $2::bigint,
+                      updated_at = NOW();
+        """,
+        DATA_GUILD_ID,
+        amt,
+    )
+
+    await log_econ(interaction, "grant_all", {"amount": amt, "characters": n_chars, "status": status})
+    trigger_bank_refresh()
+
+    await interaction.followup.send(
+        f"Granted **{format_currency(amt)}** to **{n_chars:,}** registered character(s).",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @tree.command(name="econ_refresh_bank", description="(Staff) Refresh the bank dashboard messages.", guild=discord.Object(id=GUILD_ID))
