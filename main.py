@@ -3201,7 +3201,6 @@ async def cmd_edit_noble_title(interaction: discord.Interaction, character: str,
 
 
 @tree.command(name="sell_asset", description="(Staff) Sell an owned asset and refund 100% cumulative invested Val (taxed by asset kingdom).", guild=discord.Object(id=GUILD_ID))
-@tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (refunds 100% of total invested cost).", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
 async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset: str):
