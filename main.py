@@ -40,7 +40,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v126"
+APP_VERSION = "EconBot_v129"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -493,6 +493,9 @@ async def get_assets_with_income_for_character(character_name: str) -> List[Dict
     rows = await db_fetch(
         '''
         SELECT a.asset_type, a.tier, a.asset_name, COALESCE(a.kingdom, '') AS kingdom,
+               COALESCE(a.noble_title_family, '') AS noble_title_family,
+               COALESCE(a.noble_title_option, '') AS noble_title_option,
+               COALESCE(a.noble_realm_name, '') AS noble_realm_name,
                d.add_income_val
         FROM econ_assets a
         JOIN econ_asset_definitions d
@@ -525,6 +528,49 @@ def _tier_label(tier: str) -> str:
     return f"T{rk}"
 
 
+
+def noble_title_display_from_row(row: Dict[str, Any]) -> str:
+    option = sanitize_plain_text(str(row.get("noble_title_option") or row.get("asset_name") or "")).strip()
+    realm = sanitize_plain_text(str(row.get("noble_realm_name") or "")).strip()
+    kingdom = sanitize_plain_text(str(row.get("kingdom") or "")).strip()
+    if realm and kingdom:
+        return f"{option} of {realm} | Kingdom of {kingdom}"
+    if kingdom:
+        return f"{option} | Kingdom of {kingdom}"
+    return option or "(Untitled)"
+
+
+def noble_title_rank_for_family(family: str) -> int:
+    meta = NOBLE_TITLE_FAMILIES.get(str(family or "").strip())
+    if not meta:
+        return 0
+    return int(meta["rank"])
+
+
+def noble_title_cost_for_family(family: str) -> int:
+    meta = NOBLE_TITLE_FAMILIES.get(str(family or "").strip())
+    if not meta:
+        return 0
+    return int(meta["cost"])
+
+
+async def get_noble_titles_for_character(character_name: str) -> List[Dict[str, Any]]:
+    rows = await db_fetch(
+        """
+        SELECT asset_type, tier, asset_name, COALESCE(kingdom, '') AS kingdom,
+               COALESCE(noble_title_family, '') AS noble_title_family,
+               COALESCE(noble_title_option, '') AS noble_title_option,
+               COALESCE(noble_realm_name, '') AS noble_realm_name
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type='Noble Title'
+        ORDER BY COALESCE(noble_realm_name, ''), tier, asset_name;
+        """,
+        DATA_GUILD_ID,
+        character_name,
+    )
+    return rows
+
+
 async def render_character_section(character_name: str) -> List[str]:
     """Render the character portion of a card (no nickname header, no border)."""
     kingdom = await get_character_kingdom(character_name)
@@ -533,19 +579,27 @@ async def render_character_section(character_name: str) -> List[str]:
     bal = await get_balance(character_name)
     assets = await get_assets_with_income_for_character(character_name)
     asset_income_sum = sum(int(a.get("add_income_val") or 0) for a in assets)
+    title_assets = [a for a in assets if is_noble_title_asset_type(str(a.get("asset_type", "")))]
+    regular_assets = [a for a in assets if not is_noble_title_asset_type(str(a.get("asset_type", "")))]
 
     out: List[str] = []
     safe_cname = sanitize_plain_text(character_name)
     out.append(f"**{safe_cname}** - {kingdom}")
     out.append(f"💰 **Balance:** {format_balance(bal)}")
     out.append(f"📈 **Income:** {format_amount(current_base_daily_income())} | **Income from Assets:** {asset_income_sum:,} Val")
-    out.append(f"🧾 **Assets**")
 
-    if not assets:
+    if title_assets:
+        out.append("🏛 **Noble Titles**")
+        for a in title_assets:
+            out.append(f"- {noble_title_display_from_row(a)}")
+
+    out.append("🧾 **Assets**")
+
+    if not regular_assets:
         out.append("- (none)")
         return out
 
-    for a in assets:
+    for a in regular_assets:
         tier = _tier_label(str(a.get("tier", "")))
         aname = sanitize_plain_text(str(a.get("asset_name", ""))).strip() or sanitize_plain_text(str(a.get("asset_type", ""))).strip()
         akingdom = sanitize_plain_text(str(a.get("kingdom", ""))).strip() or "(No Kingdom)"
@@ -647,6 +701,41 @@ DATA_GUILD_ID = int(LEGACY_SOURCE_GUILD_ID)
 # -------------------------
 # Asset definitions seed (authoritative from NEW Asset Table.xlsx)
 # -------------------------
+
+NOBLE_TITLE_FAMILIES: Dict[str, Dict[str, Any]] = {
+    "Baron/ess": {"tier": "(1) Baron/ess", "rank": 1, "cost": 4000, "options": ["Baron", "Baroness"]},
+    "Viscount/ess": {"tier": "(2) Viscount/ess", "rank": 2, "cost": 6000, "options": ["Viscount", "Viscountess"]},
+    "Earl/Countess": {"tier": "(3) Earl/Countess", "rank": 3, "cost": 9000, "options": ["Earl", "Countess"]},
+    "Marquess/Marchioness": {"tier": "(4) Marquess/Marchioness", "rank": 4, "cost": 13000, "options": ["Marquess", "Marchioness"]},
+    "Duke/Duchess": {"tier": "(5) Duke/Duchess", "rank": 5, "cost": 20000, "options": ["Duke", "Duchess"]},
+    "Regent": {"tier": "(6) Regent", "rank": 6, "cost": 0, "options": ["Regent"]},
+    "King/Queen": {"tier": "(7) King/Queen", "rank": 7, "cost": 0, "options": ["King", "Queen"]},
+    "Sovereign": {"tier": "(8) Sovereign", "rank": 8, "cost": 0, "options": ["Sovereign"]},
+}
+
+NOBLE_TITLE_DEFINITIONS: List[Tuple[str, str, int, int]] = [
+    ("Noble Title", str(meta["tier"]), int(meta["cost"]), 0)
+    for _family, meta in NOBLE_TITLE_FAMILIES.items()
+]
+
+NOBLE_TITLE_LOOKUP: Dict[str, str] = {
+    family: str(meta["tier"]) for family, meta in NOBLE_TITLE_FAMILIES.items()
+}
+NOBLE_TITLE_OPTION_TO_FAMILY: Dict[str, str] = {
+    opt: family
+    for family, meta in NOBLE_TITLE_FAMILIES.items()
+    for opt in meta["options"]
+}
+TIER_TO_NOBLE_TITLE_FAMILY: Dict[str, str] = {
+    str(meta["tier"]): family for family, meta in NOBLE_TITLE_FAMILIES.items()
+}
+SPECIAL_NO_COST_TITLE_FAMILIES = {"Regent", "King/Queen", "Sovereign"}
+
+
+def is_noble_title_asset_type(asset_type: str) -> bool:
+    return str(asset_type or "").strip().lower() == "noble title"
+
+
 ASSET_DEFINITIONS_SEED: List[Tuple[str, str, int, int]] = [
     ("Guild Trade Workshop", "(1) Guild Apprentice", 300, 50),
     ("Guild Trade Workshop", "(2) Guild Journeyman", 600, 100),
@@ -693,7 +782,7 @@ ASSET_DEFINITIONS_SEED: List[Tuple[str, str, int, int]] = [
     ("Armor", "(3) AC +2 / Adv Magic Atk", 1200, 0),
     ("Armor", "(4) AC +2 / Adv Magic and Melee Atk", 2400, 0),
     ("Armor", "(5) AC +3 / Adv Magic and Melee Atk", 4800, 0),
-]
+] + NOBLE_TITLE_DEFINITIONS
 
 # -------------------------
 # Discord client setup
@@ -994,6 +1083,8 @@ async def ac_asset_for_character(interaction: discord.Interaction, current: str)
         needle = (current or "").lower()
         out: List[app_commands.Choice[str]] = []
         for r in rows:
+            if is_noble_title_asset_type(str(r.get("asset_type", ""))):
+                continue
             label = f"{r['asset_type']} | {r['tier']} | {r['asset_name']}"
             if needle and needle not in label.lower():
                 continue
@@ -1033,6 +1124,57 @@ async def ac_target_tier(interaction: discord.Interaction, current: str) -> List
         return out
     except Exception:
         return []
+
+
+async def noble_title_family_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    needle = (current or "").lower()
+    out: List[app_commands.Choice[str]] = []
+    for family in NOBLE_TITLE_FAMILIES.keys():
+        if needle and needle not in family.lower():
+            continue
+        out.append(app_commands.Choice(name=family, value=family))
+        if len(out) >= 25:
+            break
+    return out
+
+
+async def noble_title_option_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    family = str(getattr(interaction.namespace, "title_name", "") or getattr(interaction.namespace, "new_title_name", "") or "").strip()
+    if not family or family not in NOBLE_TITLE_FAMILIES:
+        return []
+    needle = (current or "").lower()
+    out: List[app_commands.Choice[str]] = []
+    for opt in NOBLE_TITLE_FAMILIES[family]["options"]:
+        if needle and needle not in opt.lower():
+            continue
+        out.append(app_commands.Choice(name=opt, value=opt))
+        if len(out) >= 25:
+            break
+    return out
+
+
+async def noble_title_realm_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    try:
+        char = getattr(interaction.namespace, "character", None)
+        if not char:
+            return []
+        rows = await get_noble_titles_for_character(str(char))
+        needle = (current or "").lower()
+        out: List[app_commands.Choice[str]] = []
+        for r in rows:
+            realm = str(r.get("noble_realm_name") or "").strip()
+            if not realm:
+                continue
+            label = noble_title_display_from_row(r)
+            if needle and needle not in label.lower() and needle not in realm.lower():
+                continue
+            out.append(app_commands.Choice(name=label[:100], value=realm[:100]))
+            if len(out) >= 25:
+                break
+        return out
+    except Exception:
+        return []
+
 
 async def get_character_owner(character_name: str) -> Optional[int]:
     row = await db_fetchrow(
@@ -1173,6 +1315,8 @@ async def log_econ_channel(interaction: discord.Interaction, action: str, detail
             lines += _fmt_kv(details, ["character", "delta", "value", "new_balance"])
         elif action in ("set_kingdom_tax", "set_kingdom_treasury"):
             lines += _fmt_kv(details, ["kingdom", "percent", "tax_rate_bp", "treasury"])
+        elif action == "assign_noble_title":
+            lines += _fmt_kv(details, ["character", "title", "kingdom"])
         else:
             lines += _fmt_kv(details, ["character", "kingdom", "amount", "cost", "new_balance"])
 
@@ -1204,6 +1348,7 @@ async def list_asset_types() -> List[str]:
             """
             SELECT DISTINCT asset_type
             FROM econ_asset_definitions
+            WHERE asset_type <> 'Noble Title'
             ORDER BY asset_type ASC;
             """
         )
@@ -1457,7 +1602,7 @@ async def asset_type_autocomplete(interaction: discord.Interaction, current: str
     types = await list_asset_types()
     if not types:
         print('[warn] econ_asset_definitions returned 0 asset types (table empty or not populated).')
-    out = [t for t in types if current_l in t.lower()][:25]
+    out = [t for t in types if not is_noble_title_asset_type(t) and current_l in t.lower()][:25]
     return [app_commands.Choice(name=t, value=t) for t in out]
 
 
@@ -1887,6 +2032,45 @@ _bank_refresh_lock: asyncio.Lock = asyncio.Lock()
 _bank_dirty_full: bool = False
 _bank_dirty_header: bool = False
 
+async def force_rebuild_bank_dashboard() -> None:
+    """Delete and recreate all tracked bank dashboard messages from fresh rendered pages."""
+    if not BANK_CHANNEL_ID:
+        return
+    ch = client.get_channel(int(BANK_CHANNEL_ID))
+    if ch is None or not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return
+
+    pages = await render_bank_pages(ch.guild)
+    pages = [normalize_dashboard_markdown(p) for p in pages] or ["(empty)"]
+
+    mids = await bank_message_ids_from_db()
+    if not mids and BANK_MESSAGE_IDS:
+        mids = list(BANK_MESSAGE_IDS)
+
+    # Best-effort delete of existing tracked dashboard messages.
+    for mid in mids:
+        try:
+            m = await ch.fetch_message(int(mid))
+            await m.delete()
+            await asyncio.sleep(0.35)
+        except Exception:
+            pass
+
+    try:
+        await db_execute("DELETE FROM econ_bank_messages WHERE guild_id=$1;", DATA_GUILD_ID)
+    except Exception:
+        pass
+
+    new_ids = []
+    for page in pages:
+        m = await ch.send(page, allowed_mentions=discord.AllowedMentions.none())
+        new_ids.append(int(m.id))
+        await asyncio.sleep(0.35)
+
+    await save_bank_message_ids(new_ids)
+    print(f"[test] Force rebuilt bank dashboard pages: {len(new_ids)}")
+
+
 def request_bank_refresh(*, full: bool = True) -> None:
     """Schedule a bank dashboard refresh.
 
@@ -2299,10 +2483,10 @@ async def cmd_econ_grant_all(interaction: discord.Interaction, amount: int):
 @staff_only()
 async def cmd_refresh_bank(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    # Manual refresh (staff). Uses debounced updater to avoid PATCH rate limits.
+    # Manual refresh (staff): force delete + recreate pages so formatting/content changes always appear.
     try:
-        trigger_bank_refresh()
-        await interaction.followup.send("Bank dashboard refresh queued.", ephemeral=True)
+        await force_rebuild_bank_dashboard()
+        await interaction.followup.send("Bank dashboard rebuilt.", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"Refresh failed: {e}", ephemeral=True)
 
@@ -2326,6 +2510,10 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     owner = await get_character_owner(character)
     if owner is None:
         await interaction.followup.send("Character not found in DB.", ephemeral=True)
+        return
+
+    if is_noble_title_asset_type(asset_type):
+        await interaction.followup.send("Noble Titles are staff-assigned only. Use `/assign-noble-title`.", ephemeral=True)
         return
 
     # Validate asset definition exists (and get add_income for audit)
@@ -2447,6 +2635,10 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
     current_tier = parts[1]
     asset_name = "|".join(parts[2:]).strip()
 
+    if is_noble_title_asset_type(asset_type):
+        await interaction.followup.send("Noble Titles must be upgraded with `/upgrade-noble-title`.", ephemeral=True)
+        return
+
     exists = await db_fetchrow(
         '''
         SELECT 1
@@ -2550,6 +2742,269 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
     )
 
 
+
+@tree.command(name="assign-noble-title", description="(Staff) Assign a noble title to a character.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.describe(
+    character="Character receiving the title",
+    title_name="Title family/rank",
+    title_name_option="Exact displayed title form",
+    custom_realm_name="Custom realm name for the title",
+    kingdom="Kingdom associated with the title",
+)
+@app_commands.choices(
+    kingdom=[app_commands.Choice(name=k, value=k) for k in CANON_KINGDOMS]
+)
+@app_commands.autocomplete(
+    character=character_autocomplete,
+    title_name=noble_title_family_autocomplete,
+    title_name_option=noble_title_option_autocomplete,
+)
+async def cmd_assign_noble_title(interaction: discord.Interaction, character: str, title_name: str, title_name_option: str, custom_realm_name: str, kingdom: str):
+    await interaction.response.defer(ephemeral=True)
+
+    owner = await get_character_owner(character)
+    if owner is None:
+        await interaction.followup.send("Character not found in DB.", ephemeral=True)
+        return
+
+    family = str(title_name or "").strip()
+    if family not in NOBLE_TITLE_FAMILIES:
+        await interaction.followup.send("Invalid noble title family selection.", ephemeral=True)
+        return
+
+    option = str(title_name_option or "").strip()
+    if option not in NOBLE_TITLE_FAMILIES[family]["options"]:
+        await interaction.followup.send("Invalid title name option for that family.", ephemeral=True)
+        return
+
+    realm_name = sanitize_plain_text(str(custom_realm_name or "")).strip()
+    if not realm_name:
+        await interaction.followup.send("Custom realm name cannot be empty.", ephemeral=True)
+        return
+
+    title_kingdom = str(kingdom or "").strip()
+    if title_kingdom not in CANON_KINGDOMS:
+        await interaction.followup.send("Invalid kingdom selection.", ephemeral=True)
+        return
+
+    existing_same_realm = await db_fetchrow(
+        """
+        SELECT noble_title_family, noble_title_option
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type='Noble Title' AND COALESCE(noble_realm_name,'')=$3
+        LIMIT 1;
+        """,
+        DATA_GUILD_ID,
+        character,
+        realm_name,
+    )
+    if existing_same_realm:
+        await interaction.followup.send(
+            "That character already has a noble title for that realm. Use `/upgrade-noble-title` instead.",
+            ephemeral=True,
+        )
+        return
+
+    tier = str(NOBLE_TITLE_FAMILIES[family]["tier"])
+    cost_val = int(NOBLE_TITLE_FAMILIES[family]["cost"])
+    cur_bal = await get_balance(character)
+    if cost_val > 0 and cur_bal < cost_val:
+        await interaction.followup.send(
+            f"Insufficient funds. Balance **{format_currency(cur_bal)}**, cost **{format_currency(cost_val)}**.",
+            ephemeral=True,
+        )
+        return
+
+    exists = await db_fetchrow(
+        """
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type='Noble Title'
+          AND COALESCE(noble_title_option,'')=$3 AND COALESCE(noble_realm_name,'')=$4
+        LIMIT 1;
+        """,
+        DATA_GUILD_ID,
+        character,
+        option,
+        realm_name,
+    )
+    if exists:
+        await interaction.followup.send("That noble title is already assigned to this character.", ephemeral=True)
+        return
+
+    await db_exec(
+        """
+        INSERT INTO econ_assets (
+            guild_id, character_name, user_id, asset_name, asset_type, tier, kingdom,
+            noble_title_family, noble_title_option, noble_realm_name,
+            created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, 'Noble Title', $5, $6, $7, $8, $9, NOW(), NOW());
+        """,
+        DATA_GUILD_ID,
+        character,
+        int(owner),
+        option,
+        tier,
+        title_kingdom,
+        family,
+        option,
+        realm_name,
+    )
+
+    new_bal = cur_bal
+    if cost_val > 0:
+        new_bal = await adjust_balance(character, -cost_val)
+        await add_to_kingdom_treasury(title_kingdom, cost_val)
+
+    await log_econ(
+        interaction,
+        "assign_noble_title",
+        {
+            "character": character,
+            "title_family": family,
+            "title_option": option,
+            "realm_name": realm_name,
+            "kingdom": title_kingdom,
+            "cost": cost_val,
+            "new_balance": new_bal,
+        },
+    )
+
+    trigger_bank_refresh()
+
+    title_display = f"{option} of {realm_name} | Kingdom of {title_kingdom}"
+    cost_msg = f" Cost: **{format_currency(cost_val)}**." if cost_val > 0 else " No cost."
+    await interaction.followup.send(
+        f"Assigned **{title_display}** to **{character}**.{cost_msg}",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="upgrade-noble-title", description="(Staff) Upgrade an existing noble title.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.describe(
+    character="Character whose noble title is being upgraded",
+    current_title="Existing noble title / realm to upgrade",
+    new_title_name="New title family/rank",
+    new_title_name_option="Exact displayed title form for the new rank",
+)
+@app_commands.autocomplete(
+    character=character_autocomplete,
+    current_title=noble_title_realm_autocomplete,
+    new_title_name=noble_title_family_autocomplete,
+    new_title_name_option=noble_title_option_autocomplete,
+)
+async def cmd_upgrade_noble_title(interaction: discord.Interaction, character: str, current_title: str, new_title_name: str, new_title_name_option: str):
+    await interaction.response.defer(ephemeral=True)
+
+    realm_name = sanitize_plain_text(str(current_title or "")).strip()
+    if not realm_name:
+        await interaction.followup.send("Select an existing noble title/realm to upgrade.", ephemeral=True)
+        return
+
+    row = await db_fetchrow(
+        """
+        SELECT COALESCE(noble_title_family,'') AS noble_title_family,
+               COALESCE(noble_title_option,'') AS noble_title_option,
+               COALESCE(noble_realm_name,'') AS noble_realm_name,
+               COALESCE(kingdom,'') AS kingdom,
+               tier,
+               asset_name
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type='Noble Title' AND COALESCE(noble_realm_name,'')=$3
+        LIMIT 1;
+        """,
+        DATA_GUILD_ID,
+        character,
+        realm_name,
+    )
+    if not row:
+        await interaction.followup.send("That noble title was not found on this character.", ephemeral=True)
+        return
+
+    new_family = str(new_title_name or "").strip()
+    if new_family not in NOBLE_TITLE_FAMILIES:
+        await interaction.followup.send("Invalid target noble title family.", ephemeral=True)
+        return
+
+    new_option = str(new_title_name_option or "").strip()
+    if new_option not in NOBLE_TITLE_FAMILIES[new_family]["options"]:
+        await interaction.followup.send("Invalid title option for that family.", ephemeral=True)
+        return
+
+    cur_family = str(row.get("noble_title_family") or TIER_TO_NOBLE_TITLE_FAMILY.get(str(row.get("tier") or "")) or "").strip()
+    cur_option = str(row.get("noble_title_option") or row.get("asset_name") or "").strip()
+    title_kingdom = str(row.get("kingdom") or "").strip()
+
+    cur_rank = noble_title_rank_for_family(cur_family)
+    new_rank = noble_title_rank_for_family(new_family)
+    if cur_rank and new_rank and new_rank < cur_rank:
+        await interaction.followup.send("Noble titles cannot be downgraded with this command.", ephemeral=True)
+        return
+
+    current_cost = noble_title_cost_for_family(cur_family)
+    target_cost = noble_title_cost_for_family(new_family)
+    upgrade_cost = max(0, int(target_cost) - int(current_cost))
+
+    cur_bal = await get_balance(character)
+    if upgrade_cost > 0 and cur_bal < upgrade_cost:
+        await interaction.followup.send(
+            f"Insufficient funds. Balance **{format_currency(cur_bal)}**, upgrade cost **{format_currency(upgrade_cost)}**.",
+            ephemeral=True,
+        )
+        return
+
+    await db_exec(
+        """
+        UPDATE econ_assets
+        SET tier=$1,
+            asset_name=$2,
+            noble_title_family=$3,
+            noble_title_option=$4,
+            updated_at=NOW()
+        WHERE guild_id=$5 AND character_name=$6 AND asset_type='Noble Title' AND COALESCE(noble_realm_name,'')=$7;
+        """,
+        str(NOBLE_TITLE_FAMILIES[new_family]["tier"]),
+        new_option,
+        new_family,
+        new_option,
+        DATA_GUILD_ID,
+        character,
+        realm_name,
+    )
+
+    new_bal = cur_bal
+    if upgrade_cost > 0:
+        new_bal = await adjust_balance(character, -upgrade_cost)
+        if title_kingdom:
+            await add_to_kingdom_treasury(title_kingdom, upgrade_cost)
+
+    await log_econ(
+        interaction,
+        "upgrade_noble_title",
+        {
+            "character": character,
+            "realm_name": realm_name,
+            "from_title_family": cur_family,
+            "from_title_option": cur_option,
+            "to_title_family": new_family,
+            "to_title_option": new_option,
+            "kingdom": title_kingdom,
+            "cost": upgrade_cost,
+            "new_balance": new_bal,
+        },
+    )
+
+    trigger_bank_refresh()
+
+    await interaction.followup.send(
+        f"Updated noble title for **{character}**: **{cur_option} of {realm_name} | Kingdom of {title_kingdom}** → **{new_option} of {realm_name} | Kingdom of {title_kingdom}**. Upgrade cost: **{format_currency(upgrade_cost)}**.",
+        ephemeral=True,
+    )
+
+
 @tree.command(name="sell_asset", description="(Staff) Sell/remove an asset (refunds 100% of total invested cost).", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 @app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
@@ -2563,6 +3018,10 @@ async def cmd_sell_asset(interaction: discord.Interaction, character: str, asset
     asset_type = parts[0]
     tier = parts[1]
     asset_name = "|".join(parts[2:]).strip()
+
+    if is_noble_title_asset_type(asset_type):
+        await interaction.followup.send("Noble Titles cannot be sold. Remove them manually if needed.", ephemeral=True)
+        return
 
     row = await db_fetchrow(
         '''
@@ -2730,6 +3189,14 @@ async def on_ready():
             pass
         try:
             tree.add_command(cmd_sell_asset, guild=guild_obj)
+        except Exception:
+            pass
+        try:
+            tree.add_command(cmd_assign_noble_title, guild=guild_obj)
+        except Exception:
+            pass
+        try:
+            tree.add_command(cmd_upgrade_noble_title, guild=guild_obj)
         except Exception:
             pass
 
