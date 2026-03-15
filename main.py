@@ -875,6 +875,14 @@ async def ensure_schema() -> None:
     except Exception as e:
         print(f"[warn] Could not add econ_assets.kingdom (will require manual migration): {e}")
 
+    # Noble title metadata (additive only; required by v129 title rendering/commands)
+    try:
+        await db_exec("ALTER TABLE econ_assets ADD COLUMN IF NOT EXISTS noble_title_family TEXT;")
+        await db_exec("ALTER TABLE econ_assets ADD COLUMN IF NOT EXISTS noble_title_option TEXT;")
+        await db_exec("ALTER TABLE econ_assets ADD COLUMN IF NOT EXISTS noble_realm_name TEXT;")
+    except Exception as e:
+        print(f"[warn] Could not add econ_assets noble-title columns (will require manual migration): {e}")
+
     await db_exec(
         """
         CREATE TABLE IF NOT EXISTS econ_kingdoms (
