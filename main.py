@@ -40,7 +40,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v130"
+APP_VERSION = "EconBot_v131"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -1301,6 +1301,76 @@ async def adjust_balance(character_name: str, delta: int) -> int:
     return new_val
 
 
+async def transfer_balance(source_character: str, target_character: str, amount_val: int) -> Tuple[int, int]:
+    """Atomically transfer Val from one character to another within the econ balance table.
+
+    Returns: (new_source_balance, new_target_balance)
+    Raises: ValueError if amount is invalid or source would go negative.
+    """
+    amt = int(amount_val)
+    if amt <= 0:
+        raise ValueError("Transfer amount must be greater than zero.")
+    if str(source_character).strip() == str(target_character).strip():
+        raise ValueError("Source and target characters must be different.")
+
+    pool = await db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            src = await conn.fetchrow(
+                """
+                SELECT balance_val
+                FROM econ_balances
+                WHERE guild_id=$1 AND character_name=$2
+                FOR UPDATE;
+                """,
+                DATA_GUILD_ID,
+                source_character,
+            )
+            src_bal = int(src["balance_val"]) if src else 0
+            if src_bal < amt:
+                raise ValueError("Insufficient funds on the source character.")
+
+            tgt = await conn.fetchrow(
+                """
+                SELECT balance_val
+                FROM econ_balances
+                WHERE guild_id=$1 AND character_name=$2
+                FOR UPDATE;
+                """,
+                DATA_GUILD_ID,
+                target_character,
+            )
+            tgt_bal = int(tgt["balance_val"]) if tgt else 0
+
+            new_src = src_bal - amt
+            new_tgt = tgt_bal + amt
+
+            await conn.execute(
+                """
+                INSERT INTO econ_balances (guild_id, character_name, balance_val, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (guild_id, character_name)
+                DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW();
+                """,
+                DATA_GUILD_ID,
+                source_character,
+                new_src,
+            )
+            await conn.execute(
+                """
+                INSERT INTO econ_balances (guild_id, character_name, balance_val, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (guild_id, character_name)
+                DO UPDATE SET balance_val=EXCLUDED.balance_val, updated_at=NOW();
+                """,
+                DATA_GUILD_ID,
+                target_character,
+                new_tgt,
+            )
+
+            return new_src, new_tgt
+
+
 async def log_audit(interaction: discord.Interaction, action: str, details: Dict[str, Any]) -> None:
     try:
         await db_exec(
@@ -1362,6 +1432,8 @@ async def log_econ_channel(interaction: discord.Interaction, action: str, detail
             lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "tier", "refund_amount"])
         elif action == "income_claim":
             lines += _fmt_kv(details, ["character", "character_kingdom", "base_income", "asset_income", "gross_total", "tax_total", "net_total", "new_balance"])
+        elif action == "transfer_balance":
+            lines += _fmt_kv(details, ["source_character", "target_character", "amount", "new_source_balance", "new_target_balance"])
         elif action in ("adjust_balance", "set_balance"):
             lines += _fmt_kv(details, ["character", "delta", "value", "new_balance"])
         elif action in ("set_kingdom_tax", "set_kingdom_treasury"):
@@ -2329,6 +2401,64 @@ async def cmd_income(interaction: discord.Interaction, character: str):
     await send_ephemeral_with_parchment(interaction, msg)
 
 
+
+
+@tree.command(name="transfer_val", description="Transfer Val from one character to another.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(source_character="Your source character", target_character="Destination character", amount="Amount in Val")
+@app_commands.autocomplete(source_character=character_autocomplete, target_character=character_autocomplete)
+async def cmd_transfer_val(interaction: discord.Interaction, source_character: str, target_character: str, amount: int):
+    await interaction.response.defer(ephemeral=True)
+
+    source_owner = await get_character_owner(source_character)
+    if source_owner is None:
+        await interaction.followup.send("Source character not found in DB.", ephemeral=True)
+        return
+    if int(source_owner) != int(interaction.user.id):
+        await interaction.followup.send("You are not the owner of the source character.", ephemeral=True)
+        return
+
+    target_owner = await get_character_owner(target_character)
+    if target_owner is None:
+        await interaction.followup.send("Target character not found in DB.", ephemeral=True)
+        return
+
+    amt = int(amount)
+    if amt <= 0:
+        await interaction.followup.send("Transfer amount must be greater than zero.", ephemeral=True)
+        return
+    if source_character == target_character:
+        await interaction.followup.send("Source and target characters must be different.", ephemeral=True)
+        return
+
+    try:
+        new_source_balance, new_target_balance = await transfer_balance(source_character, target_character, amt)
+    except ValueError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
+
+    await log_econ(
+        interaction,
+        "transfer_balance",
+        {
+            "source_character": source_character,
+            "target_character": target_character,
+            "amount": amt,
+            "new_source_balance": new_source_balance,
+            "new_target_balance": new_target_balance,
+        },
+    )
+
+    trigger_bank_refresh()
+
+    await interaction.followup.send(
+        (
+            f"Transferred **{format_currency(amt)}** from **{source_character}** to **{target_character}**.\n"
+            f"{source_character} new balance: **{format_currency(new_source_balance)}**\n"
+            f"{target_character} new balance: **{format_currency(new_target_balance)}**"
+        ),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @tree.command(name="econ_commands", description="List EconBot commands.", guild=discord.Object(id=GUILD_ID))
