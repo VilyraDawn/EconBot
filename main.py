@@ -2530,6 +2530,151 @@ async def cmd_econ_grant_all(interaction: discord.Interaction, amount: int):
     )
 
 
+@tree.command(name="transfer_val", description="Transfer Val from one of your characters to another character.", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    source_character="One of your registered characters sending the funds",
+    target_character="The registered character receiving the funds",
+    amount="Amount of Val to transfer",
+)
+@app_commands.autocomplete(source_character=character_autocomplete, target_character=character_autocomplete)
+async def cmd_transfer_val(interaction: discord.Interaction, source_character: str, target_character: str, amount: int):
+    await interaction.response.defer(ephemeral=True)
+
+    source_character = str(source_character or '').strip()
+    target_character = str(target_character or '').strip()
+
+    if not source_character or not target_character:
+        await interaction.followup.send("Both source and target characters are required.", ephemeral=True)
+        return
+
+    if source_character == target_character:
+        await interaction.followup.send("Source and target characters must be different.", ephemeral=True)
+        return
+
+    try:
+        amount = int(amount)
+    except Exception:
+        await interaction.followup.send("Amount must be a whole number of Val.", ephemeral=True)
+        return
+
+    if amount <= 0:
+        await interaction.followup.send("Transfer amount must be greater than 0 Val.", ephemeral=True)
+        return
+
+    source_owner = await get_character_owner(source_character)
+    if source_owner is None:
+        await interaction.followup.send("Source character not found.", ephemeral=True)
+        return
+
+    if int(source_owner) != int(interaction.user.id):
+        await interaction.followup.send("You may only transfer funds from a character you own.", ephemeral=True)
+        return
+
+    target_owner = await get_character_owner(target_character)
+    if target_owner is None:
+        await interaction.followup.send("Target character not found.", ephemeral=True)
+        return
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO econ_balances (guild_id, character_name, balance_val, updated_at)
+                VALUES ($1, $2, 0, NOW())
+                ON CONFLICT (guild_id, character_name) DO NOTHING;
+                """,
+                DATA_GUILD_ID,
+                source_character,
+            )
+            await conn.execute(
+                """
+                INSERT INTO econ_balances (guild_id, character_name, balance_val, updated_at)
+                VALUES ($1, $2, 0, NOW())
+                ON CONFLICT (guild_id, character_name) DO NOTHING;
+                """,
+                DATA_GUILD_ID,
+                target_character,
+            )
+
+            src_row = await conn.fetchrow(
+                """
+                SELECT balance_val
+                FROM econ_balances
+                WHERE guild_id=$1 AND character_name=$2
+                FOR UPDATE;
+                """,
+                DATA_GUILD_ID,
+                source_character,
+            )
+            tgt_row = await conn.fetchrow(
+                """
+                SELECT balance_val
+                FROM econ_balances
+                WHERE guild_id=$1 AND character_name=$2
+                FOR UPDATE;
+                """,
+                DATA_GUILD_ID,
+                target_character,
+            )
+
+            src_bal = int((src_row or {}).get('balance_val', 0) or 0)
+            tgt_bal = int((tgt_row or {}).get('balance_val', 0) or 0)
+
+            if src_bal < amount:
+                await interaction.followup.send(
+                    f"Insufficient funds. **{source_character}** has **{format_currency(src_bal)}**.",
+                    ephemeral=True,
+                )
+                return
+
+            new_src = src_bal - amount
+            new_tgt = tgt_bal + amount
+
+            await conn.execute(
+                """
+                UPDATE econ_balances
+                SET balance_val=$1, updated_at=NOW()
+                WHERE guild_id=$2 AND character_name=$3;
+                """,
+                new_src,
+                DATA_GUILD_ID,
+                source_character,
+            )
+            await conn.execute(
+                """
+                UPDATE econ_balances
+                SET balance_val=$1, updated_at=NOW()
+                WHERE guild_id=$2 AND character_name=$3;
+                """,
+                new_tgt,
+                DATA_GUILD_ID,
+                target_character,
+            )
+
+    await log_econ(
+        interaction,
+        "transfer_val",
+        {
+            "source_character": source_character,
+            "target_character": target_character,
+            "amount": amount,
+            "source_new_balance": new_src,
+            "target_new_balance": new_tgt,
+        },
+    )
+
+    trigger_bank_refresh()
+
+    await interaction.followup.send(
+        f"Transferred **{format_currency(amount)}** from **{source_character}** to **{target_character}**.\n"
+        f"**{source_character}**: **{format_currency(new_src)}**\n"
+        f"**{target_character}**: **{format_currency(new_tgt)}**",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 @tree.command(name="econ_refresh_bank", description="(Staff) Refresh the bank dashboard messages.", guild=discord.Object(id=GUILD_ID))
 @staff_only()
 async def cmd_refresh_bank(interaction: discord.Interaction):
