@@ -2575,7 +2575,7 @@ async def cmd_transfer_val(interaction: discord.Interaction, source_character: s
         await interaction.followup.send("Target character not found.", ephemeral=True)
         return
 
-    pool = await get_pool()
+    pool = await db_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
