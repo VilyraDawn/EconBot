@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 try:
     from zoneinfo import ZoneInfo  # py>=3.9
@@ -40,42 +41,39 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v130"
+APP_VERSION = "EconBot_v137"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
 DEFAULT_KINGDOM_TAX_BP = 1000  # 10%
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
-# Balance/Income parchment image should be bundled with the bot (do NOT use expiring Discord CDN URLs).
-# Put the image file in your repo at this relative path (default below) so it is always available.
-BALANCE_CARD_IMAGE_PATH = os.getenv("BALANCE_CARD_IMAGE_PATH", "assets/great_anus.jpg")
-BALANCE_CARD_IMAGE_FILENAME = os.getenv("BALANCE_CARD_IMAGE_FILENAME", "balance_card.jpg")
+# Bundled images (do NOT use expiring Discord CDN URLs).
+# These are relative to the repo root beside main.py, typically under ./assets/.
+BALANCE_CARD_IMAGE_PATH = "assets/great_anus.jpg"
+BALANCE_CARD_IMAGE_FILENAME = "balance_card.jpg"
+WEEKEND_INCOME_IMAGE_PATH = "assets/weekend_income.jpg"
+WEEKEND_INCOME_IMAGE_FILENAME = "weekend_income.jpg"
 
+# Daily income reminder (hard-coded by request; no Railway env vars required).
+DAILY_REMINDER_CHANNEL_ID = 1324994929176612936
+DAILY_REMINDER_ROLE_ID = 1476435497776840724
+DAILY_REMINDER_HOUR = 9
+DAILY_REMINDER_MINUTE = 0
+DAILY_REMINDER_MESSAGE = f"<@&{DAILY_REMINDER_ROLE_ID}> - Don’t forget to claim your daily income (and pay your taxes) using the /income command!"
 
-# Resolve bundled image path relative to this file (Railway working directory can vary).
+# Resolve bundled image paths relative to this file (Railway working directory can vary).
 _BASE_DIR = Path(__file__).resolve().parent
 
 
-def _find_parchment_path() -> Optional[Path]:
-    """Return an existing path to the parchment image, or None if not found."""
+def _find_bundled_image(config_path: str, fallback_names: list[str]) -> Optional[Path]:
+    """Return an existing bundled image path, or None if not found."""
     candidates: list[Path] = []
-
-    # User-configured path (absolute or relative to this file)
-    p = Path(BALANCE_CARD_IMAGE_PATH)
+    p = Path(config_path)
     candidates.append(p if p.is_absolute() else (_BASE_DIR / p))
-
-    # Common fallbacks inside ./assets (handles accidental filename/case differences)
     assets_dir = _BASE_DIR / "assets"
-    for name in [
-        "great_anus.jpg",
-        "Great Anus.jpg",
-        "Great%20Anus.jpg",
-        "great_anus.jpeg",
-        "great_anus.png",
-    ]:
+    for name in fallback_names:
         candidates.append(assets_dir / name)
-
     for c in candidates:
         try:
             if c.exists() and c.is_file():
@@ -85,50 +83,78 @@ def _find_parchment_path() -> Optional[Path]:
     return None
 
 
-def _parchment_embed() -> discord.Embed:
+def _image_embed(filename: str) -> discord.Embed:
     e = discord.Embed()
-    e.set_image(url=f"attachment://{BALANCE_CARD_IMAGE_FILENAME}")
+    e.set_image(url=f"attachment://{filename}")
     return e
 
 
-async def send_ephemeral_with_parchment(interaction: discord.Interaction, content: str):
-    """Send an ephemeral message with the bundled parchment image attached.
-
-    Falls back to sending content without an image if the file is missing.
-    """
-    p = _find_parchment_path()
+async def send_ephemeral_with_bundled_image(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    config_path: str,
+    filename: str,
+    fallback_names: list[str],
+    label: str,
+):
+    p = _find_bundled_image(config_path, fallback_names)
     if not p:
-        print(f"[warn] Balance/Income image missing. Tried {BALANCE_CARD_IMAGE_PATH!r} relative to {_BASE_DIR}.")
-        # Helpful diagnostics to confirm deploy packaging
+        print(f"[warn] {label} image missing. Tried {config_path!r} relative to {_BASE_DIR}.")
         assets_dir = _BASE_DIR / "assets"
         if assets_dir.exists() and assets_dir.is_dir():
             try:
                 print(f"[debug] assets/ contents: {[x.name for x in assets_dir.iterdir() if x.is_file()]}")
             except Exception:
                 pass
-        await interaction.followup.send(
-            content,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
         return
-
     try:
-        f = discord.File(str(p), filename=BALANCE_CARD_IMAGE_FILENAME)
+        f = discord.File(str(p), filename=filename)
         await interaction.followup.send(
             content,
             ephemeral=True,
-            embed=_parchment_embed(),
+            embed=_image_embed(filename),
             file=f,
             allowed_mentions=discord.AllowedMentions.none(),
         )
     except FileNotFoundError:
-        print(f"[warn] Balance/Income image missing at {str(p)!r}; sending without image")
-        await interaction.followup.send(
-            content,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        print(f"[warn] {label} image missing at {str(p)!r}; sending without image")
+        await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def send_ephemeral_with_parchment(interaction: discord.Interaction, content: str):
+    await send_ephemeral_with_bundled_image(
+        interaction,
+        content,
+        config_path=BALANCE_CARD_IMAGE_PATH,
+        filename=BALANCE_CARD_IMAGE_FILENAME,
+        fallback_names=[
+            "great_anus.jpg",
+            "great_anus.jpg.jpg",
+            "Great Anus.jpg",
+            "Great Anus (1).jpg",
+            "Great%20Anus.jpg",
+            "great_anus.jpeg",
+            "great_anus.png",
+        ],
+        label="Balance/Income",
+    )
+
+
+async def send_ephemeral_with_weekend_income_image(interaction: discord.Interaction, content: str):
+    await send_ephemeral_with_bundled_image(
+        interaction,
+        content,
+        config_path=WEEKEND_INCOME_IMAGE_PATH,
+        filename=WEEKEND_INCOME_IMAGE_FILENAME,
+        fallback_names=[
+            "weekend_income.jpg",
+            "weekend_income.jpeg",
+            "BA4EB710-C8AB-4B8F-AFDC-EDBAFDEE13F6.jpeg",
+        ],
+        label="Weekend income",
+    )
 
 
 # -------------------------
@@ -902,6 +928,16 @@ async def ensure_schema() -> None:
             idx INTEGER NOT NULL,
             message_id BIGINT NOT NULL,
             PRIMARY KEY (guild_id, idx)
+        );
+        """
+    )
+
+    await db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS econ_daily_reminder_runs (
+            guild_id BIGINT NOT NULL,
+            reminder_date DATE NOT NULL,
+            PRIMARY KEY (guild_id, reminder_date)
         );
         """
     )
@@ -2326,7 +2362,11 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         f"• Net received: **{format_currency(net_total)}**\n\n"
         f"New balance: **{format_currency(new_bal)}**"
     )
-    await send_ephemeral_with_parchment(interaction, msg)
+    now_dt = datetime.now(CHICAGO_TZ)
+    if now_dt.weekday() in (4, 5, 6):
+        await send_ephemeral_with_weekend_income_image(interaction, msg)
+    else:
+        await send_ephemeral_with_parchment(interaction, msg)
 
 
 
@@ -3506,6 +3546,67 @@ async def delete_all_global_commands() -> None:
             print("[test] No GLOBAL commands found.")
     except Exception as e:
         print(f"[warn] Global command deletion failed/skipped: {e}")
+
+
+async def _daily_reminder_already_sent(reminder_date: date) -> bool:
+    row = await db_fetchrow(
+        "SELECT 1 FROM econ_daily_reminder_runs WHERE guild_id=$1 AND reminder_date=$2 LIMIT 1;",
+        DATA_GUILD_ID,
+        reminder_date,
+    )
+    return bool(row)
+
+
+async def _mark_daily_reminder_sent(reminder_date: date) -> None:
+    await db_exec(
+        """
+        INSERT INTO econ_daily_reminder_runs (guild_id, reminder_date)
+        VALUES ($1, $2)
+        ON CONFLICT (guild_id, reminder_date) DO NOTHING;
+        """,
+        DATA_GUILD_ID,
+        reminder_date,
+    )
+
+
+@tasks.loop(minutes=1)
+async def daily_income_reminder_loop():
+    now = datetime.now(CHICAGO_TZ)
+    if now.hour != DAILY_REMINDER_HOUR or now.minute != DAILY_REMINDER_MINUTE:
+        return
+    today = now.date()
+    try:
+        if await _daily_reminder_already_sent(today):
+            return
+    except Exception as e:
+        print(f"[warn] Could not check daily reminder log: {e}")
+        return
+
+    guild = client.get_guild(GUILD_ID)
+    if guild is None:
+        print(f"[warn] Daily reminder guild not found in cache: {GUILD_ID}")
+        return
+    channel = guild.get_channel(DAILY_REMINDER_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(DAILY_REMINDER_CHANNEL_ID)
+        except Exception as e:
+            print(f"[warn] Daily reminder channel fetch failed: {e}")
+            return
+    try:
+        await channel.send(
+            DAILY_REMINDER_MESSAGE,
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+        await _mark_daily_reminder_sent(today)
+        print(f"[test] Sent daily income reminder for {today.isoformat()} to channel {DAILY_REMINDER_CHANNEL_ID}")
+    except Exception as e:
+        print(f"[warn] Sending daily income reminder failed: {e}")
+
+
+@daily_income_reminder_loop.before_loop
+async def _before_daily_income_reminder_loop():
+    await client.wait_until_ready()
 
 
 @client.event
