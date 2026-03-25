@@ -41,7 +41,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v137"
+APP_VERSION = "EconBot_v138"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -58,7 +58,7 @@ WEEKEND_INCOME_IMAGE_FILENAME = "weekend_income.jpg"
 # Daily income reminder (hard-coded by request; no Railway env vars required).
 DAILY_REMINDER_CHANNEL_ID = 1324994929176612936
 DAILY_REMINDER_ROLE_ID = 1476435497776840724
-DAILY_REMINDER_HOUR = 9
+DAILY_REMINDER_HOUR = 12
 DAILY_REMINDER_MINUTE = 0
 DAILY_REMINDER_MESSAGE = f"<@&{DAILY_REMINDER_ROLE_ID}> - Don’t forget to claim your daily income (and pay your taxes) using the /income command!"
 
@@ -3684,6 +3684,13 @@ async def on_ready():
         await seed_asset_definitions()
     except Exception as e:
         print(f"[warn] seed_asset_definitions failed: {e}")
+    try:
+        if not daily_income_reminder_loop.is_running():
+            daily_income_reminder_loop.start()
+            print(f"[test] Started daily income reminder loop for {DAILY_REMINDER_HOUR:02d}:{DAILY_REMINDER_MINUTE:02d} America/Chicago")
+    except Exception as e:
+        print(f"[warn] Failed to start daily income reminder loop: {e}")
+
 
 def main():
     client.run(DISCORD_TOKEN)
