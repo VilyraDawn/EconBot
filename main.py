@@ -41,7 +41,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v143"
+APP_VERSION = "EconBot_v145"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -2099,6 +2099,88 @@ async def render_bank_dashboard_embeds(guild: discord.Guild) -> List[discord.Emb
     return embeds
 
 
+async def render_bank_navigation_embeds(guild: discord.Guild, content_message_ids: List[int]) -> List[discord.Embed]:
+    """Build one or more bottom-of-channel navigation embeds linking to the leaderboard and character ledgers."""
+    rows = await _sorted_bank_dashboard_rows_for_display(guild)
+    if not content_message_ids:
+        return []
+
+    header_mid = int(content_message_ids[0])
+    char_message_ids = list(content_message_ids[1:])
+
+    grouped: Dict[int, List[str]] = {}
+    order: List[int] = []
+    for cname, uid, _bal, _inc, _owner_display in rows:
+        key = int(uid or 0)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(cname)
+
+    ordered_character_names: List[str] = []
+    for uid in order:
+        ordered_character_names.extend(grouped[uid])
+
+    char_link_map: Dict[str, str] = {}
+    for idx, cname in enumerate(ordered_character_names):
+        if idx < len(char_message_ids):
+            mid = int(char_message_ids[idx])
+            char_link_map[cname] = f"https://discord.com/channels/{guild.id}/{BANK_CHANNEL_ID}/{mid}"
+
+    header_url = f"https://discord.com/channels/{guild.id}/{BANK_CHANNEL_ID}/{header_mid}"
+    leaderboard_line = f"🏆 [LEADERBOARD]({header_url}) 🏆"
+
+    lines: List[str] = []
+    current_line = ""
+    max_line_len = 1000
+
+    for uid in order:
+        for cname in grouped[uid]:
+            url = char_link_map.get(cname)
+            clean_name = sanitize_plain_text(cname)
+            piece = f"[{clean_name}]({url})" if url else clean_name
+            candidate = piece if not current_line else f"{current_line} | {piece}"
+            if len(candidate) > max_line_len:
+                if current_line:
+                    lines.append(current_line)
+                    current_line = piece
+                else:
+                    lines.append(piece[:max_line_len])
+                    current_line = ""
+            else:
+                current_line = candidate
+    if current_line:
+        lines.append(current_line)
+
+    if not lines:
+        lines = ["(no character links available)"]
+
+    embeds: List[discord.Embed] = []
+    page = 1
+    description_lines = [leaderboard_line, lines[0]]
+    current = discord.Embed(
+        title="🧭 Quick Links",
+        description="\n".join(description_lines),
+        color=0xC2A878,
+    )
+
+    for extra_line in lines[1:]:
+        if len(current.fields) >= 25:
+            current.set_footer(text=f"Quick links • Page {page}")
+            embeds.append(current)
+            page += 1
+            current = discord.Embed(
+                title=f"🧭 Quick Links (cont. {page})",
+                description=leaderboard_line,
+                color=0xC2A878,
+            )
+        current.add_field(name="​", value=extra_line, inline=False)
+
+    current.set_footer(text=f"Quick links • Page {page}")
+    embeds.append(current)
+    return embeds
+
+
 async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool = False) -> None:
     if not BANK_CHANNEL_ID:
         return
@@ -2110,9 +2192,9 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
     if not mids and BANK_MESSAGE_IDS:
         mids = list(BANK_MESSAGE_IDS)
 
-    embeds = [await render_bank_header_embed(ch.guild)] if header_only else await render_bank_dashboard_embeds(ch.guild)
-    if not embeds:
-        embeds = [discord.Embed(title="Bank of Vilyra", description="(empty)")]
+    content_embeds = [await render_bank_header_embed(ch.guild)] if header_only else await render_bank_dashboard_embeds(ch.guild)
+    if not content_embeds:
+        content_embeds = [discord.Embed(title="Bank of Vilyra", description="(empty)")]
 
     msgs: List[discord.Message] = []
     for mid in mids:
@@ -2122,10 +2204,10 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
         except Exception:
             pass
 
-    if create_missing and len(msgs) < len(embeds):
+    if create_missing and len(msgs) < len(content_embeds):
         try:
-            while len(msgs) < len(embeds):
-                m = await ch.send(embed=embeds[len(msgs)], allowed_mentions=discord.AllowedMentions.none())
+            while len(msgs) < len(content_embeds):
+                m = await ch.send(embed=content_embeds[len(msgs)], allowed_mentions=discord.AllowedMentions.none())
                 msgs.append(m)
                 await asyncio.sleep(0.35)
             await save_bank_message_ids([int(m.id) for m in msgs])
@@ -2137,10 +2219,25 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
         if not msgs:
             return
         try:
-            await msgs[0].edit(content=None, embed=embeds[0], allowed_mentions=discord.AllowedMentions.none())
+            await msgs[0].edit(content=None, embed=content_embeds[0], allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as e:
             print(f"[warn] Failed to edit header page: {e}")
         return
+
+    content_count = len(content_embeds)
+    nav_embeds = await render_bank_navigation_embeds(ch.guild, [int(m.id) for m in msgs[:content_count]])
+    embeds = content_embeds + nav_embeds
+
+    if create_missing and len(msgs) < len(embeds):
+        try:
+            while len(msgs) < len(embeds):
+                m = await ch.send(embed=embeds[len(msgs)], allowed_mentions=discord.AllowedMentions.none())
+                msgs.append(m)
+                await asyncio.sleep(0.35)
+            await save_bank_message_ids([int(m.id) for m in msgs])
+            print(f"[test] Bank dashboard message IDs saved to Postgres: {len(msgs)}")
+        except Exception as e:
+            print(f"[warn] Bank dashboard create/persist failed: {e}")
 
     n = min(len(msgs), len(embeds))
     for i in range(n):
@@ -2161,7 +2258,6 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
                 await msgs[j].edit(content="(unused bank slot)", embed=None, allowed_mentions=discord.AllowedMentions.none())
             except Exception:
                 pass
-
 # Bank refresh coordinator (Option A1): single worker + dirty flags to avoid overlapping refreshes.
 _bank_refresh_task: Optional[asyncio.Task] = None
 _bank_refresh_lock: asyncio.Lock = asyncio.Lock()
@@ -2176,9 +2272,9 @@ async def force_rebuild_bank_dashboard() -> None:
     if ch is None or not isinstance(ch, (discord.TextChannel, discord.Thread)):
         return
 
-    embeds = await render_bank_dashboard_embeds(ch.guild)
-    if not embeds:
-        embeds = [discord.Embed(title="Bank of Vilyra", description="(empty)")]
+    content_embeds = await render_bank_dashboard_embeds(ch.guild)
+    if not content_embeds:
+        content_embeds = [discord.Embed(title="Bank of Vilyra", description="(empty)")]
 
     mids = await bank_message_ids_from_db()
     if not mids and BANK_MESSAGE_IDS:
@@ -2197,14 +2293,20 @@ async def force_rebuild_bank_dashboard() -> None:
     except Exception:
         pass
 
-    new_ids = []
-    for emb in embeds:
+    msgs: List[discord.Message] = []
+    for emb in content_embeds:
         m = await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
-        new_ids.append(int(m.id))
+        msgs.append(m)
         await asyncio.sleep(0.35)
 
-    await save_bank_message_ids(new_ids)
-    print(f"[test] Force rebuilt bank dashboard embeds: {len(new_ids)}")
+    nav_embeds = await render_bank_navigation_embeds(ch.guild, [int(m.id) for m in msgs])
+    for emb in nav_embeds:
+        m = await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+        msgs.append(m)
+        await asyncio.sleep(0.35)
+
+    await save_bank_message_ids([int(m.id) for m in msgs])
+    print(f"[ok] Rebuilt bank dashboard: {len(content_embeds)} content embeds + {len(nav_embeds)} nav embeds")
 
 
 def request_bank_refresh(*, full: bool = True) -> None:
