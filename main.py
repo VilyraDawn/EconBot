@@ -41,7 +41,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v138"
+APP_VERSION = "EconBot_v143"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -2086,9 +2086,7 @@ async def render_bank_dashboard_embeds(guild: discord.Guild) -> List[discord.Emb
         grouped[key]["characters"].append(cname)
 
     for uid in order:
-        owner_display = str(grouped[uid]["owner_display"])
         char_names = list(grouped[uid]["characters"])
-        embeds.append(await render_owner_group_embed(guild, uid, owner_display, char_names))
         for cname in char_names:
             embeds.append(await render_character_bank_embed(guild, cname))
     return embeds
