@@ -41,7 +41,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v138"
+APP_VERSION = "EconBot_v139"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -50,7 +50,7 @@ CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 # Bundled images (do NOT use expiring Discord CDN URLs).
 # These are relative to the repo root beside main.py, typically under ./assets/.
-BALANCE_CARD_IMAGE_PATH = "assets/great_anus.jpg"
+BALANCE_CARD_IMAGE_PATH = "assets/balance_card.jpg"
 BALANCE_CARD_IMAGE_FILENAME = "balance_card.jpg"
 WEEKEND_INCOME_IMAGE_PATH = "assets/weekend_income.jpg"
 WEEKEND_INCOME_IMAGE_FILENAME = "weekend_income.jpg"
@@ -1278,24 +1278,6 @@ async def get_character_owner(character_name: str) -> Optional[int]:
 
 
 
-async def get_character_kingdom(character_name: str) -> Optional[str]:
-    row = await db_fetchrow(
-        """
-        SELECT kingdom
-        FROM characters
-        WHERE guild_id=$1 AND name=$2 AND archived=FALSE
-        LIMIT 1;
-        """,
-        DATA_GUILD_ID,
-        character_name,
-    )
-    if not row:
-        return None
-    k = row.get("kingdom")
-    if k is None:
-        return None
-    k = str(k).strip()
-    return k if k else None
 
 
 # -------------------------
@@ -1395,7 +1377,7 @@ async def log_econ_channel(interaction: discord.Interaction, action: str, detail
         elif action == "upgrade_asset":
             lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "from_tier", "to_tier", "cost", "sales_kingdom"])
         elif action == "sell_asset":
-            lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "tier", "refund_amount"])
+            lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "tier", "asset_kingdom", "gross_refund", "tax_amount", "net_refund"])
         elif action == "income_claim":
             lines += _fmt_kv(details, ["character", "character_kingdom", "base_income", "asset_income", "gross_total", "tax_total", "net_total", "new_balance"])
         elif action in ("adjust_balance", "set_balance"):
@@ -2144,7 +2126,7 @@ async def force_rebuild_bank_dashboard() -> None:
             pass
 
     try:
-        await db_execute("DELETE FROM econ_bank_messages WHERE guild_id=$1;", DATA_GUILD_ID)
+        await db_exec("DELETE FROM econ_bank_messages WHERE guild_id=$1;", DATA_GUILD_ID)
     except Exception:
         pass
 
@@ -2378,35 +2360,24 @@ async def cmd_econ_commands(interaction: discord.Interaction):
     msg = (
         f"**EconBot Commands** ({APP_VERSION})\n\n"
         "**Player**\n"
-        "• `/balance` — view balance\n"
-        "• `/income` — claim daily income\n\n"
+        "• `/balance` - view a character balance card\n"
+        "• `/income` - claim daily income\n\n"
         "**Staff**\n"
-        "• `/purchase_new` — record an asset purchase\n"
-        "• `/upgrade_asset` — upgrade an existing asset\n"
-        "• `/sell_asset` — sell/remove an existing asset\n"
-        "• `/econ_adjust` — adjust balance by delta\n"
-        "• `/econ_set_balance` — set balance to value\n"
-        "• `/econ_refresh_bank` — refresh bank dashboard\n"
-        "• `/econ_set_kingdom_tax` — set kingdom tax rate (10–50%)\n"
+        "• `/purchase_new` - record an asset purchase\n"
+        "• `/upgrade_asset` - upgrade an existing asset\n"
+        "• `/sell_asset` - sell an existing asset\n"
+        "• `/econ_adjust` - adjust a balance by delta\n"
+        "• `/econ_set_balance` - set a balance directly\n"
+        "• `/econ_set_kingdom_tax` - set a kingdom income tax\n"
+        "• `/set_kingdom_treasury` - set a kingdom treasury amount\n"
+        "• `/econ_grant_all` - grant all registered characters Val\n"
+        "• `/transfer_val` - transfer Val between characters\n"
+        "• `/assign-noble-title` - assign a noble title\n"
+        "• `/upgrade-noble-title` - upgrade a noble title\n"
+        "• `/edit-noble-title` - edit noble title presentation\n"
+        "• `/econ_refresh_bank` - rebuild the bank dashboard\n"
     )
     await interaction.followup.send(msg, ephemeral=True)
-
-@tree.command(name="econ_set_kingdom_tax", description="Set a kingdom's income tax rate (10–50%).", guild=discord.Object(id=GUILD_ID))
-@staff_only()
-@app_commands.describe(kingdom="Kingdom name (must match character/asset kingdom values).", rate="Tax rate percent.")
-@app_commands.choices(
-    kingdom=[
-        app_commands.Choice(name="Sethrathiel", value="Sethrathiel"),
-        app_commands.Choice(name="Velarith", value="Velarith"),
-        app_commands.Choice(name="Lyvik", value="Lyvik"),
-        app_commands.Choice(name="Baelon", value="Baelon"),
-        app_commands.Choice(name="Avalea", value="Avalea"),
-    ],
-    rate=[
-        app_commands.Choice(name="10%", value=10),
-        app_commands.Choice(name="20%", value=20),
-        app_commands.Choice(name="30%", value=30),
-        app_commands.Choice(name="40%", value=40),
         app_commands.Choice(name="50%", value=50),
     ],
 )
@@ -2850,6 +2821,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     )
 
     await interaction.followup.send(
+    trigger_bank_refresh()
         f"Recorded purchase for **{character}**:\n"
         f"• **{asset_type}** | **{tier}** | **{asset_name}**\n"
         f"Cost: **{format_currency(cost_val)}** → sent to **{sales_kingdom or 'N/A'}** treasury (new balance **{format_currency(new_bal)}**)\n"
@@ -3697,6 +3669,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main(
-
-)
+    main()
