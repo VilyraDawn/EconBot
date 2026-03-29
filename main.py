@@ -1918,21 +1918,52 @@ def _truncate_embed_field(text: str, limit: int = 1024) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
-async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
+def _bank_color_for_kingdom(kingdom: str) -> int:
+    k = str(kingdom or "").strip().lower()
+    palette = {
+        "velarith": 0x7F98B1,
+        "lyvik": 0x6B8E9E,
+        "avalea": 0xB7C9E2,
+        "baelon": 0x8C5A4B,
+        "sethrathiel": 0x6E5A8A,
+        "setrathiel": 0x6E5A8A,
+    }
+    return palette.get(k, 0x8B7355)
+
+
+async def _sorted_bank_dashboard_rows_for_display(guild: discord.Guild) -> List[Tuple[str, int, int, int, str]]:
+    """rows: [(character_name, owner_id, balance, income, owner_display)] grouped by owner display then character."""
     rows = await fetch_bank_dashboard_rows()
+    decorated: List[Tuple[str, int, int, int, str]] = []
+    for cname, uid, bal, inc in rows:
+        owner_display = sanitize_plain_text(await _display_name_from_cache(guild, int(uid or 0))) if uid else "Unknown Owner"
+        decorated.append((cname, uid, bal, inc, owner_display))
+    decorated.sort(key=lambda r: (str(r[4]).lower(), str(r[0]).lower()))
+    return decorated
+
+
+async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
+    rows = await _sorted_bank_dashboard_rows_for_display(guild)
     now = datetime.now(CHICAGO_TZ)
 
+    total_balance = sum(int(r[2]) for r in rows)
+    total_income = sum(int(r[3]) for r in rows)
+    owner_count = len({int(r[1]) for r in rows if int(r[1] or 0) > 0})
+
     embed = discord.Embed(
-        title="Bank of Vilyra",
-        description="Kingdom treasuries and live economy standings.",
+        title="🏦 Bank of Vilyra",
+        description="The crown ledger of coin, titles, and holdings across the realm.",
+        color=0x7F98B1,
     )
 
     treas = await fetch_kingdom_treasuries()
     treasury_lines: List[str] = []
     for kingdom, bp, treasury in treas:
-        treasury_lines.append(f"**{kingdom}** - {format_currency(int(treasury or 0))} - Tax {int(bp or 0) / 100:.0f}%")
+        treasury_lines.append(
+            f"👑 **{sanitize_plain_text(kingdom)}** — {format_currency(int(treasury or 0))} • Tax {int(bp or 0) / 100:.0f}%"
+        )
     embed.add_field(
-        name="Kingdom Treasuries",
+        name="🪙 Kingdom Treasuries",
         value=_truncate_embed_field("\n".join(treasury_lines) or "(none)"),
         inline=False,
     )
@@ -1941,30 +1972,51 @@ async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
         top_bal = sorted(rows, key=lambda r: int(r[2]), reverse=True)[:5]
         top_inc = sorted(rows, key=lambda r: int(r[3]), reverse=True)[:5]
 
-        bal_lines = [f"{i}. **{sanitize_plain_text(c)}** - {format_currency(bal)}" for i, (c, _, bal, _) in enumerate(top_bal, start=1)]
-        inc_lines = [f"{i}. **{sanitize_plain_text(c)}** - {format_currency(inc)}" for i, (c, _, _, inc) in enumerate(top_inc, start=1)]
+        bal_lines = [
+            f"{i}. **{sanitize_plain_text(c)}** — {format_currency(bal)}"
+            for i, (c, _uid, bal, _inc, _owner) in enumerate(top_bal, start=1)
+        ]
+        inc_lines = [
+            f"{i}. **{sanitize_plain_text(c)}** — {format_currency(inc)}"
+            for i, (c, _uid, _bal, inc, _owner) in enumerate(top_inc, start=1)
+        ]
 
-        embed.add_field(name="Top Balances", value=_truncate_embed_field("\n".join(bal_lines) or "(none)"), inline=False)
-        embed.add_field(name="Top Daily Income", value=_truncate_embed_field("\n".join(inc_lines) or "(none)"), inline=False)
-
-        total_balance = sum(int(r[2]) for r in rows)
-        total_income = sum(int(r[3]) for r in rows)
+        embed.add_field(name="💰 Wealthiest Ledgers", value=_truncate_embed_field("\n".join(bal_lines) or "(none)"), inline=False)
+        embed.add_field(name="📈 Highest Daily Income", value=_truncate_embed_field("\n".join(inc_lines) or "(none)"), inline=False)
         embed.add_field(
-            name="Ledger Status",
+            name="📜 Ledger Status",
             value=_truncate_embed_field(
                 "\n".join([
                     f"Characters tracked: **{len(rows)}**",
+                    f"Owners represented: **{owner_count}**",
                     f"Total wealth: **{format_currency(total_balance)}**",
                     f"Total daily income: **{format_currency(total_income)}**",
-                    "See the following messages for individual character ledgers.",
+                    "Character ledgers appear below, grouped by owner.",
                 ])
             ),
             inline=False,
         )
     else:
-        embed.add_field(name="Ledger Status", value="No characters found in DB.", inline=False)
+        embed.add_field(name="📜 Ledger Status", value="No characters found in DB.", inline=False)
 
     embed.set_footer(text=f"Last updated {now.strftime('%Y-%m-%d %H:%M')} America/Chicago")
+    return embed
+
+
+async def render_owner_group_embed(guild: discord.Guild, owner_id: int, owner_display: str, character_names: List[str]) -> discord.Embed:
+    clean_owner = sanitize_plain_text(owner_display or f"User {owner_id}")
+    lines = [f"• {sanitize_plain_text(name)}" for name in character_names]
+    embed = discord.Embed(
+        title=f"👤 {clean_owner}",
+        description="Household ledger grouping",
+        color=0x5C6F82,
+    )
+    embed.add_field(
+        name="Characters",
+        value=_truncate_embed_field("\n".join(lines) or "(none)"),
+        inline=False,
+    )
+    embed.set_footer(text="The following ledgers belong to this owner")
     return embed
 
 
@@ -1975,26 +2027,27 @@ async def render_character_bank_embed(guild: discord.Guild, character_name: str)
     balance_val = await get_balance(character_name)
     assets = await get_assets_with_income_for_character(character_name)
     asset_income_sum = sum(int(a.get("add_income_val") or 0) for a in assets)
+    base_income = int(current_base_daily_income())
+    total_income = base_income + asset_income_sum
     title_assets = [a for a in assets if is_noble_title_asset_type(str(a.get("asset_type", "")))]
     regular_assets = [a for a in assets if not is_noble_title_asset_type(str(a.get("asset_type", "")))]
 
     embed = discord.Embed(
-        title=sanitize_plain_text(character_name),
-        description=f"Owner: **{owner_display}**",
+        title=f"📘 {sanitize_plain_text(character_name)}",
+        description=f"Held under **{owner_display}**",
+        color=_bank_color_for_kingdom(kingdom),
     )
-    embed.add_field(name="Kingdom", value=kingdom, inline=True)
-    embed.add_field(name="Balance", value=_truncate_embed_field(format_balance(balance_val), 1024), inline=True)
-    embed.add_field(
-        name="Income",
-        value=_truncate_embed_field(
-            f"Base: {format_amount(current_base_daily_income())}\nAssets: {asset_income_sum:,} Val\nTotal: {format_currency(current_base_daily_income() + asset_income_sum)}"
-        ),
-        inline=True,
-    )
+    embed.add_field(name="🏰 Kingdom", value=kingdom, inline=True)
+    embed.add_field(name="💰 Balance", value=_truncate_embed_field(format_balance(balance_val), 1024), inline=False)
+    embed.add_field(name="☀️ Base Daily Income", value=format_currency(base_income), inline=True)
+    embed.add_field(name="🏦 Asset Income", value=format_currency(asset_income_sum), inline=True)
+    embed.add_field(name="📈 Total Daily Income", value=format_currency(total_income), inline=True)
 
     if title_assets:
-        title_lines = [f"• {noble_title_display_from_row(a)}" for a in title_assets]
-        embed.add_field(name="Noble Titles", value=_truncate_embed_field("\n".join(title_lines), 1024), inline=False)
+        title_lines = [f"👑 {noble_title_display_from_row(a)}" for a in title_assets]
+        embed.add_field(name="👑 Noble Titles", value=_truncate_embed_field("\n".join(title_lines), 1024), inline=False)
+    else:
+        embed.add_field(name="👑 Noble Titles", value="None recorded", inline=False)
 
     if regular_assets:
         asset_lines: List[str] = []
@@ -2004,7 +2057,7 @@ async def render_character_bank_embed(guild: discord.Guild, character_name: str)
             aname = sanitize_plain_text(str(a.get("asset_name", "")).strip() or str(a.get("asset_type", "")).strip())
             akingdom = sanitize_plain_text(str(a.get("kingdom", "")).strip() or "(No Kingdom)")
             add = int(a.get("add_income_val") or 0)
-            candidate = f"• {tier} - {aname} - {akingdom} - +{add:,} Val"
+            candidate = f"• **{tier}** — {aname} • {akingdom} • +{add:,} Val"
             joined = "\n".join(asset_lines + [candidate])
             if len(joined) > 1000:
                 hidden += 1
@@ -2012,19 +2065,32 @@ async def render_character_bank_embed(guild: discord.Guild, character_name: str)
                 asset_lines.append(candidate)
         if hidden > 0:
             asset_lines.append(f"• ...and {hidden} more")
-        embed.add_field(name="Assets", value=_truncate_embed_field("\n".join(asset_lines), 1024), inline=False)
+        embed.add_field(name="🧾 Assets", value=_truncate_embed_field("\n".join(asset_lines), 1024), inline=False)
     else:
-        embed.add_field(name="Assets", value="(none)", inline=False)
+        embed.add_field(name="🧾 Assets", value="No income-bearing assets recorded", inline=False)
 
     embed.set_footer(text=f"Live ledger • Updated {datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M')} America/Chicago")
     return embed
 
 
 async def render_bank_dashboard_embeds(guild: discord.Guild) -> List[discord.Embed]:
-    rows = await fetch_bank_dashboard_rows()
+    rows = await _sorted_bank_dashboard_rows_for_display(guild)
     embeds: List[discord.Embed] = [await render_bank_header_embed(guild)]
-    for cname, _uid, _bal, _inc in rows:
-        embeds.append(await render_character_bank_embed(guild, cname))
+    grouped: Dict[int, Dict[str, Any]] = {}
+    order: List[int] = []
+    for cname, uid, _bal, _inc, owner_display in rows:
+        key = int(uid or 0)
+        if key not in grouped:
+            grouped[key] = {"owner_display": owner_display, "characters": []}
+            order.append(key)
+        grouped[key]["characters"].append(cname)
+
+    for uid in order:
+        owner_display = str(grouped[uid]["owner_display"])
+        char_names = list(grouped[uid]["characters"])
+        embeds.append(await render_owner_group_embed(guild, uid, owner_display, char_names))
+        for cname in char_names:
+            embeds.append(await render_character_bank_embed(guild, cname))
     return embeds
 
 
