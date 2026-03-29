@@ -1927,7 +1927,7 @@ async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
         description="Kingdom treasuries and live economy standings.",
     )
 
-    treas = await get_kingdom_treasuries()
+    treas = await fetch_kingdom_treasuries()
     treasury_lines: List[str] = []
     for kingdom, bp, treasury in treas:
         treasury_lines.append(f"**{kingdom}** - {format_currency(int(treasury or 0))} - Tax {int(bp or 0) / 100:.0f}%")
