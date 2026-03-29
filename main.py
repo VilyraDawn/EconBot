@@ -1395,7 +1395,7 @@ async def log_econ_channel(interaction: discord.Interaction, action: str, detail
         elif action == "upgrade_asset":
             lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "from_tier", "to_tier", "cost", "sales_kingdom"])
         elif action == "sell_asset":
-            lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "tier", "refund_amount"])
+            lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "tier", "gross_refund", "tax_amount", "net_refund"])
         elif action == "income_claim":
             lines += _fmt_kv(details, ["character", "character_kingdom", "base_income", "asset_income", "gross_total", "tax_total", "net_total", "new_balance"])
         elif action in ("adjust_balance", "set_balance"):
@@ -1887,147 +1887,17 @@ async def save_bank_message_ids(message_ids: List[int]) -> None:
                 )
 
 
-async def render_bank_pages(guild: discord.Guild) -> List[str]:
-    """
-    Returns full message pages (content strings) for the bank dashboard.
-
-    Page 1: header + kingdom treasuries + leaderboards
-    Pages 2+: full character cards (never split across messages)
-    """
+async def fetch_bank_dashboard_rows() -> List[Tuple[str, int, int, int]]:
+    """rows: [(character_name, owner_id, balance, income)]"""
     chars = await db_fetch(
-        '''
+        """
         SELECT user_id, name
         FROM characters
         WHERE guild_id=$1 AND archived=FALSE
         ORDER BY name ASC;
-        ''',
+        """,
         DATA_GUILD_ID,
     )
-
-    now = datetime.now(CHICAGO_TZ)
-
-    header_lines: List[str] = [
-        f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
-    header_lines += await render_treasury_lines()
-    header_lines.append("")
-
-    if not chars:
-        return ["\n".join(header_lines + ["No characters found in DB."])]
-
-    # Precompute balance+income for leaderboards (single DB authority)
-    rows: List[Tuple[str, int, int, int]] = []
-    for r in chars:
-        cname = str(r["name"])
-        uid = int(r["user_id"])
-        bal = await get_balance(cname)
-        inc = await recompute_daily_income(cname)
-        rows.append((cname, uid, bal, inc))
-
-    header_lines += await render_leaderboard_lines(guild, rows)
-    header_lines.append("")
-    header_lines.append("📜 **Ledger Entries**")
-    header_lines.append("━━━━━━━━━━━━━━━━━━")
-    header_lines.append("_See the following messages for full character cards._")
-
-    # Build card blocks grouped by user (each block is a complete card)
-    by_user: Dict[int, List[str]] = {}
-    for cname, uid, _, _ in rows:
-        by_user.setdefault(int(uid), []).append(str(cname))
-
-    for uid in by_user:
-        by_user[uid] = sorted(by_user[uid], key=lambda s: s.lower())
-
-    card_blocks: List[str] = []
-    for uid in sorted(by_user.keys()):
-        card_lines = await render_user_card_block(guild, uid, by_user[uid])
-        card_text = "\n".join(card_lines).strip()
-
-        # Ensure a single card never exceeds a safe limit; truncate asset list if needed
-        max_card_len = 1800
-        if len(card_text) > max_card_len:
-            lines = card_text.split("\n")
-            removed = 0
-            while len("\n".join(lines)) > max_card_len and any(l.startswith("- ") for l in lines):
-                for i in range(len(lines) - 1, -1, -1):
-                    if lines[i].startswith("- "):
-                        lines.pop(i)
-                        removed += 1
-                        break
-                else:
-                    break
-            if removed > 0:
-                try:
-                    insert_at = len(lines)
-                    for i in range(len(lines) - 1, -1, -1):
-                        if "Assets" in lines[i]:
-                            insert_at = i + 1
-                            break
-                    lines.insert(insert_at, f"- …and {removed} more (not shown)")
-                except Exception:
-                    pass
-            card_text = "\n".join(lines).strip()
-
-        card_blocks.append(card_text)
-
-    # Paginate cards so no card is split across messages
-    pages: List[str] = []
-    pages.append("\n".join(header_lines).strip())
-
-    max_page_len = 1900
-    current: List[str] = []
-    current_len = 0
-
-    def flush():
-        nonlocal current, current_len
-        if current:
-            pages.append("\n\n".join(current).strip())
-            current = []
-            current_len = 0
-
-    for block in card_blocks:
-        add_len = len(block) + (2 if current else 0)  # account for \n\n
-        if current_len + add_len > max_page_len:
-            flush()
-            current.append(block)
-            current_len = len(block)
-        else:
-            current.append(block)
-            current_len += add_len
-
-    flush()
-    return pages
-
-
-
-async def render_bank_header_page(guild: discord.Guild) -> str:
-    """Render only page 1 (header + treasuries + leaderboards)."""
-    chars = await db_fetch(
-        '''
-        SELECT user_id, name
-        FROM characters
-        WHERE guild_id=$1 AND archived=FALSE
-        ORDER BY name ASC;
-        ''',
-        DATA_GUILD_ID,
-    )
-
-    now = datetime.now(CHICAGO_TZ)
-
-    header_lines: List[str] = [
-        f"🏦 **Bank of Vilyra** — {now.strftime('%Y-%m-%d %H:%M')} (Chicago)",
-        "━━━━━━━━━━━━━━━━━━",
-        "",
-    ]
-
-    header_lines += await render_treasury_lines()
-    header_lines.append("")
-
-    if not chars:
-        return "\n".join(header_lines + ["No characters found in DB."])
 
     rows: List[Tuple[str, int, int, int]] = []
     for r in chars:
@@ -2036,13 +1906,127 @@ async def render_bank_header_page(guild: discord.Guild) -> str:
         bal = await get_balance(cname)
         inc = await recompute_daily_income(cname)
         rows.append((cname, uid, bal, inc))
+    return rows
 
-    header_lines += await render_leaderboard_lines(guild, rows)
-    header_lines.append("")
-    header_lines.append("📜 **Ledger Entries**")
-    header_lines.append("━━━━━━━━━━━━━━━━━━")
-    header_lines.append("_See the following messages for full character cards._")
-    return "\n".join(header_lines)
+
+def _truncate_embed_field(text: str, limit: int = 1024) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text or "-"
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3].rstrip() + "..."
+
+
+async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
+    rows = await fetch_bank_dashboard_rows()
+    now = datetime.now(CHICAGO_TZ)
+
+    embed = discord.Embed(
+        title="Bank of Vilyra",
+        description="Kingdom treasuries and live economy standings.",
+    )
+
+    treas = await get_kingdom_treasuries()
+    treasury_lines: List[str] = []
+    for kingdom, bp, treasury in treas:
+        treasury_lines.append(f"**{kingdom}** - {format_currency(int(treasury or 0))} - Tax {int(bp or 0) / 100:.0f}%")
+    embed.add_field(
+        name="Kingdom Treasuries",
+        value=_truncate_embed_field("\n".join(treasury_lines) or "(none)"),
+        inline=False,
+    )
+
+    if rows:
+        top_bal = sorted(rows, key=lambda r: int(r[2]), reverse=True)[:5]
+        top_inc = sorted(rows, key=lambda r: int(r[3]), reverse=True)[:5]
+
+        bal_lines = [f"{i}. **{sanitize_plain_text(c)}** - {format_currency(bal)}" for i, (c, _, bal, _) in enumerate(top_bal, start=1)]
+        inc_lines = [f"{i}. **{sanitize_plain_text(c)}** - {format_currency(inc)}" for i, (c, _, _, inc) in enumerate(top_inc, start=1)]
+
+        embed.add_field(name="Top Balances", value=_truncate_embed_field("\n".join(bal_lines) or "(none)"), inline=False)
+        embed.add_field(name="Top Daily Income", value=_truncate_embed_field("\n".join(inc_lines) or "(none)"), inline=False)
+
+        total_balance = sum(int(r[2]) for r in rows)
+        total_income = sum(int(r[3]) for r in rows)
+        embed.add_field(
+            name="Ledger Status",
+            value=_truncate_embed_field(
+                "\n".join([
+                    f"Characters tracked: **{len(rows)}**",
+                    f"Total wealth: **{format_currency(total_balance)}**",
+                    f"Total daily income: **{format_currency(total_income)}**",
+                    "See the following messages for individual character ledgers.",
+                ])
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Ledger Status", value="No characters found in DB.", inline=False)
+
+    embed.set_footer(text=f"Last updated {now.strftime('%Y-%m-%d %H:%M')} America/Chicago")
+    return embed
+
+
+async def render_character_bank_embed(guild: discord.Guild, character_name: str) -> discord.Embed:
+    owner_id = await get_character_owner(character_name)
+    owner_display = sanitize_plain_text(await _display_name_from_cache(guild, int(owner_id or 0))) if owner_id else "Unknown Owner"
+    kingdom = sanitize_plain_text(str(await get_character_kingdom(character_name) or "")).strip() or "(No Kingdom)"
+    balance_val = await get_balance(character_name)
+    assets = await get_assets_with_income_for_character(character_name)
+    asset_income_sum = sum(int(a.get("add_income_val") or 0) for a in assets)
+    title_assets = [a for a in assets if is_noble_title_asset_type(str(a.get("asset_type", "")))]
+    regular_assets = [a for a in assets if not is_noble_title_asset_type(str(a.get("asset_type", "")))]
+
+    embed = discord.Embed(
+        title=sanitize_plain_text(character_name),
+        description=f"Owner: **{owner_display}**",
+    )
+    embed.add_field(name="Kingdom", value=kingdom, inline=True)
+    embed.add_field(name="Balance", value=_truncate_embed_field(format_balance(balance_val), 1024), inline=True)
+    embed.add_field(
+        name="Income",
+        value=_truncate_embed_field(
+            f"Base: {format_amount(current_base_daily_income())}\nAssets: {asset_income_sum:,} Val\nTotal: {format_currency(current_base_daily_income() + asset_income_sum)}"
+        ),
+        inline=True,
+    )
+
+    if title_assets:
+        title_lines = [f"• {noble_title_display_from_row(a)}" for a in title_assets]
+        embed.add_field(name="Noble Titles", value=_truncate_embed_field("\n".join(title_lines), 1024), inline=False)
+
+    if regular_assets:
+        asset_lines: List[str] = []
+        hidden = 0
+        for a in regular_assets:
+            tier = _tier_label(str(a.get("tier", "")))
+            aname = sanitize_plain_text(str(a.get("asset_name", "")).strip() or str(a.get("asset_type", "")).strip())
+            akingdom = sanitize_plain_text(str(a.get("kingdom", "")).strip() or "(No Kingdom)")
+            add = int(a.get("add_income_val") or 0)
+            candidate = f"• {tier} - {aname} - {akingdom} - +{add:,} Val"
+            joined = "\n".join(asset_lines + [candidate])
+            if len(joined) > 1000:
+                hidden += 1
+            else:
+                asset_lines.append(candidate)
+        if hidden > 0:
+            asset_lines.append(f"• ...and {hidden} more")
+        embed.add_field(name="Assets", value=_truncate_embed_field("\n".join(asset_lines), 1024), inline=False)
+    else:
+        embed.add_field(name="Assets", value="(none)", inline=False)
+
+    embed.set_footer(text=f"Live ledger • Updated {datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M')} America/Chicago")
+    return embed
+
+
+async def render_bank_dashboard_embeds(guild: discord.Guild) -> List[discord.Embed]:
+    rows = await fetch_bank_dashboard_rows()
+    embeds: List[discord.Embed] = [await render_bank_header_embed(guild)]
+    for cname, _uid, _bal, _inc in rows:
+        embeds.append(await render_character_bank_embed(guild, cname))
+    return embeds
+
 
 async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool = False) -> None:
     if not BANK_CHANNEL_ID:
@@ -2055,10 +2039,9 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
     if not mids and BANK_MESSAGE_IDS:
         mids = list(BANK_MESSAGE_IDS)
 
-    pages = [await render_bank_header_page(ch.guild)] if header_only else await render_bank_pages(ch.guild)
-    pages = [normalize_dashboard_markdown(p) for p in pages]
-    if not pages:
-        pages = ["(empty)"]
+    embeds = [await render_bank_header_embed(ch.guild)] if header_only else await render_bank_dashboard_embeds(ch.guild)
+    if not embeds:
+        embeds = [discord.Embed(title="Bank of Vilyra", description="(empty)")]
 
     msgs: List[discord.Message] = []
     for mid in mids:
@@ -2068,14 +2051,12 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
         except Exception:
             pass
 
-    if create_missing and len(msgs) < len(pages):
+    if create_missing and len(msgs) < len(embeds):
         try:
-            while len(msgs) < len(pages):
-                m = await ch.send(
-                    "Initializing Bank of Vilyra…",
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+            while len(msgs) < len(embeds):
+                m = await ch.send(embed=embeds[len(msgs)], allowed_mentions=discord.AllowedMentions.none())
                 msgs.append(m)
+                await asyncio.sleep(0.35)
             await save_bank_message_ids([int(m.id) for m in msgs])
             print(f"[test] Bank dashboard message IDs saved to Postgres: {len(msgs)}")
         except Exception as e:
@@ -2085,31 +2066,28 @@ async def refresh_bank_dashboard(create_missing: bool = True, header_only: bool 
         if not msgs:
             return
         try:
-            await msgs[0].edit(content=pages[0], allowed_mentions=discord.AllowedMentions.none())
+            await msgs[0].edit(content=None, embed=embeds[0], allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as e:
             print(f"[warn] Failed to edit header page: {e}")
         return
-    n = min(len(msgs), len(pages))
+
+    n = min(len(msgs), len(embeds))
     for i in range(n):
-        # Robust edit with small retries; avoids silent stale page 1 on transient failures / rate limits.
         for attempt in range(4):
             try:
-                if msgs[i].content != pages[i]:
-                    await msgs[i].edit(content=pages[i], allowed_mentions=discord.AllowedMentions.none())
-                # Space edits to reduce 429s when multiple pages exist.
+                await msgs[i].edit(content=None, embed=embeds[i], allowed_mentions=discord.AllowedMentions.none())
                 if i < n - 1:
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(0.75)
                 break
-            except discord.HTTPException as e:
-                # 429/5xx can happen; backoff a bit
+            except discord.HTTPException:
                 await asyncio.sleep(0.8 * (attempt + 1))
             except Exception:
                 await asyncio.sleep(0.5 * (attempt + 1))
 
-    if len(msgs) > len(pages):
-        for j in range(len(pages), len(msgs)):
+    if len(msgs) > len(embeds):
+        for j in range(len(embeds), len(msgs)):
             try:
-                await msgs[j].edit(content="(unused bank page)", allowed_mentions=discord.AllowedMentions.none())
+                await msgs[j].edit(content="(unused bank slot)", embed=None, allowed_mentions=discord.AllowedMentions.none())
             except Exception:
                 pass
 
@@ -2120,21 +2098,21 @@ _bank_dirty_full: bool = False
 _bank_dirty_header: bool = False
 
 async def force_rebuild_bank_dashboard() -> None:
-    """Delete and recreate all tracked bank dashboard messages from fresh rendered pages."""
+    """Delete and recreate all tracked bank dashboard messages from fresh rendered embeds."""
     if not BANK_CHANNEL_ID:
         return
     ch = client.get_channel(int(BANK_CHANNEL_ID))
     if ch is None or not isinstance(ch, (discord.TextChannel, discord.Thread)):
         return
 
-    pages = await render_bank_pages(ch.guild)
-    pages = [normalize_dashboard_markdown(p) for p in pages] or ["(empty)"]
+    embeds = await render_bank_dashboard_embeds(ch.guild)
+    if not embeds:
+        embeds = [discord.Embed(title="Bank of Vilyra", description="(empty)")]
 
     mids = await bank_message_ids_from_db()
     if not mids and BANK_MESSAGE_IDS:
         mids = list(BANK_MESSAGE_IDS)
 
-    # Best-effort delete of existing tracked dashboard messages.
     for mid in mids:
         try:
             m = await ch.fetch_message(int(mid))
@@ -2144,18 +2122,18 @@ async def force_rebuild_bank_dashboard() -> None:
             pass
 
     try:
-        await db_execute("DELETE FROM econ_bank_messages WHERE guild_id=$1;", DATA_GUILD_ID)
+        await db_exec("DELETE FROM econ_bank_messages WHERE guild_id=$1;", DATA_GUILD_ID)
     except Exception:
         pass
 
     new_ids = []
-    for page in pages:
-        m = await ch.send(page, allowed_mentions=discord.AllowedMentions.none())
+    for emb in embeds:
+        m = await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
         new_ids.append(int(m.id))
         await asyncio.sleep(0.35)
 
     await save_bank_message_ids(new_ids)
-    print(f"[test] Force rebuilt bank dashboard pages: {len(new_ids)}")
+    print(f"[test] Force rebuilt bank dashboard embeds: {len(new_ids)}")
 
 
 def request_bank_refresh(*, full: bool = True) -> None:
@@ -2378,16 +2356,22 @@ async def cmd_econ_commands(interaction: discord.Interaction):
     msg = (
         f"**EconBot Commands** ({APP_VERSION})\n\n"
         "**Player**\n"
-        "• `/balance` — view balance\n"
-        "• `/income` — claim daily income\n\n"
+        "• `/balance` - view a character balance card\n"
+        "• `/income` - claim daily income\n\n"
         "**Staff**\n"
-        "• `/purchase_new` — record an asset purchase\n"
-        "• `/upgrade_asset` — upgrade an existing asset\n"
-        "• `/sell_asset` — sell/remove an existing asset\n"
-        "• `/econ_adjust` — adjust balance by delta\n"
-        "• `/econ_set_balance` — set balance to value\n"
-        "• `/econ_refresh_bank` — refresh bank dashboard\n"
-        "• `/econ_set_kingdom_tax` — set kingdom tax rate (10–50%)\n"
+        "• `/purchase_new` - record an asset purchase\n"
+        "• `/upgrade_asset` - upgrade an existing asset\n"
+        "• `/sell_asset` - sell an existing asset\n"
+        "• `/econ_adjust` - adjust a balance by delta\n"
+        "• `/econ_set_balance` - set a balance directly\n"
+        "• `/econ_set_kingdom_tax` - set a kingdom income tax\n"
+        "• `/set_kingdom_treasury` - set a kingdom treasury amount\n"
+        "• `/econ_grant_all` - grant all registered characters Val\n"
+        "• `/transfer_val` - transfer Val between characters\n"
+        "• `/assign-noble-title` - assign a noble title\n"
+        "• `/upgrade-noble-title` - upgrade a noble title\n"
+        "• `/edit-noble-title` - edit noble title presentation\n"
+        "• `/econ_refresh_bank` - rebuild the bank dashboard\n"
     )
     await interaction.followup.send(msg, ephemeral=True)
 
@@ -3572,7 +3556,9 @@ async def _mark_daily_reminder_sent(reminder_date: date) -> None:
 @tasks.loop(minutes=1)
 async def daily_income_reminder_loop():
     now = datetime.now(CHICAGO_TZ)
-    if now.hour != DAILY_REMINDER_HOUR or now.minute != DAILY_REMINDER_MINUTE:
+    minutes_now = now.hour * 60 + now.minute
+    target_minutes = DAILY_REMINDER_HOUR * 60 + DAILY_REMINDER_MINUTE
+    if not (target_minutes <= minutes_now <= target_minutes + 2):
         return
     today = now.date()
     try:
@@ -3584,9 +3570,12 @@ async def daily_income_reminder_loop():
 
     guild = client.get_guild(GUILD_ID)
     if guild is None:
-        print(f"[warn] Daily reminder guild not found in cache: {GUILD_ID}")
-        return
-    channel = guild.get_channel(DAILY_REMINDER_CHANNEL_ID)
+        try:
+            guild = await client.fetch_guild(GUILD_ID)
+        except Exception as e:
+            print(f"[warn] Daily reminder guild fetch failed: {e}")
+            return
+    channel = guild.get_channel(DAILY_REMINDER_CHANNEL_ID) if hasattr(guild, 'get_channel') else None
     if channel is None:
         try:
             channel = await client.fetch_channel(DAILY_REMINDER_CHANNEL_ID)
