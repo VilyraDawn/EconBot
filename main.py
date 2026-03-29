@@ -2020,7 +2020,7 @@ async def render_owner_group_embed(guild: discord.Guild, owner_id: int, owner_di
     return embed
 
 
-async def render_character_bank_embed(guild: discord.Guild, character_name: str) -> discord.Embed:
+async def render_character_bank_embed(guild: discord.Guild, character_name: str, embed_color: Optional[int] = None) -> discord.Embed:
     owner_id = await get_character_owner(character_name)
     owner_display = sanitize_plain_text(await _display_name_from_cache(guild, int(owner_id or 0))) if owner_id else "Unknown Owner"
     kingdom = sanitize_plain_text(str(await get_character_kingdom(character_name) or "")).strip() or "(No Kingdom)"
@@ -2035,7 +2035,7 @@ async def render_character_bank_embed(guild: discord.Guild, character_name: str)
     embed = discord.Embed(
         title=f"📘 {sanitize_plain_text(character_name)}",
         description=f"Held under **{owner_display}**",
-        color=_bank_color_for_kingdom(kingdom),
+        color=(int(embed_color) if embed_color is not None else _bank_color_for_kingdom(kingdom)),
     )
     embed.add_field(name="🏰 Kingdom", value=kingdom, inline=True)
     embed.add_field(name="💰 Balance", value=_truncate_embed_field(format_balance(balance_val), 1024), inline=False)
@@ -2085,10 +2085,17 @@ async def render_bank_dashboard_embeds(guild: discord.Guild) -> List[discord.Emb
             order.append(key)
         grouped[key]["characters"].append(cname)
 
+    owner_group_colors = [0x7F98B1, 0x5E748C]
+    owner_color_map: Dict[int, int] = {
+        uid: owner_group_colors[idx % len(owner_group_colors)]
+        for idx, uid in enumerate(order)
+    }
+
     for uid in order:
         char_names = list(grouped[uid]["characters"])
+        group_color = owner_color_map.get(uid, owner_group_colors[0])
         for cname in char_names:
-            embeds.append(await render_character_bank_embed(guild, cname))
+            embeds.append(await render_character_bank_embed(guild, cname, embed_color=group_color))
     return embeds
 
 
