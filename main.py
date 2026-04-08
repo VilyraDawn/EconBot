@@ -2100,7 +2100,10 @@ async def render_bank_dashboard_embeds(guild: discord.Guild) -> List[discord.Emb
 
 
 async def render_bank_navigation_embeds(guild: discord.Guild, content_message_ids: List[int]) -> List[discord.Embed]:
-    """Build one or more bottom-of-channel navigation embeds linking to the leaderboard and character ledgers."""
+    """Build one or more bottom-of-channel navigation embeds linking to the leaderboard and character ledgers.
+
+    This version respects Discord's *total* embed size limits so later quick-link pages do not silently fail.
+    """
     rows = await _sorted_bank_dashboard_rows_for_display(guild)
     if not content_message_ids:
         return []
@@ -2130,9 +2133,11 @@ async def render_bank_navigation_embeds(guild: discord.Guild, content_message_id
     header_url = f"https://discord.com/channels/{guild.id}/{BANK_CHANNEL_ID}/{header_mid}"
     leaderboard_line = f"🏆 [LEADERBOARD]({header_url}) 🏆"
 
+    # Build owner-ordered inline link rows like:
+    # [Elarion Vaelith](...) | [Saelira Thiravae](...) | ...
     lines: List[str] = []
     current_line = ""
-    max_line_len = 1000
+    max_line_len = 1000  # conservative breathing room below the 1024 field limit
 
     for uid in order:
         for cname in grouped[uid]:
@@ -2155,29 +2160,56 @@ async def render_bank_navigation_embeds(guild: discord.Guild, content_message_id
     if not lines:
         lines = ["(no character links available)"]
 
+    def _embed_char_budget(include_leaderboard: bool, page_num: int) -> int:
+        # Stay well below Discord's 6000-char total embed limit.
+        title = "🧭 Quick Links" if page_num == 1 else f"🧭 Quick Links (cont. {page_num})"
+        footer = f"Quick links • Page {page_num}"
+        used = len(title) + len(footer)
+        if include_leaderboard:
+            used += len(leaderboard_line)
+        return max(1, 5600 - used)
+
+    def _field_cost(value: str) -> int:
+        # One invisible-char field name plus the value length.
+        return 1 + len(value)
+
     embeds: List[discord.Embed] = []
     page = 1
-    description_lines = [leaderboard_line, lines[0]]
-    current = discord.Embed(
-        title="🧭 Quick Links",
-        description="\n".join(description_lines),
-        color=0xC2A878,
-    )
+    idx = 0
+    while idx < len(lines):
+        include_leaderboard = page == 1
+        title = "🧭 Quick Links" if page == 1 else f"🧭 Quick Links (cont. {page})"
+        description = leaderboard_line if include_leaderboard else None
+        remaining = _embed_char_budget(include_leaderboard, page)
+        page_lines: List[str] = []
 
-    for extra_line in lines[1:]:
-        if len(current.fields) >= 25:
-            current.set_footer(text=f"Quick links • Page {page}")
-            embeds.append(current)
-            page += 1
-            current = discord.Embed(
-                title=f"🧭 Quick Links (cont. {page})",
-                description=leaderboard_line,
-                color=0xC2A878,
-            )
-        current.add_field(name="​", value=extra_line, inline=False)
+        while idx < len(lines) and len(page_lines) < 25:
+            line = lines[idx]
+            cost = _field_cost(line)
+            if page_lines and cost > remaining:
+                break
+            if not page_lines and cost > remaining:
+                # Emergency split for exceptionally long rows.
+                take = max(1, min(1000, remaining - 16))
+                page_lines.append(line[:take])
+                remainder = line[take:]
+                if remainder:
+                    lines[idx] = remainder
+                else:
+                    idx += 1
+                remaining = 0
+                break
+            page_lines.append(line)
+            remaining -= cost
+            idx += 1
 
-    current.set_footer(text=f"Quick links • Page {page}")
-    embeds.append(current)
+        emb = discord.Embed(title=title, description=description, color=0xC2A878)
+        for line in page_lines:
+            emb.add_field(name="​", value=line, inline=False)
+        emb.set_footer(text=f"Quick links • Page {page}")
+        embeds.append(emb)
+        page += 1
+
     return embeds
 
 
