@@ -41,7 +41,7 @@ except Exception:
     openpyxl = None  # type: ignore
 
 
-APP_VERSION = "EconBot_v145"
+APP_VERSION = "EconBot_v148"
 
 # Canon kingdoms (authoritative list for tax dropdowns & treasury seeding)
 CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Avalea"]
@@ -554,6 +554,39 @@ def _tier_label(tier: str) -> str:
     return f"T{rk}"
 
 
+def _tier_display_name(tier: str) -> str:
+    """Return the human-readable tier descriptor without the numeric prefix."""
+    s = sanitize_plain_text(str(tier or "")).strip()
+    if not s:
+        return ""
+    s = re.sub(r"^\(\s*\d+\s*\)\s*", "", s)
+    return s.strip()
+
+
+def format_regular_asset_line(row: Dict[str, Any], *, for_embed: bool = False) -> str:
+    """Format a non-title asset for /balance cards and bank embeds.
+
+    Special rule for Village assets: include the settlement type explicitly.
+    """
+    tier_label = _tier_label(str(row.get("tier", "")))
+    asset_type = sanitize_plain_text(str(row.get("asset_type", ""))).strip()
+    asset_name = sanitize_plain_text(str(row.get("asset_name", ""))).strip() or asset_type or "(Unnamed Asset)"
+    kingdom = sanitize_plain_text(str(row.get("kingdom", ""))).strip() or "(No Kingdom)"
+    add_income = int(row.get("add_income_val") or 0)
+
+    parts = [tier_label, asset_name]
+    if asset_type == "Village":
+        settlement_type = _tier_display_name(str(row.get("tier", ""))) or "Village"
+        parts.append(settlement_type)
+    parts.extend([kingdom, f"+{add_income:,} Val"])
+
+    if for_embed:
+        first = f"**{parts[0]}**"
+        remainder = " - ".join(parts[1:])
+        return f"• {first} - {remainder}" if remainder else f"• {first}"
+    return "- " + " - ".join(parts)
+
+
 
 def noble_title_family_requires_realm(family: str) -> bool:
     meta = NOBLE_TITLE_FAMILIES.get(str(family or "").strip())
@@ -670,11 +703,7 @@ async def render_character_section(character_name: str) -> List[str]:
         return out
 
     for a in regular_assets:
-        tier = _tier_label(str(a.get("tier", "")))
-        aname = sanitize_plain_text(str(a.get("asset_name", ""))).strip() or sanitize_plain_text(str(a.get("asset_type", ""))).strip()
-        akingdom = sanitize_plain_text(str(a.get("kingdom", ""))).strip() or "(No Kingdom)"
-        add = int(a.get("add_income_val") or 0)
-        out.append(f"- {tier} - {aname} - {akingdom} - +{add:,} Val")
+        out.append(format_regular_asset_line(a, for_embed=False))
     return out
 
 
@@ -1396,6 +1425,8 @@ async def log_econ_channel(interaction: discord.Interaction, action: str, detail
             lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "from_tier", "to_tier", "cost", "sales_kingdom"])
         elif action == "sell_asset":
             lines += _fmt_kv(details, ["character", "asset_name", "asset_type", "tier", "gross_refund", "tax_amount", "net_refund"])
+        elif action == "rename_asset":
+            lines += _fmt_kv(details, ["character", "asset_type", "tier", "old_asset_name", "new_asset_name"])
         elif action == "income_claim":
             lines += _fmt_kv(details, ["character", "character_kingdom", "base_income", "asset_income", "gross_total", "tax_total", "net_total", "new_balance"])
         elif action in ("adjust_balance", "set_balance"):
@@ -2053,11 +2084,7 @@ async def render_character_bank_embed(guild: discord.Guild, character_name: str,
         asset_lines: List[str] = []
         hidden = 0
         for a in regular_assets:
-            tier = _tier_label(str(a.get("tier", "")))
-            aname = sanitize_plain_text(str(a.get("asset_name", "")).strip() or str(a.get("asset_type", "")).strip())
-            akingdom = sanitize_plain_text(str(a.get("kingdom", "")).strip() or "(No Kingdom)")
-            add = int(a.get("add_income_val") or 0)
-            candidate = f"• **{tier}** — {aname} • {akingdom} • +{add:,} Val"
+            candidate = format_regular_asset_line(a, for_embed=True)
             joined = "\n".join(asset_lines + [candidate])
             if len(joined) > 1000:
                 hidden += 1
@@ -2576,6 +2603,7 @@ async def cmd_econ_commands(interaction: discord.Interaction):
         "• `/assign-noble-title` - assign a noble title\n"
         "• `/upgrade-noble-title` - upgrade a noble title\n"
         "• `/edit-noble-title` - edit noble title presentation\n"
+        "• `/rename_asset` - rename an existing owned asset\n"
         "• `/econ_refresh_bank` - rebuild the bank dashboard\n"
     )
     await interaction.followup.send(msg, ephemeral=True)
@@ -3570,6 +3598,101 @@ async def cmd_edit_noble_title(interaction: discord.Interaction, character: str,
 
     await interaction.followup.send(
         f"Corrected noble title for **{character}**: **{old_display}** → **{new_display}**.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="rename_asset", description="(Staff) Rename an existing owned asset.", guild=discord.Object(id=GUILD_ID))
+@staff_only()
+@app_commands.autocomplete(character=character_autocomplete, asset=ac_asset_for_character)
+async def cmd_rename_asset(interaction: discord.Interaction, character: str, asset: str, new_name: str):
+    await interaction.response.defer(ephemeral=True)
+
+    parts = [p.strip() for p in str(asset).split("|")]
+    if len(parts) < 3:
+        await interaction.followup.send("Invalid asset selection.", ephemeral=True)
+        return
+
+    asset_type = parts[0]
+    current_tier = parts[1]
+    current_name = "|".join(parts[2:]).strip()
+    new_name = sanitize_plain_text(str(new_name or "")).strip()
+
+    if is_noble_title_asset_type(asset_type):
+        await interaction.followup.send("Noble Titles must be changed with the noble title commands, not `/rename_asset`.", ephemeral=True)
+        return
+
+    if not new_name:
+        await interaction.followup.send("New asset name cannot be empty.", ephemeral=True)
+        return
+
+    row = await db_fetchrow(
+        '''
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        current_name,
+    )
+    if not row:
+        await interaction.followup.send("That asset was not found on this character.", ephemeral=True)
+        return
+
+    dup = await db_fetchrow(
+        '''
+        SELECT 1
+        FROM econ_assets
+        WHERE guild_id=$1 AND character_name=$2 AND asset_type=$3 AND tier=$4 AND asset_name=$5
+        LIMIT 1;
+        ''',
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        new_name,
+    )
+    if dup and new_name != current_name:
+        await interaction.followup.send(
+            "That character already has an asset with the same type, tier, and name. Choose a different new name.",
+            ephemeral=True,
+        )
+        return
+
+    await db_exec(
+        '''
+        UPDATE econ_assets
+        SET asset_name=$1, updated_at=NOW()
+        WHERE guild_id=$2 AND character_name=$3 AND asset_type=$4 AND tier=$5 AND asset_name=$6;
+        ''',
+        new_name,
+        DATA_GUILD_ID,
+        character,
+        asset_type,
+        current_tier,
+        current_name,
+    )
+
+    await log_econ(
+        interaction,
+        "rename_asset",
+        {
+            "character": character,
+            "asset_type": asset_type,
+            "tier": current_tier,
+            "old_asset_name": current_name,
+            "new_asset_name": new_name,
+        },
+    )
+
+    trigger_bank_refresh()
+
+    await interaction.followup.send(
+        f"Renamed asset for **{character}**:\n- {asset_type} | {current_tier} | **{current_name}** → **{new_name}**",
         ephemeral=True,
     )
 
