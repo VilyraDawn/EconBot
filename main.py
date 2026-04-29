@@ -88,15 +88,6 @@ def _image_embed(filename: str) -> discord.Embed:
     e.set_image(url=f"attachment://{filename}")
     return e
 
-
-async def send_ephemeral_with_bundled_image(
-    interaction: discord.Interaction,
-    content: str,
-    *,
-    config_path: str,
-    filename: str,
-    fallback_names: list[str],
-    label: str,
 ):
     p = _find_bundled_image(config_path, fallback_names)
     if not p:
