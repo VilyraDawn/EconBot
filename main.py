@@ -50,7 +50,7 @@ CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
 # Bundled images (do NOT use expiring Discord CDN URLs).
 # These are relative to the repo root beside main.py, typically under ./assets/.
-BALANCE_CARD_IMAGE_PATH = "assets/great_anus.jpg"
+BALANCE_CARD_IMAGE_PATH = "assets/balance_card.jpg"
 BALANCE_CARD_IMAGE_FILENAME = "balance_card.jpg"
 WEEKEND_INCOME_IMAGE_PATH = "assets/weekend_income.jpg"
 WEEKEND_INCOME_IMAGE_FILENAME = "weekend_income.jpg"
@@ -124,30 +124,11 @@ async def send_ephemeral_with_bundled_image(
 
 
 async def send_ephemeral_with_parchment(interaction: discord.Interaction, content: str):
-    await send_ephemeral_with_bundled_image(
-        interaction,
-        content,
-        config_path=BALANCE_CARD_IMAGE_PATH,
-        filename=BALANCE_CARD_IMAGE_FILENAME,
-        fallback_names=[
-        ],
-        label="Balance/Income",
-    )
+    await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def send_ephemeral_with_weekend_income_image(interaction: discord.Interaction, content: str):
-    await send_ephemeral_with_bundled_image(
-        interaction,
-        content,
-        config_path=WEEKEND_INCOME_IMAGE_PATH,
-        filename=WEEKEND_INCOME_IMAGE_FILENAME,
-        fallback_names=[
-            "weekend_income.jpg",
-            "weekend_income.jpeg",
-            "BA4EB710-C8AB-4B8F-AFDC-EDBAFDEE13F6.jpeg",
-        ],
-        label="Weekend income",
-    )
+    await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # -------------------------
