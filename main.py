@@ -48,13 +48,6 @@ CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Aval
 DEFAULT_KINGDOM_TAX_BP = 1000  # 10%
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
-# Bundled images (do NOT use expiring Discord CDN URLs).
-# These are relative to the repo root beside main.py, typically under ./assets/.
-BALANCE_CARD_IMAGE_PATH = "assets/balance_card.jpg"
-BALANCE_CARD_IMAGE_FILENAME = "balance_card.jpg"
-WEEKEND_INCOME_IMAGE_PATH = "assets/weekend_income.jpg"
-WEEKEND_INCOME_IMAGE_FILENAME = "weekend_income.jpg"
-
 # Daily income reminder (hard-coded by request; no Railway env vars required).
 DAILY_REMINDER_CHANNEL_ID = 1324994929176612936
 DAILY_REMINDER_ROLE_ID = 1476435497776840724
@@ -110,14 +103,6 @@ def _image_embed(filename: str) -> discord.Embed:
     except FileNotFoundError:
         print(f"[warn] {label} image missing at {str(p)!r}; sending without image")
         await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-
-
-async def send_ephemeral_with_parchment(interaction: discord.Interaction, content: str):
-    await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-
-
-async def send_ephemeral_with_weekend_income_image(interaction: discord.Interaction, content: str):
-    await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # -------------------------
