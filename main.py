@@ -688,15 +688,15 @@ async def render_character_section(character_name: str) -> List[str]:
     out: List[str] = []
     safe_cname = sanitize_plain_text(character_name)
     out.append(f"**{safe_cname}** - {kingdom}")
-    out.append(f"💰 **Balance:** {format_balance(bal)}")
-    out.append(f"📈 **Income:** {format_amount(current_base_daily_income())} | **Income from Assets:** {asset_income_sum:,} Val")
+    out.append(f"?? **Balance:** {format_balance(bal)}")
+    out.append(f"?? **Income:** {format_amount(current_base_daily_income())} | **Income from Assets:** {asset_income_sum:,} Val")
 
     if title_assets:
-        out.append("🏛 **Noble Titles**")
+        out.append("?? **Noble Titles**")
         for a in title_assets:
             out.append(f"- {noble_title_display_from_row(a)}")
 
-    out.append("🧾 **Assets**")
+    out.append("?? **Assets**")
 
     if not regular_assets:
         out.append("- (none)")
@@ -748,8 +748,8 @@ async def render_leaderboard_lines(
         return cache[uid]
 
     out: List[str] = []
-    out.append("🏆 **Leaderboards**")
-    out.append("━━━━━━━━━━━━━━━━━━")
+    out.append("?? **Leaderboards**")
+    out.append("??????????????????")
     out.append("**Top Balances**")
     if not top_bal:
         out.append("- (none)")
@@ -1863,14 +1863,14 @@ async def render_treasury_lines() -> List[str]:
     treas = await fetch_kingdom_treasuries()
     if not treas:
         return [
-            "🏰 **Kingdom Treasuries**",
-            "━━━━━━━━━━━━━━━━━━",
+            "?? **Kingdom Treasuries**",
+            "??????????????????",
             "_No kingdoms configured yet._",
             "",
         ]
     out: List[str] = [
-        "🏰 **Kingdom Treasuries**",
-        "━━━━━━━━━━━━━━━━━━",
+        "?? **Kingdom Treasuries**",
+        "??????????????????",
     ]
     for kingdom, bp, treasury in treas:
         out.append(f"• **{kingdom}** — Treasury: **{format_currency(treasury)}** — Tax: **{_bp_to_percent(bp)}**")
@@ -1982,7 +1982,7 @@ async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
     owner_count = len({int(r[1]) for r in rows if int(r[1] or 0) > 0})
 
     embed = discord.Embed(
-        title="🏦 Bank of Vilyra",
+        title="?? Bank of Vilyra",
         description="The crown ledger of coin, titles, and holdings across the realm.",
         color=0x7F98B1,
     )
@@ -1991,10 +1991,10 @@ async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
     treasury_lines: List[str] = []
     for kingdom, bp, treasury in treas:
         treasury_lines.append(
-            f"👑 **{sanitize_plain_text(kingdom)}** — {format_currency(int(treasury or 0))} • Tax {int(bp or 0) / 100:.0f}%"
+            f"?? **{sanitize_plain_text(kingdom)}** — {format_currency(int(treasury or 0))} • Tax {int(bp or 0) / 100:.0f}%"
         )
     embed.add_field(
-        name="🪙 Kingdom Treasuries",
+        name="?? Kingdom Treasuries",
         value=_truncate_embed_field("\n".join(treasury_lines) or "(none)"),
         inline=False,
     )
@@ -2012,10 +2012,10 @@ async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
             for i, (c, _uid, _bal, inc, _owner) in enumerate(top_inc, start=1)
         ]
 
-        embed.add_field(name="💰 Wealthiest Ledgers", value=_truncate_embed_field("\n".join(bal_lines) or "(none)"), inline=False)
-        embed.add_field(name="📈 Highest Daily Income", value=_truncate_embed_field("\n".join(inc_lines) or "(none)"), inline=False)
+        embed.add_field(name="?? Wealthiest Ledgers", value=_truncate_embed_field("\n".join(bal_lines) or "(none)"), inline=False)
+        embed.add_field(name="?? Highest Daily Income", value=_truncate_embed_field("\n".join(inc_lines) or "(none)"), inline=False)
         embed.add_field(
-            name="📜 Ledger Status",
+            name="?? Ledger Status",
             value=_truncate_embed_field(
                 "\n".join([
                     f"Characters tracked: **{len(rows)}**",
@@ -2028,7 +2028,7 @@ async def render_bank_header_embed(guild: discord.Guild) -> discord.Embed:
             inline=False,
         )
     else:
-        embed.add_field(name="📜 Ledger Status", value="No characters found in DB.", inline=False)
+        embed.add_field(name="?? Ledger Status", value="No characters found in DB.", inline=False)
 
     embed.set_footer(text=f"Last updated {now.strftime('%Y-%m-%d %H:%M')} America/Chicago")
     return embed
@@ -2038,7 +2038,7 @@ async def render_owner_group_embed(guild: discord.Guild, owner_id: int, owner_di
     clean_owner = sanitize_plain_text(owner_display or f"User {owner_id}")
     lines = [f"• {sanitize_plain_text(name)}" for name in character_names]
     embed = discord.Embed(
-        title=f"👤 {clean_owner}",
+        title=f"?? {clean_owner}",
         description="Household ledger grouping",
         color=0x5C6F82,
     )
@@ -2064,21 +2064,21 @@ async def render_character_bank_embed(guild: discord.Guild, character_name: str,
     regular_assets = [a for a in assets if not is_noble_title_asset_type(str(a.get("asset_type", "")))]
 
     embed = discord.Embed(
-        title=f"📘 {sanitize_plain_text(character_name)}",
+        title=f"?? {sanitize_plain_text(character_name)}",
         description=f"Held under **{owner_display}**",
         color=(int(embed_color) if embed_color is not None else _bank_color_for_kingdom(kingdom)),
     )
-    embed.add_field(name="🏰 Kingdom", value=kingdom, inline=True)
-    embed.add_field(name="💰 Balance", value=_truncate_embed_field(format_balance(balance_val), 1024), inline=False)
-    embed.add_field(name="☀️ Base Daily Income", value=format_currency(base_income), inline=True)
-    embed.add_field(name="🏦 Asset Income", value=format_currency(asset_income_sum), inline=True)
-    embed.add_field(name="📈 Total Daily Income", value=format_currency(total_income), inline=True)
+    embed.add_field(name="?? Kingdom", value=kingdom, inline=True)
+    embed.add_field(name="?? Balance", value=_truncate_embed_field(format_balance(balance_val), 1024), inline=False)
+    embed.add_field(name="?? Base Daily Income", value=format_currency(base_income), inline=True)
+    embed.add_field(name="?? Asset Income", value=format_currency(asset_income_sum), inline=True)
+    embed.add_field(name="?? Total Daily Income", value=format_currency(total_income), inline=True)
 
     if title_assets:
-        title_lines = [f"👑 {noble_title_display_from_row(a)}" for a in title_assets]
-        embed.add_field(name="👑 Noble Titles", value=_truncate_embed_field("\n".join(title_lines), 1024), inline=False)
+        title_lines = [f"?? {noble_title_display_from_row(a)}" for a in title_assets]
+        embed.add_field(name="?? Noble Titles", value=_truncate_embed_field("\n".join(title_lines), 1024), inline=False)
     else:
-        embed.add_field(name="👑 Noble Titles", value="None recorded", inline=False)
+        embed.add_field(name="?? Noble Titles", value="None recorded", inline=False)
 
     if regular_assets:
         asset_lines: List[str] = []
@@ -2092,9 +2092,9 @@ async def render_character_bank_embed(guild: discord.Guild, character_name: str,
                 asset_lines.append(candidate)
         if hidden > 0:
             asset_lines.append(f"• ...and {hidden} more")
-        embed.add_field(name="🧾 Assets", value=_truncate_embed_field("\n".join(asset_lines), 1024), inline=False)
+        embed.add_field(name="?? Assets", value=_truncate_embed_field("\n".join(asset_lines), 1024), inline=False)
     else:
-        embed.add_field(name="🧾 Assets", value="No income-bearing assets recorded", inline=False)
+        embed.add_field(name="?? Assets", value="No income-bearing assets recorded", inline=False)
 
     embed.set_footer(text=f"Live ledger • Updated {datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M')} America/Chicago")
     return embed
@@ -2158,7 +2158,7 @@ async def render_bank_navigation_embeds(guild: discord.Guild, content_message_id
             char_link_map[cname] = f"https://discord.com/channels/{guild.id}/{BANK_CHANNEL_ID}/{mid}"
 
     header_url = f"https://discord.com/channels/{guild.id}/{BANK_CHANNEL_ID}/{header_mid}"
-    leaderboard_line = f"🏆 [LEADERBOARD]({header_url}) 🏆"
+    leaderboard_line = f"?? [LEADERBOARD]({header_url}) ??"
 
     # Build owner-ordered inline link rows like:
     # [Elarion Vaelith](...) | [Saelira Thiravae](...) | ...
@@ -2189,7 +2189,7 @@ async def render_bank_navigation_embeds(guild: discord.Guild, content_message_id
 
     def _embed_char_budget(include_leaderboard: bool, page_num: int) -> int:
         # Stay well below Discord's 6000-char total embed limit.
-        title = "🧭 Quick Links" if page_num == 1 else f"🧭 Quick Links (cont. {page_num})"
+        title = "?? Quick Links" if page_num == 1 else f"?? Quick Links (cont. {page_num})"
         footer = f"Quick links • Page {page_num}"
         used = len(title) + len(footer)
         if include_leaderboard:
@@ -2205,7 +2205,7 @@ async def render_bank_navigation_embeds(guild: discord.Guild, content_message_id
     idx = 0
     while idx < len(lines):
         include_leaderboard = page == 1
-        title = "🧭 Quick Links" if page == 1 else f"🧭 Quick Links (cont. {page})"
+        title = "?? Quick Links" if page == 1 else f"?? Quick Links (cont. {page})"
         description = leaderboard_line if include_leaderboard else None
         remaining = _embed_char_budget(include_leaderboard, page)
         page_lines: List[str] = []
@@ -2232,7 +2232,7 @@ async def render_bank_navigation_embeds(guild: discord.Guild, content_message_id
 
         emb = discord.Embed(title=title, description=description, color=0xC2A878)
         for line in page_lines:
-            emb.add_field(name="​", value=line, inline=False)
+            emb.add_field(name="?", value=line, inline=False)
         emb.set_footer(text=f"Quick links • Page {page}")
         embeds.append(emb)
         page += 1
@@ -2445,7 +2445,7 @@ async def cmd_balance(interaction: discord.Interaction, character: str):
                 break
             trimmed.append(ln)
         txt = "\n".join(trimmed).strip()
-    await send_ephemeral_with_parchment(interaction, txt)
+    await interaction.followup.send(txt, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @tree.command(name="income", description="Claim daily income for a character.", guild=discord.Object(id=GUILD_ID))
@@ -2572,11 +2572,7 @@ async def cmd_income(interaction: discord.Interaction, character: str):
         f"• Net received: **{format_currency(net_total)}**\n\n"
         f"New balance: **{format_currency(new_bal)}**"
     )
-    now_dt = datetime.now(CHICAGO_TZ)
-    if now_dt.weekday() in (4, 5, 6):
-        await send_ephemeral_with_weekend_income_image(interaction, msg)
-    else:
-        await send_ephemeral_with_parchment(interaction, msg)
+    await interaction.followup.send(msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 
@@ -3069,7 +3065,7 @@ async def cmd_purchase_new(interaction: discord.Interaction, character: str, ass
     await interaction.followup.send(
         f"Recorded purchase for **{character}**:\n"
         f"• **{asset_type}** | **{tier}** | **{asset_name}**\n"
-        f"Cost: **{format_currency(cost_val)}** → sent to **{sales_kingdom or 'N/A'}** treasury (new balance **{format_currency(new_bal)}**)\n"
+        f"Cost: **{format_currency(cost_val)}** ? sent to **{sales_kingdom or 'N/A'}** treasury (new balance **{format_currency(new_bal)}**)\n"
         f"Daily income now: **{format_currency(new_daily_income)}**",
         ephemeral=True,
     )
@@ -3187,8 +3183,8 @@ async def cmd_upgrade_asset(interaction: discord.Interaction, character: str, as
         (
             f"Upgraded **{character}** asset:\n"
             f"- {asset_type} | {current_tier} | {asset_name}\n"
-            f"→ {asset_type} | {target_tier} | {asset_name}\n"
-            f"Cost: **{format_currency(cost_val)}** → sent to **{upgrade_kingdom or 'N/A'}** treasury\n"
+            f"? {asset_type} | {target_tier} | {asset_name}\n"
+            f"Cost: **{format_currency(cost_val)}** ? sent to **{upgrade_kingdom or 'N/A'}** treasury\n"
             f"New balance: **{format_currency(await get_balance(character))}**"
         ),
         ephemeral=True,
@@ -3454,7 +3450,7 @@ async def cmd_upgrade_noble_title(interaction: discord.Interaction, character: s
     before_display = noble_title_display_from_parts(cur_option, realm_name, title_kingdom, cur_family)
     after_display = noble_title_display_from_parts(new_option, realm_name, title_kingdom, new_family)
     await interaction.followup.send(
-        f"Updated noble title for **{character}**: **{before_display}** → **{after_display}**. Upgrade cost: **{format_currency(upgrade_cost)}**.",
+        f"Updated noble title for **{character}**: **{before_display}** ? **{after_display}**. Upgrade cost: **{format_currency(upgrade_cost)}**.",
         ephemeral=True,
     )
 
@@ -3597,7 +3593,7 @@ async def cmd_edit_noble_title(interaction: discord.Interaction, character: str,
     trigger_bank_refresh()
 
     await interaction.followup.send(
-        f"Corrected noble title for **{character}**: **{old_display}** → **{new_display}**.",
+        f"Corrected noble title for **{character}**: **{old_display}** ? **{new_display}**.",
         ephemeral=True,
     )
 
@@ -3692,7 +3688,7 @@ async def cmd_rename_asset(interaction: discord.Interaction, character: str, ass
     trigger_bank_refresh()
 
     await interaction.followup.send(
-        f"Renamed asset for **{character}**:\n- {asset_type} | {current_tier} | **{current_name}** → **{new_name}**",
+        f"Renamed asset for **{character}**:\n- {asset_type} | {current_tier} | **{current_name}** ? **{new_name}**",
         ephemeral=True,
     )
 
@@ -3810,7 +3806,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
     # Respond ephemerally so interactions don't hang forever
-    msg = "⚠️ Internal error while running that command. Check Railway logs for details."
+    msg = "?? Internal error while running that command. Check Railway logs for details."
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
