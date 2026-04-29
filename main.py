@@ -48,6 +48,7 @@ CANON_KINGDOMS: list[str] = ["Sethrathiel", "Velarith", "Lyvik", "Baelon", "Aval
 DEFAULT_KINGDOM_TAX_BP = 1000  # 10%
 CHICAGO_TZ = ZoneInfo("America/Chicago") if ZoneInfo else timezone.utc
 
+
 # Daily income reminder (hard-coded by request; no Railway env vars required).
 DAILY_REMINDER_CHANNEL_ID = 1324994929176612936
 DAILY_REMINDER_ROLE_ID = 1476435497776840724
@@ -55,54 +56,9 @@ DAILY_REMINDER_HOUR = 12
 DAILY_REMINDER_MINUTE = 0
 DAILY_REMINDER_MESSAGE = f"<@&{DAILY_REMINDER_ROLE_ID}> - Don’t forget to claim your daily income (and pay your taxes) using the /income command!"
 
-# Resolve bundled image paths relative to this file (Railway working directory can vary).
-_BASE_DIR = Path(__file__).resolve().parent
 
 
-def _find_bundled_image(config_path: str, fallback_names: list[str]) -> Optional[Path]:
-    """Return an existing bundled image path, or None if not found."""
-    candidates: list[Path] = []
-    p = Path(config_path)
-    candidates.append(p if p.is_absolute() else (_BASE_DIR / p))
-    assets_dir = _BASE_DIR / "assets"
-    for name in fallback_names:
-        candidates.append(assets_dir / name)
-    for c in candidates:
-        try:
-            if c.exists() and c.is_file():
-                return c
-        except Exception:
-            continue
-    return None
 
-
-def _image_embed(filename: str) -> discord.Embed:
-    e = discord.Embed()
-    e.set_image(url=f"attachment://{filename}")
-    return e
-
-):
-    p = _find_bundled_image(config_path, fallback_names)
-    if not p:
-        print(f"[warn] {label} image missing. Tried {config_path!r} relative to {_BASE_DIR}.")
-        assets_dir = _BASE_DIR / "assets"
-        if assets_dir.exists() and assets_dir.is_dir():
-            try:
-                print(f"[debug] assets/ contents: {[x.name for x in assets_dir.iterdir() if x.is_file()]}")
-            except Exception:
-                pass
-        await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-        return
-    try:
-        f = discord.File(str(p), filename=filename)
-        await interaction.followup.send(
-        content,
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except FileNotFoundError:
-        print(f"[warn] {label} image missing at {str(p)!r}; sending without image")
-        await interaction.followup.send(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # -------------------------
