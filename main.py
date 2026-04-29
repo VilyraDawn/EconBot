@@ -103,11 +103,9 @@ def _image_embed(filename: str) -> discord.Embed:
     try:
         f = discord.File(str(p), filename=filename)
         await interaction.followup.send(
-            content,
-            ephemeral=True,
-            embed=_image_embed(filename),
-            file=f,
-            allowed_mentions=discord.AllowedMentions.none(),
+        content,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
         )
     except FileNotFoundError:
         print(f"[warn] {label} image missing at {str(p)!r}; sending without image")
