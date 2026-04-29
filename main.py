@@ -130,13 +130,6 @@ async def send_ephemeral_with_parchment(interaction: discord.Interaction, conten
         config_path=BALANCE_CARD_IMAGE_PATH,
         filename=BALANCE_CARD_IMAGE_FILENAME,
         fallback_names=[
-            "great_anus.jpg",
-            "great_anus.jpg.jpg",
-            "Great Anus.jpg",
-            "Great Anus (1).jpg",
-            "Great%20Anus.jpg",
-            "great_anus.jpeg",
-            "great_anus.png",
         ],
         label="Balance/Income",
     )
