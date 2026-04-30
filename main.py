@@ -3868,9 +3868,9 @@ async def on_ready():
         except Exception as e:
             print(f"[warn] copy_global_to failed/skipped: {e}")
 
-# NOTE: We do NOT clear guild commands here.
-# tree.sync(guild=...) overwrites the server-side guild command set to match the locally-registered guild commands.
-# Clearing first would drop all existing commands unless we re-register every single one manually.
+        # NOTE: We do NOT clear guild commands here.
+        # tree.sync(guild=...) overwrites the server-side guild command set to match the locally-registered guild commands.
+        # Clearing first would drop all existing commands unless we re-register every single one manually.
 
         synced = await tree.sync(guild=guild_obj)
         print(f"[test] Synced {len(synced)} guild command(s).")
